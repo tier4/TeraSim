@@ -15,8 +15,8 @@ services:
       # Mount outputs and logs to host for persistence
       - ./outputs:/app/TeraSim/outputs
       - ./logs:/app/TeraSim/logs
-      # Optional: mount examples for easy editing
-      # - ./examples:/app/TeraSim/examples
+      # Mount examples for easy editing
+      - ./examples:/app/TeraSim/examples
     environment:
       - SUMO_HOME=/root/.terasim/deps/sumo
       - PYTHONUNBUFFERED=1

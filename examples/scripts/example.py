@@ -11,8 +11,8 @@ from terasim.vehicle.sensors.local import LocalSensor
 from terasim.vehicle.vehicle import Vehicle
 
 current_path = Path(__file__).parent
-# maps_path = current_path / "maps" / "3LaneHighway"
-maps_path = current_path / "maps" / "Mcity"
+# maps_path = current_path.parent / "maps" / "3LaneHighway"
+maps_path = current_path.parent / "maps" / "Mcity"
 
 
 class ExampleVehicleFactory(VehicleFactory):
@@ -41,8 +41,8 @@ class ExampleVehicleFactory(VehicleFactory):
 
 env = EnvTemplate(vehicle_factory=ExampleVehicleFactory(), info_extractor=InfoExtractor)
 sim = Simulator(
-    sumo_net_file_path=maps_path / "map.net.xml",
-    sumo_config_file_path=maps_path / "sim.sumocfg",
+    sumo_net_file_path=maps_path / "mcity.net.xml",
+    sumo_config_file_path=maps_path / "mcity.sumocfg",
     num_tries=10,
     gui_flag=False,
     output_path=current_path / "output" / "0",

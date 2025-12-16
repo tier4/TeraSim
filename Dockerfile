@@ -107,6 +107,12 @@ RUN apt-get update && apt-get install -y \
     libproj22 \
     libxml2 \
     libxslt1.1 \
+    # X11およびOpenGLライブラリ（SUMOの実行に必要）
+    libxrender1 \
+    libxext6 \
+    libfontconfig1 \
+    libgl1-mesa-glx \
+    libglu1-mesa \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Python 3.10 as default
