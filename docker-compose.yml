@@ -9,8 +9,8 @@ services:
     container_name: terasim
     working_dir: /app/TeraSim
     ports:
-      - "8000:8000"  # TeraSim FastAPI service
-      - "6379:6379"  # Redis
+      - "${TERASIM_PORT:-8000}:8000"  # TeraSim FastAPI service
+      - "${REDIS_PORT:-6379}:6379"  # Redis
     volumes:
       # Mount outputs and logs to host for persistence
       - ./outputs:/app/TeraSim/outputs
@@ -40,7 +40,7 @@ services:
   #   image: redis:7-alpine
   #   container_name: terasim-redis
   #   ports:
-  #     - "6379:6379"
+  #     - "${REDIS_PORT:-6379}:6379"
   #   volumes:
   #     - redis-data:/data
   #   command: redis-server --appendonly yes
