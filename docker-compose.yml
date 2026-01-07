@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        EXTRA_APT_PACKAGES: "ffmpeg libxrender1 libxext6 libfontconfig1 libgl1-mesa-glx libglu1-mesa"
     image: terasim:latest
     container_name: terasim
     working_dir: /app/TeraSim

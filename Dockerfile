@@ -6,6 +6,7 @@ FROM ubuntu:22.04 AS builder
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+ARG EXTRA_APT_PACKAGES=""
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -34,6 +35,7 @@ RUN apt-get update && apt-get install -y \
     # Other utilities
     wget \
     curl \
+    ${EXTRA_APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Python 3.10 as default python3
@@ -96,6 +98,8 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG EXTRA_APT_PACKAGES=""
+
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y \
     python3.10 \
@@ -107,6 +111,7 @@ RUN apt-get update && apt-get install -y \
     libproj22 \
     libxml2 \
     libxslt1.1 \
+    ${EXTRA_APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Python 3.10 as default
