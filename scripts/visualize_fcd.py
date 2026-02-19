@@ -259,10 +259,26 @@ class TrafficVisualizer:
         print(f"Creating animation with {len(timestep_range)} frames")
         print(f"Time range: {timestep_range[0]:.1f} to {timestep_range[-1]:.1f}")
         
+        # Build a lookup from frame value to step index
+        frame_to_step = {f: i for i, f in enumerate(timestep_range)}
+        
+        # Add step counter text in the top-right corner
+        self.step_text = self.ax.text(
+            0.98, 0.97, '', transform=self.ax.transAxes,
+            fontsize=12, fontweight='bold',
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', alpha=0.8),
+            zorder=1000
+        )
+        
         # Create animation function with camera following
         def animate_with_follow(frame):
             # Call original plot_points function
             self.trajectories.plot_points(frame, self.ax, True)
+            
+            # Update step counter text
+            step = frame_to_step.get(frame, 0)
+            self.step_text.set_text(f'Step: {step} / {len(timestep_range)-1}\nTime: {frame:.1f}s')
             
             # Follow target vehicle if specified
             if self.target_trajectory and frame in self.target_trajectory.time:
@@ -285,6 +301,13 @@ class TrafficVisualizer:
             
             return self.ax.get_children()  # Return artists for blitting
         
+        # Wrapper for non-follow mode that also updates step counter
+        def animate_no_follow(frame):
+            self.trajectories.plot_points(frame, self.ax, True)
+            step = frame_to_step.get(frame, 0)
+            self.step_text.set_text(f'Step: {step} / {len(timestep_range)-1}\nTime: {frame:.1f}s')
+            return self.ax.get_children()
+        
         if self.target_trajectory:
             # Use custom animation function for following
             anim = animation.FuncAnimation(
@@ -295,14 +318,13 @@ class TrafficVisualizer:
                 blit=False  # Disable blitting when changing view limits
             )
         else:
-            # Use original approach when not following
+            # Use animation with step counter
             anim = animation.FuncAnimation(
-                self.fig, self.trajectories.plot_points, 
+                self.fig, animate_no_follow, 
                 frames=timestep_range, 
                 repeat=False,
                 interval=int(1000 * self.trajectories.timestep) if self.trajectories.timestep else 100,
-                fargs=(self.ax, True),
-                blit=True
+                blit=False
             )
         
         # Store time_range for later use in saving
