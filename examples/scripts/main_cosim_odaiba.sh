@@ -73,7 +73,7 @@ for start_edge in sorted(connections.keys()):
 route_edges = best_route if len(best_route) >= 3 else edges[:5]
 
 # Update the YAML config
-with open('/app/examples/simulation_odaiba_config.yaml', 'r') as f:
+with open('/app/examples/scenarios/cosim_odaiba.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
 config['environment']['parameters']['AV_cfg']['route'] = route_edges
@@ -146,7 +146,7 @@ try:
 except Exception as e:
     print(f'  Warning: could not update SUMO config: {e}')
 
-with open('/app/examples/simulation_odaiba_config.yaml', 'w') as f:
+with open('/app/examples/scenarios/cosim_odaiba.yaml', 'w') as f:
     yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
 print('  Config updated successfully.')
@@ -210,19 +210,19 @@ print('Odaiba OpenDRIVE map loaded into CARLA!')
 " 2>&1 || echo "  Warning: Failed to load OpenDRIVE into CARLA."
     fi
 
-    echo "  Config: /app/examples/simulation_odaiba_config.yaml"
+    echo "  Config: /app/examples/scenarios/cosim_odaiba.yaml"
     echo "------------------------------------------"
 
     # Run CARLA co-simulation
     python3 /app/examples/scripts/carla_cosim_main.py \
-        --terasim_config /app/examples/simulation_odaiba_config.yaml || true
+        --terasim_config /app/examples/scenarios/cosim_odaiba.yaml || true
     CARLA_EXIT=$?
 
     echo "=========================================="
     echo " CARLA client exited (code: $CARLA_EXIT)"
 else
     echo "  CARLA is NOT available. Running TeraSim-only simulation..."
-    echo "  Config: /app/examples/simulation_odaiba_config.yaml"
+    echo "  Config: /app/examples/scenarios/cosim_odaiba.yaml"
     echo "------------------------------------------"
 
     # Run TeraSim-only simulation via HTTP API
@@ -239,7 +239,7 @@ print('Starting TeraSim-only simulation...')
 
 # Initialize simulation
 init_data = {
-    'config_file': '/app/examples/simulation_odaiba_config.yaml',
+    'config_file': '/app/examples/scenarios/cosim_odaiba.yaml',
     'auto_run': False,
 }
 

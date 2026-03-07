@@ -189,5 +189,9 @@ run_experiments_debug.py
 test_docker.sh
 /local_test
 
+# Deploy outputs (legacy)
 apps/deploy/outputs
 apps/deploy/examples/maps
+
+# Generated map files (created at runtime)
+examples/maps/odaiba/

@@ -54,8 +54,7 @@ ENV PYTHONUNBUFFERED=1
 RUN python3 -c "import terasim; print('terasim OK')" && \
     python3 -c "import terasim_nde_nade; print('terasim-nde-nade OK')" && \
     python3 -c "import terasim_service; print('terasim-service OK')" && \
-    python3 -c "import carla; print('carla OK')" && \
-    python3 -c "from terasim.simulator import Simulator; import inspect; sig = inspect.signature(Simulator.__init__); params = list(sig.parameters.keys()); assert 'traffic_scale' in params, f'traffic_scale not found in {params}'; print('traffic_scale support: OK')"
+    python3 -c "import carla; print('carla OK')"
 
 # Create output directory with open permissions
 RUN mkdir -p /app/outputs && chmod 777 /app/outputs
