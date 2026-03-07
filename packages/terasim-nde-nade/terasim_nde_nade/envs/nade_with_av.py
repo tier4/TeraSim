@@ -114,7 +114,10 @@ class NADEWithAV(NADE):
             # Set SpeedMode and LaneChangeMode to 0 for external control
             traci.vehicle.setSpeedMode(AV_ID, 0)
             traci.vehicle.setLaneChangeMode(AV_ID, 0)
-        traci.vehicle.setSpeed(AV_ID, speed)
+            traci.vehicle.setSpeed(AV_ID, speed)
+        else:
+            # Hand back speed control to SUMO's car-following model
+            traci.vehicle.setSpeed(AV_ID, -1)
         
         # Set control mode to external
         self.av_control_mode = "external"
