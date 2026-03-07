@@ -39,12 +39,12 @@ print(f'CARLA server version: {version}')
 
 if [ "$CARLA_AVAILABLE" = true ]; then
     echo "  CARLA is available! Running CARLA co-simulation..."
-    echo "  Config: /app/examples/simulation_Mcity_carla_config.yaml"
+    echo "  Config: /app/examples/scenarios/cosim_mcity.yaml"
     echo "------------------------------------------"
 
     # Run CARLA co-simulation
     python3 /app/examples/scripts/carla_cosim_main.py \
-        --terasim_config /app/examples/simulation_Mcity_carla_config.yaml \
+        --terasim_config /app/examples/scenarios/cosim_mcity.yaml \
         --map_name=McityMap_Main || true
     CARLA_EXIT=$?
 
@@ -52,7 +52,7 @@ if [ "$CARLA_AVAILABLE" = true ]; then
     echo " CARLA client exited (code: $CARLA_EXIT)"
 else
     echo "  CARLA is NOT available. Running TeraSim-only simulation..."
-    echo "  Config: /app/examples/simulation_Mcity_carla_config.yaml"
+    echo "  Config: /app/examples/scenarios/cosim_mcity.yaml"
     echo "------------------------------------------"
 
     # Run TeraSim-only simulation via HTTP API
@@ -69,7 +69,7 @@ print('Starting TeraSim-only simulation...')
 
 # Initialize simulation
 init_data = {
-    'config_file': '/app/examples/simulation_Mcity_carla_config.yaml',
+    'config_file': '/app/examples/scenarios/cosim_mcity.yaml',
     'auto_run': False,
 }
 

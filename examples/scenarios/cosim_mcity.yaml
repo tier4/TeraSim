@@ -26,8 +26,8 @@ environment:
 
     MOBIL_lc_flag: True
     stochastic_acc_flag: False
-    sumo_net_file_path: "/app/examples/maps/Mcity_safetest_carla/mcity.net.xml"
-    sumo_cfg_file_path: "/app/examples/maps/Mcity_safetest_carla/mcity.sumocfg"
+    sumo_net_file_path: "/app/examples/maps/Mcity/mcity.net.xml"
+    sumo_cfg_file_path: "/app/examples/maps/Mcity/mcity.sumocfg"
     drive_rule: "righthand"
     av_debug_control: true
 
@@ -150,8 +150,8 @@ simulator:
       - "tripinfo"
 
 input:
-  sumo_net_file: "/app/examples/maps/Mcity_safetest_carla/mcity.net.xml"
-  sumo_config_file: "/app/examples/maps/Mcity_safetest_carla/mcity.sumocfg"
+  sumo_net_file: "/app/examples/maps/Mcity/mcity.net.xml"
+  sumo_config_file: "/app/examples/maps/Mcity/mcity.sumocfg"
 
 logging:
   levels:
