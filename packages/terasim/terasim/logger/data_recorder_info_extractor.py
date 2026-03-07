@@ -263,7 +263,7 @@ class DataRecorderInfoExtractor(InfoExtractor):
                 vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
                 vru_state.sumo_angle = traci.person.getAngle(vru_id)
                 vru_state.speed = traci.person.getSpeed(vru_id)
-                vru_state.acceleration = traci.person.getAcceleration(vru_id)
+                vru_state.acceleration = traci.person.getAcceleration(vru_id) if hasattr(traci.person, 'getAcceleration') else 0.0
                 vru_state.length = traci.person.getLength(vru_id)
                 vru_state.width = traci.person.getWidth(vru_id)
                 vru_state.height = traci.person.getHeight(vru_id)
