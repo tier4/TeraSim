@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  terasim_service:
+    build:
+      context: ../../..
+      dockerfile: apps/deploy/docker/Dockerfile.source
+    image: terasim-service:source
+    container_name: terasim_service
+    network_mode: host
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ENVIRONMENT=development
+      - HOME=/tmp
+    volumes:
+      - ../examples:/app/examples
+      - ../outputs:/app/outputs
+    command: ["/bin/bash", "/app/examples/main_cosim.sh"]

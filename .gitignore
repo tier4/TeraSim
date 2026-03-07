@@ -188,3 +188,6 @@ README_QUICKSTART.md
 run_experiments_debug.py
 test_docker.sh
 /local_test
+
+apps/deploy/outputs
+apps/deploy/examples/maps
