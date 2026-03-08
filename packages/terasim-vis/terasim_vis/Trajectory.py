@@ -536,18 +536,20 @@ class Trajectories:
             ax = plt.gca()
         # for lane in lanes:
         #     ax.add_patch(lane)
-        for traj in self.trajectories:
-            if traj.id == "AV":
-                values = traj._get_values_at_time(time)
-                x_av, y_av = values["x"], values["y"]
-                if x_av is None or y_av is None:
-                    print("AV info is none!!!")
-                    continue
-                xlim = (x_av - 120.0, x_av + 120.0)
-                ylim = (y_av - 120.0, y_av + 120.0)
-                ax.axis("equal")
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
+        # NOTE: Removed hardcoded AV camera follow - use visualize_fcd.py's
+        # ego_vehicle_id and center_on_ego config instead.
+        # for traj in self.trajectories:
+        #     if traj.id == "AV":
+        #         values = traj._get_values_at_time(time)
+        #         x_av, y_av = values["x"], values["y"]
+        #         if x_av is None or y_av is None:
+        #             print("AV info is none!!!")
+        #             continue
+        #         xlim = (x_av - 120.0, x_av + 120.0)
+        #         ylim = (y_av - 120.0, y_av + 120.0)
+        #         ax.axis("equal")
+        #         ax.set_xlim(xlim)
+        #         ax.set_ylim(ylim)
         for traj in self.trajectories:
             values = traj._get_values_at_time(time)
             x, y = values["x"], values["y"]
