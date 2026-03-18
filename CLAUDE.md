@@ -8,77 +8,6 @@ TeraSim is an open-source traffic simulation platform designed for naturalistic 
 
 This is a monorepo containing multiple Python packages managed with uv workspace. The project includes the core simulation engine, NDE-NADE algorithms for naturalistic and adversarial environments, a FastAPI service for integration, environment generation tools, data processing utilities, and visualization components.
 
-## Common Development Commands
-
-### Environment Setup
-```bash
-# Quick setup (recommended)
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-./setup_environment.sh  # Automated setup script
-
-# Manual setup with uv (if needed)
-conda create -n terasim python=3.10
-conda activate terasim
-uv sync  # Install all workspace dependencies
-```
-
-### Testing
-```bash
-# Run all tests with coverage
-uv run pytest
-# or: make test
-
-# Run specific test suites
-make test-core         # Core simulation tests
-make test-envgen      # Environment generation tests
-make test-service     # Service API tests
-make test-integration # Integration tests
-make test-fast        # Skip slow tests
-
-# Run specific test file
-uv run pytest tests/test_core/test_physics.py::test_dummy
-
-# With coverage HTML report
-uv run pytest --cov=terasim --cov-report=html
-```
-
-### Code Quality
-```bash
-# Format code
-uv run black packages/
-# or: make format
-
-# Sort imports
-uv run isort packages/
-
-# Lint code (ruff is preferred over flake8)
-uv run ruff check packages/
-# or: make lint
-
-# Type checking
-uv run mypy packages/terasim/
-```
-
-### Running Simulations
-```bash
-# Run main simulation with HTTP API (default: police pullover scenario)
-python run_experiments.py
-
-# Run debug mode with GUI (cutin scenario)
-python run_experiments_debug.py
-
-# Start TeraSim FastAPI service
-python run_service.py  # Starts on port 8000
-
-# Run basic simulation example
-cd examples/scripts/
-python example.py  # Set gui_flag=True in script for GUI mode
-
-# Run with custom scenario
-python run_experiments.py --config examples/scenarios/urban_construction_ann_arbor.yaml
-```
-
 ## Architecture Overview
 
 ### Monorepo Structure
@@ -187,3 +116,17 @@ TeraSim/
 2. Configure co-simulation in service settings
 3. Use `terasim-service` with cosim plugin
 4. Exchange states via API endpoints
+
+以上内容は、TeraSimのリポジトリに元から記されていたものです。
+
+現在私は、別のリポジトリでCARLAサーバを起動し、
+```
+docker compose -f /home/t-cho/tier4/TeraSim/docker-compose.cosim-odaiba.yml up -d
+```
+のように特定のDockerfileでコンテナを起動することで、TeraSimとCARLAの共シミュレーションを実行しています。
+
+シミュレーション結果の可視化は、output内に作成されたディレクトリ内に/home/t-cho/tier4/TeraSim/apps/deploy/outputs/vis.yaml.sampleをコピーし、
+```
+uv run /home/t-cho/tier4/TeraSim/scripts/visualize_fcd.py <yamlファイル>
+```
+で実行しています。
