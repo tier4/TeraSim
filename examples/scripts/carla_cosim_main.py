@@ -7,6 +7,7 @@ Usage:
     python carla_cosim_main.py --terasim_config /path/to/config.yaml
 """
 import argparse
+import time
 
 import carla
 from terasim_service.utils.carla import CarlaCosim
@@ -46,6 +47,11 @@ def main():
         action='store_true',
         help='Activate async mode execution')
     argparser.add_argument(
+        '--carla_timeout',
+        default=10.0,
+        type=float,
+        help='Timeout in seconds for CARLA client connection (default: 10.0)')
+    argparser.add_argument(
         '--map_name',
         default='',
         type=str,
@@ -66,10 +72,38 @@ def main():
     args = argparser.parse_args()
     carla_cosim = CarlaCosim(args)
 
-    settings = carla_cosim.world.get_settings()
-    settings.fixed_delta_seconds = args.step_length
-    settings.synchronous_mode = True
-    carla_cosim.world.apply_settings(settings)
+    if not args.async_mode:
+        # Apply synchronous mode with retry - OpenDRIVE maps may need multiple attempts
+        for attempt in range(5):
+            settings = carla_cosim.world.get_settings()
+            settings.fixed_delta_seconds = args.step_length
+            settings.synchronous_mode = True
+            carla_cosim.world.apply_settings(settings)
+            time.sleep(1.0)
+            current = carla_cosim.world.get_settings()
+            if current.synchronous_mode:
+                print(f"Synchronous mode enabled (attempt {attempt + 1})")
+                break
+            print(f"Settings not applied yet, retrying... (attempt {attempt + 1})")
+            try:
+                carla_cosim.world.tick()
+            except Exception:
+                pass
+            time.sleep(2.0)
+    else:
+        # Ensure async mode is set (previous runs may leave sync mode active)
+        settings = carla_cosim.world.get_settings()
+        if settings.synchronous_mode:
+            try:
+                carla_cosim.world.tick()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            carla_cosim.world.apply_settings(settings)
+            time.sleep(1.0)
+        print("Running in async mode")
 
     carla_cosim.world.set_weather(carla.WeatherParameters.WetSunset)
 
