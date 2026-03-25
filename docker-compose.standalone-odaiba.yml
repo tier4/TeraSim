@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  terasim_standalone:
+    build:
+      context: .
+      dockerfile: Dockerfile.cosim
+    image: terasim-service:cosim
+    container_name: terasim_standalone_odaiba
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+    volumes:
+      - ./examples:/app/examples
+      - ./outputs:/app/outputs
+      - ./scripts:/app/scripts
+    command: ["/bin/bash", "/app/examples/scripts/main_standalone_odaiba.sh"]

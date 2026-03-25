@@ -1,0 +1,105 @@
+simulation_module: "my_simulations"
+simulation_class: "CarSimulation"
+parameters:
+  num_cars: 100
+  simulation_time: 3600
+seed: 42
+
+simulation_type: "safetest_odaiba_standalone"
+
+output:
+  dir: "/app/outputs"
+  name: "odaiba_nade_standalone"
+  nth: "0_0"
+  aggregated_dir: "aggregated"
+
+environment:
+  module: "terasim_nde_nade.envs"
+  class: "NADE"
+  parameters:
+    vehicle_factory: "terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory"
+    info_extractor: "terasim.logger.infoextractor.InfoExtractor"
+    log_flag: true
+    warmup_time_lb: 60
+    warmup_time_ub: 62
+    run_time: 120
+
+    MOBIL_lc_flag: true
+    stochastic_acc_flag: false
+    sumo_net_file_path: "/app/examples/maps/odaiba/odaiba.net.xml"
+    sumo_cfg_file_path: "/app/examples/maps/odaiba/odaiba.sumocfg"
+    drive_rule: "righthand"
+
+    adversity_sampling_probability: 1.0
+    adversity_cfg:
+      vehicle:
+        intersection_cutin:
+          _target_: terasim_nde_nade.adversity.vehicles.lanechange_adversity.LanechangeAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_cutin"
+
+        intersection_rearend_leader:
+          _target_: terasim_nde_nade.adversity.vehicles.leader_adversity.LeaderAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_rearend"
+
+        intersection_rearend_follower:
+          _target_: terasim_nde_nade.adversity.vehicles.follower_adversity.FollowerAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_rearend_follower"
+
+        intersection_tfl:
+          _target_: terasim_nde_nade.adversity.vehicles.trafficrule_adversity.TrafficRuleAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_tfl"
+
+        intersection_headon:
+          _target_: terasim_nde_nade.adversity.vehicles.headon_adversity.HeadonAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_headon"
+
+      vulnerable_road_user:
+        jaywalking:
+          _target_: terasim_nde_nade.adversity.vru.jaywalking_adversity.JaywalkingAdversity
+          _convert_: 'all'
+          location: 'crosswalk'
+          ego_type: 'vulnerable_road_user'
+          probability: 0.01
+          predicted_collision_type: "intersection_jaywalking"
+
+simulator:
+  module: "terasim.simulator"
+  class: "Simulator"
+  parameters:
+    num_tries: 10
+    gui_flag: false
+    realtime_flag: false
+    sumo_output_file_types:
+      - "fcd_all"
+      - "collision"
+      - "tripinfo"
+    traffic_scale: 1.0
+
+input:
+  sumo_net_file: "/app/examples/maps/odaiba/odaiba.net.xml"
+  sumo_config_file: "/app/examples/maps/odaiba/odaiba.sumocfg"
+
+logging:
+  levels:
+    - "TRACE"
+    - "INFO"
