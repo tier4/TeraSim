@@ -196,3 +196,4 @@ apps/deploy/examples/maps
 # Generated map files (created at runtime)
 examples/maps/odaiba/
 examples/maps/odaiba_ll2/
+examples/maps/odaiba_ll2_exp/

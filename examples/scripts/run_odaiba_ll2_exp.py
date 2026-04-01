@@ -1,0 +1,42 @@
+from pathlib import Path
+
+from terasim.envs.template import EnvTemplate
+from terasim.logger.infoextractor import InfoExtractor
+from terasim.simulator import Simulator
+from terasim.vehicle.controllers.high_efficiency_controller import HighEfficiencyController
+from terasim.vehicle.decision_models.idm_model import IDMModel
+from terasim.vehicle.factories.vehicle_factory import VehicleFactory
+from terasim.vehicle.sensors.ego import EgoSensor
+from terasim.vehicle.sensors.local import LocalSensor
+from terasim.vehicle.vehicle import Vehicle
+
+current_path = Path(__file__).parent
+maps_path = current_path / ".." / "maps" / "odaiba_ll2_exp"
+output_path = current_path / ".." / "output" / "odaiba_ll2_exp"
+
+
+class OdaibaVehicleFactory(VehicleFactory):
+    def create_vehicle(self, veh_id, simulator):
+        sensor_list = [EgoSensor(), LocalSensor(obs_range=40)]
+        decision_model = IDMModel(MOBIL_lc_flag=False, stochastic_acc_flag=True)
+        controller = HighEfficiencyController(simulator)
+        return Vehicle(
+            veh_id,
+            simulator,
+            sensors=sensor_list,
+            decision_model=decision_model,
+            controller=controller,
+        )
+
+
+env = EnvTemplate(vehicle_factory=OdaibaVehicleFactory(), info_extractor=InfoExtractor)
+sim = Simulator(
+    sumo_net_file_path=maps_path / "odaiba_ll2_exp.net.xml",
+    sumo_config_file_path=maps_path / "odaiba_ll2_exp.sumocfg",
+    num_tries=10,
+    gui_flag=False,
+    output_path=output_path,
+    sumo_output_file_types=["fcd_all"],
+)
+sim.bind_env(env)
+sim.run()
