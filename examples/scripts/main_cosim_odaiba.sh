@@ -73,7 +73,8 @@ print('Odaiba OpenDRIVE map loaded into CARLA!')
 
     # Run CARLA co-simulation
     python3 /app/examples/scripts/carla_cosim_main.py \
-        --terasim_config /app/examples/scenarios/cosim_odaiba.yaml || true
+        --terasim_config /app/examples/scenarios/cosim_odaiba.yaml \
+        --carla_timeout 30.0 || true
     CARLA_EXIT=$?
 
     echo "=========================================="
