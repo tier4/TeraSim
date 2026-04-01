@@ -117,4 +117,4 @@ The service exposes REST endpoints for:
 
 - Port 8000 conflicts: Use `kill -9 $(lsof -t -i:8000)` to clean up
 - Redis connection issues: Ensure Redis is running on port 6379
-- CARLA integration requires specific version 0.9.15
+- CARLA integration requires specific version 0.9.16

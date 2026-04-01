@@ -45,7 +45,8 @@ if [ "$CARLA_AVAILABLE" = true ]; then
     # Run CARLA co-simulation
     python3 /app/examples/scripts/carla_cosim_main.py \
         --terasim_config /app/examples/scenarios/cosim_mcity.yaml \
-        --map_name=McityMap_Main || true
+        --map_name=McityMap_Main \
+        --carla_timeout 30.0 || true
     CARLA_EXIT=$?
 
     echo "=========================================="
