@@ -282,11 +282,12 @@ def carla_to_utm(x, y):
 
     return utm_x, utm_y
 
-def sumo_to_carla(sumo_location, sumo_rotation, shape, offset):
+def sumo_to_carla(sumo_location, sumo_rotation, shape, offset, carla_map=None):
     # SUMO location is [x,y,z], repsernting the head center of the agent
     # SUMO rotation is [slope, angle, 0.0]
     # Shape is [length, width, height]
     # Offset is [x, y, z]
+    # carla_map is optional; if provided, pitch/roll are derived from road surface
     # Convert SUMO location to Carla location
     sumo_yaw = -1 * sumo_rotation[1] + 90
     carla_location = carla.Location(
@@ -294,10 +295,19 @@ def sumo_to_carla(sumo_location, sumo_rotation, shape, offset):
         y=-(sumo_location[1] - math.sin(math.radians(sumo_yaw)) * shape[0] / 2.0) + offset[1],
         z=sumo_location[2] + offset[2],
     )
+
+    pitch = sumo_rotation[0]
+    roll = sumo_rotation[2]
+    if carla_map is not None:
+        waypoint = carla_map.get_waypoint(carla_location)
+        if waypoint is not None:
+            pitch = waypoint.transform.rotation.pitch
+            roll = waypoint.transform.rotation.roll
+
     carla_rotation = carla.Rotation(
-        pitch=sumo_rotation[0],
+        pitch=pitch,
         yaw=sumo_rotation[1]-90,
-        roll=sumo_rotation[2],
+        roll=roll,
     )
     carla_transform = carla.Transform(carla_location, carla_rotation)
     return carla_transform

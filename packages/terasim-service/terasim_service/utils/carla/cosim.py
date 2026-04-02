@@ -63,6 +63,8 @@ class CarlaCosim(object):
         self.async_mode = args.async_mode
         self.step_length = args.step_length
 
+        self.carla_map = self.world.get_map()
+
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
         self.pedestrian_blueprints = create_pedestrian_blueprint(self.world)
@@ -637,13 +639,13 @@ class CarlaCosim(object):
             if carla_id > 0:
                 # Immediately set the correct road-level transform
                 sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
-                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct, self.carla_map)
                 vehicle = self.world.get_actor(carla_id)
                 if vehicle is not None:
                     vehicle.set_transform(carla_trasform)
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset, self.carla_map)
             vehicle = self.world.get_actor(carla_id)
             if vehicle is not None:
                 vehicle.set_transform(carla_trasform)
