@@ -15,6 +15,9 @@ services:
     volumes:
       - ./examples:/app/examples
       - ./outputs:/app/outputs
+      # Local patch for TeraSim cosim (TrafficLight type guard).
+      # Tracked in ../docs/upstream-issues.md; remove once upstreamed.
+      - ./packages/terasim-service/terasim_service/utils/carla/cosim.py:/app/packages/terasim-service/terasim_service/utils/carla/cosim.py:ro
     command: ["/bin/bash", "/app/examples/scripts/main_cosim.sh"]
 
   # mcity_carla:

@@ -3,6 +3,9 @@ import json
 import math
 import carla
 import random
+import xml.etree.ElementTree as ET
+
+import yaml
 
 from .tools import (
     carla_to_sumo,
@@ -59,6 +62,22 @@ class CarlaCosim(object):
         self.async_mode = args.async_mode
         self.step_length = args.step_length
 
+        # ------------------------------------------------------------------
+        # netOffset handling for OpenDRIVE-based SUMO networks.
+        #
+        # netconvert places the SUMO origin at the bottom-left of its bounding
+        # box by default, adding a `netOffset` that differs from the CARLA /
+        # OpenDRIVE world origin unless the map is geographically anchored
+        # (e.g. Mcity's realistic UTM lat_0/lon_0).
+        #
+        # For CARLA built-in maps (Town01..Town10) the OpenDRIVE has a
+        # placeholder geoReference (lat_0=0, lon_0=0) and netconvert yields a
+        # non-zero netOffset, so sumo_to_carla must compensate; otherwise all
+        # actors spawn at the wrong CARLA world coordinates.
+        # ------------------------------------------------------------------
+        self.net_offset_x, self.net_offset_y = self._read_sumo_net_offset(args.terasim_config)
+        print(f"SUMO netOffset compensation: (x={self.net_offset_x:.3f}, y={self.net_offset_y:.3f})")
+
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
         self.pedestrian_blueprints = create_pedestrian_blueprint(self.world)
@@ -79,6 +98,28 @@ class CarlaCosim(object):
             if terasim_status.get("status", None) == "wait_for_tick":
                 break
             time.sleep(0.1)
+
+    @staticmethod
+    def _read_sumo_net_offset(terasim_config_path):
+        """Read <location netOffset> from the SUMO net.xml referenced in the TeraSim YAML.
+        Returns (netOffset_x, netOffset_y) as floats, or (0.0, 0.0) if unavailable.
+        """
+        try:
+            with open(terasim_config_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            env_params = (cfg.get("environment") or {}).get("parameters") or {}
+            net_path = env_params.get("sumo_net_file_path") or (cfg.get("input") or {}).get("sumo_net_file")
+            if not net_path:
+                return 0.0, 0.0
+            tree = ET.parse(net_path)
+            loc = tree.getroot().find("location")
+            if loc is None:
+                return 0.0, 0.0
+            parts = loc.get("netOffset", "0,0").split(",")
+            return float(parts[0]), float(parts[1])
+        except Exception as e:
+            print(f"Warning: could not read SUMO netOffset ({e}); using (0, 0).")
+            return 0.0, 0.0
 
     def tick(self):
         if self.async_mode:
@@ -202,6 +243,14 @@ class CarlaCosim(object):
                     light_actor = self.world.get_actor(light_id)
                     if not light_actor:
                         print(f"Traffic light with ID {light_id} not found in CARLA.")
+                        continue
+
+                    # Defensive guard: CARLA may return a non-TrafficLight Actor
+                    # when SUMO's TLS program parameters are not mapped to a
+                    # real CARLA landmark_id (e.g. netconvert --tls.guess nets
+                    # like Town01). Calling set_state on such an actor raises
+                    # AttributeError and aborts the whole cosim tick.
+                    if not isinstance(light_actor, carla.TrafficLight):
                         continue
 
                     light_state = sumo_tls[i]
@@ -348,11 +397,11 @@ class CarlaCosim(object):
                 blueprint.set_attribute("color", "255, 0, 0")
             else:
                 blueprint.set_attribute("color", "0, 102, 204")
-            sumo_offset = [0.0, 0.0, shape[2]] # spawn the vehicle higher than the ground to make sure it is available
+            sumo_offset = [-self.net_offset_x, self.net_offset_y, shape[2]] # spawn the vehicle higher than the ground to make sure it is available
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             carla_id = spawn_actor(self.client, blueprint, carla_trasform)
         else:
-            sumo_offset = [0.0, 0.0, 0.0] # move the vehicle back to the ground
+            sumo_offset = [-self.net_offset_x, self.net_offset_y, 0.0] # move the vehicle back to the ground
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             vehicle = self.world.get_actor(carla_id)
             vehicle.set_transform(carla_trasform)
@@ -375,14 +424,14 @@ class CarlaCosim(object):
             else:
                 blueprint = random.choice(self.pedestrian_blueprints)
             blueprint.set_attribute("role_name", vru_id)
-            sumo_offset = [0.0, 0.0, shape[2]] # spawn the VRU higher than the ground to make sure it is available
+            sumo_offset = [-self.net_offset_x, self.net_offset_y, shape[2]] # spawn the VRU higher than the ground to make sure it is available
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             carla_id = spawn_actor(self.client, blueprint, carla_trasform)
         else:
             # move the VRU back to the ground
-            sumo_offset = [0.0, 0.0, shape[2]/2.0]
+            sumo_offset = [-self.net_offset_x, self.net_offset_y, shape[2]/2.0]
             if "BIKE" in vru_info["type"]:
-                sumo_offset = [0.0, 0.0, 0.0]
+                sumo_offset = [-self.net_offset_x, self.net_offset_y, 0.0]
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             pedestrian = self.world.get_actor(carla_id)
             pedestrian.set_transform(carla_trasform)
