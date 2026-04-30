@@ -1,0 +1,192 @@
+simulation_module: my_simulations
+simulation_class: CarSimulation
+parameters:
+  num_cars: 100
+  simulation_time: 3600
+seed: 42
+simulation_type: safetest_odaiba_ll2
+output:
+  dir: /app/outputs
+  name: odaiba_ll2_generated_test
+  nth: '0_0'
+  aggregated_dir: aggregated
+environment:
+  module: terasim_nde_nade.envs
+  class: NADEWithAV
+  parameters:
+    vehicle_factory: terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory
+    info_extractor: terasim.logger.infoextractor.InfoExtractor
+    log_flag: true
+    warmup_time_lb: 500
+    warmup_time_ub: 520
+    run_time: 600
+    MOBIL_lc_flag: true
+    stochastic_acc_flag: false
+    sumo_net_file_path: /app/examples/maps/odaiba_ll2/network.net.xml
+    sumo_cfg_file_path: /app/examples/maps/odaiba_ll2/simulation.sumocfg
+    drive_rule: righthand
+    adversity_sampling_probability: 1.0
+    adversity_cfg:
+      vehicle:
+        intersection_cutin:
+          _target_: terasim_nde_nade.adversity.vehicles.lanechange_adversity.LanechangeAdversity
+          _convert_: all
+          location: intersection
+          ego_type: vehicle
+          probability: 0.01
+          predicted_collision_type: intersection_cutin
+        intersection_rearend_leader:
+          _target_: terasim_nde_nade.adversity.vehicles.leader_adversity.LeaderAdversity
+          _convert_: all
+          location: intersection
+          ego_type: vehicle
+          probability: 0.01
+          predicted_collision_type: intersection_rearend
+        intersection_rearend_follower:
+          _target_: terasim_nde_nade.adversity.vehicles.follower_adversity.FollowerAdversity
+          _convert_: all
+          location: intersection
+          ego_type: vehicle
+          probability: 0.01
+          predicted_collision_type: intersection_rearend_follower
+        intersection_tfl:
+          _target_: terasim_nde_nade.adversity.vehicles.trafficrule_adversity.TrafficRuleAdversity
+          _convert_: all
+          location: intersection
+          ego_type: vehicle
+          probability: 0.01
+          predicted_collision_type: intersection_tfl
+        intersection_headon:
+          _target_: terasim_nde_nade.adversity.vehicles.headon_adversity.HeadonAdversity
+          _convert_: all
+          location: intersection
+          ego_type: vehicle
+          probability: 0.01
+          predicted_collision_type: intersection_headon
+      vulnerable_road_user:
+        jaywalking:
+          _target_: terasim_nde_nade.adversity.vru.jaywalking_adversity.JaywalkingAdversity
+          _convert_: all
+          location: crosswalk
+          ego_type: vulnerable_road_user
+          probability: 0.01
+          predicted_collision_type: intersection_jaywalking
+    av_debug_control: true
+    AV_cfg:
+      type: NDE_URBAN
+      cache_radius: 100
+      control_radius: 50
+      route:
+      - edge_1612
+      - edge_1608
+      - edge_1605
+      - edge_1603
+      - edge_3222
+      - edge_1287
+      - edge_1288
+      - edge_1295
+      - edge_1026
+      - edge_1028
+      - edge_1147
+      - edge_757
+      - edge_760
+      - edge_773
+      - edge_852
+      - edge_3149
+      - edge_776
+      - edge_855
+      - edge_777
+      - edge_3244
+      - edge_782
+      - edge_732
+      - edge_731
+      - edge_728
+      - edge_857
+      - edge_858
+      - edge_900
+      - edge_860
+      - edge_942
+      - edge_945
+      - edge_947
+      - edge_954
+      - edge_955
+      - edge_963
+      - edge_559
+      - edge_560
+      - edge_561
+      - edge_564
+      - edge_565
+      - edge_1537
+      - edge_570
+      - edge_571
+      - edge_618
+      - edge_616
+      - edge_611
+      - edge_612
+      - edge_603
+      - edge_604
+      - edge_1396
+      - edge_1398
+      - edge_1399
+      - edge_1422
+      - edge_1402
+      - edge_1403
+      - edge_1413
+      - edge_682
+      - edge_1540
+      - edge_677
+      - edge_683
+      - edge_685
+      - edge_600
+      - edge_601
+      - edge_607
+      - edge_608
+      - edge_610
+      - edge_619
+      - edge_620
+      - edge_544
+      - edge_545
+      - edge_1534
+      - edge_1535
+      - edge_550
+      - edge_551
+      - edge_557
+      - edge_983
+      - edge_908
+      - edge_911
+      - edge_912
+      - edge_919
+      - edge_922
+      - edge_927
+      - edge_930
+      - edge_861
+      - edge_862
+      - edge_864
+      - edge_865
+      - edge_868
+      - edge_729
+      - edge_730
+      - edge_3227
+      - edge_734
+      - edge_836
+      - edge_736
+      - edge_839
+simulator:
+  module: terasim.simulator
+  class: Simulator
+  parameters:
+    num_tries: 10
+    gui_flag: false
+    realtime_flag: false
+    sumo_output_file_types:
+    - fcd_all
+    - collision
+    - tripinfo
+    traffic_scale: 1.0
+input:
+  sumo_net_file: /app/examples/maps/odaiba_ll2/network.net.xml
+  sumo_config_file: /app/examples/maps/odaiba_ll2/simulation.sumocfg
+logging:
+  levels:
+  - TRACE
+  - INFO

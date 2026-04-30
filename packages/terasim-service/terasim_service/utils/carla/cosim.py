@@ -548,6 +548,8 @@ class CarlaCosim(object):
                         client=self.client,
                         blueprint=construction_cone,
                         transform=spawn_point,
+                        world=self.world,
+                        actor_role="construction_cone",
                     )
                     print(f"created construction cone: {id}")
 
@@ -633,7 +635,13 @@ class CarlaCosim(object):
             # Spawn elevated to avoid collision with road geometry, then set correct transform
             sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            carla_id = spawn_actor(self.client, blueprint, spawn_transform)
+            carla_id = spawn_actor(
+                self.client,
+                blueprint,
+                spawn_transform,
+                world=self.world,
+                actor_role=veh_id,
+            )
             if carla_id > 0:
                 # Immediately set the correct road-level transform
                 sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
@@ -669,7 +677,13 @@ class CarlaCosim(object):
             # Spawn elevated to avoid collision with road geometry
             sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            carla_id = spawn_actor(self.client, blueprint, spawn_transform)
+            carla_id = spawn_actor(
+                self.client,
+                blueprint,
+                spawn_transform,
+                world=self.world,
+                actor_role=vru_id,
+            )
             if carla_id > 0:
                 z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
                 sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)

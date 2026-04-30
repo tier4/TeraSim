@@ -8,6 +8,7 @@ import utm
 ZONE_NUMBER = 17
 ZONE_LETTER = "T"
 GNSS_ORIGIN = [42.3005934157, -83.699283188811]
+_SPAWN_DIAGNOSTIC_LOGGED = set()
 
 TLS_NODES = {
     "NODE_11": [(83,), (92,), None, (88,), (89,), (86,), None, (84,)],
@@ -136,7 +137,105 @@ def isPedestrian(actorID):
     return "VRU" in actorID
 
 
-def spawn_actor(client, blueprint, transform):
+def _distance_3d(a, b):
+    return math.sqrt(
+        (a.x - b.x) ** 2
+        + (a.y - b.y) ** 2
+        + (a.z - b.z) ** 2
+    )
+
+
+def _label_name(label):
+    return getattr(label, "name", str(label))
+
+
+def _summarize_nearby_actors(world, location, *, horizontal_radius=6.0, vertical_tolerance=4.0, limit=5):
+    nearby = []
+    for actor in world.get_actors():
+        if actor.type_id.startswith("sensor."):
+            continue
+        actor_location = actor.get_location()
+        dx = actor_location.x - location.x
+        dy = actor_location.y - location.y
+        dz = actor_location.z - location.z
+        horizontal_distance = math.sqrt(dx**2 + dy**2)
+        if horizontal_distance > horizontal_radius or abs(dz) > vertical_tolerance:
+            continue
+        nearby.append(
+            {
+                "id": actor.id,
+                "type_id": actor.type_id,
+                "role_name": actor.attributes.get("role_name", ""),
+                "horizontal_distance": round(horizontal_distance, 2),
+                "dz": round(dz, 2),
+            }
+        )
+    nearby.sort(key=lambda row: (row["horizontal_distance"], abs(row["dz"])))
+    return nearby[:limit]
+
+
+def _summarize_raycast_hits(world, start_location, end_location, *, limit=6):
+    summaries = []
+    try:
+        hits = world.cast_ray(start_location, end_location)
+    except Exception:
+        return summaries
+
+    for hit in hits[:limit]:
+        summaries.append(
+            {
+                "label": _label_name(hit.label),
+                "distance": round(_distance_3d(start_location, hit.location), 2),
+                "z": round(hit.location.z, 2),
+            }
+        )
+    return summaries
+
+
+def _infer_spawn_collision_hint(nearby_actors, down_hits, up_hits):
+    if nearby_actors:
+        return "nearby_actor_likely"
+
+    non_road_labels = {
+        row["label"]
+        for row in down_hits + up_hits
+        if row["label"] not in {"Roads", "RoadLines", "Ground", "Terrain", "NONE"}
+    }
+    if non_road_labels:
+        return "static_geometry_possible"
+
+    return "unknown"
+
+
+def _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role):
+    location = transform.location
+    nearby_actors = _summarize_nearby_actors(world, location)
+    down_hits = _summarize_raycast_hits(
+        world,
+        carla.Location(location.x, location.y, location.z + 1.0),
+        carla.Location(location.x, location.y, location.z - 8.0),
+    )
+    up_hits = _summarize_raycast_hits(
+        world,
+        carla.Location(location.x, location.y, location.z),
+        carla.Location(location.x, location.y, location.z + 8.0),
+    )
+    cause_hint = _infer_spawn_collision_hint(nearby_actors, down_hits, up_hits)
+    logging.error(
+        "Spawn collision diagnostics. actor=%s blueprint=%s hint=%s location=(%.2f, %.2f, %.2f) nearby_actors=%s down_hits=%s up_hits=%s",
+        actor_role or "<unknown>",
+        blueprint.id,
+        cause_hint,
+        location.x,
+        location.y,
+        location.z,
+        nearby_actors,
+        down_hits,
+        up_hits,
+    )
+
+
+def spawn_actor(client, blueprint, transform, *, world=None, actor_role=None):
     """
     Spawns a new actor.
 
@@ -153,6 +252,15 @@ def spawn_actor(client, blueprint, transform):
     response = client.apply_batch_sync(batch, True)[0]
     if response.error:
         logging.error("Spawn carla actor failed. %s", response.error)
+        diagnostic_key = actor_role or (
+            blueprint.id,
+            round(transform.location.x, 1),
+            round(transform.location.y, 1),
+            round(transform.location.z, 1),
+        )
+        if world is not None and diagnostic_key not in _SPAWN_DIAGNOSTIC_LOGGED:
+            _SPAWN_DIAGNOSTIC_LOGGED.add(diagnostic_key)
+            _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role)
         return -1
 
     return response.actor_id

@@ -1,0 +1,65 @@
+FROM carlasim/carla:0.9.16
+
+USER root
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Tokyo
+ARG PYTHON_VERSION=3.10.18
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    xvfb x11vnc openbox novnc websockify \
+    net-tools procps \
+    python3-pip python3-numpy \
+    wget ca-certificates \
+    build-essential \
+    zlib1g-dev \
+    libssl-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libncursesw5-dev \
+    libffi-dev \
+    liblzma-dev \
+    libgdbm-dev \
+    libdb5.3-dev \
+    libexpat1-dev \
+    uuid-dev \
+    tk-dev \
+    libsdl2-2.0-0 libsdl2-image-2.0-0 libsdl2-mixer-2.0-0 libsdl2-ttf-2.0-0 \
+    libsm6 libxext6 libxrender1 \
+ && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && python3 -m pip install --no-cache-dir -U pip pygame \
+ && cd /tmp \
+ && wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
+ && tar -xf Python-${PYTHON_VERSION}.tgz \
+ && cd Python-${PYTHON_VERSION} \
+ && ./configure --prefix=/usr/local --with-ensurepip=install \
+ && make -j"$(nproc)" \
+ && make altinstall \
+ && /usr/local/bin/python3.10 -m pip install --no-cache-dir -U pip setuptools wheel \
+ && /usr/local/bin/python3.10 -m pip install --no-cache-dir \
+    /workspace/PythonAPI/carla/dist/carla-0.9.16-cp310-cp310-manylinux_2_31_x86_64.whl \
+    numpy \
+    pygame \
+ && mkdir -p /tmp/.X11-unix /home/carla/workspace \
+ && chmod 1777 /tmp/.X11-unix \
+ && chown -R carla:carla /home/carla/workspace \
+ && rm -rf /tmp/Python-${PYTHON_VERSION} /tmp/Python-${PYTHON_VERSION}.tgz \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/start_carla_novnc.sh /start_carla_novnc.sh
+RUN chmod +x /start_carla_novnc.sh
+
+EXPOSE 6080 5900 2000 2001 2002
+
+ENV DISPLAY=:1
+ENV RESOLUTION=1600x900x24
+ENV RESX=1600
+ENV RESY=900
+ENV CARLA_RPC_PORT=2000
+ENV SDL_VIDEODRIVER=x11
+ENV CARLA_PYTHON=python3.10
+
+USER carla
+ENTRYPOINT ["/start_carla_novnc.sh"]
