@@ -100,6 +100,13 @@ http://localhost:6092/vnc.html
 headless
 ```
 
+後で co-sim を起動すると、SUMO 側の noVNC も既定で `6093` に出ます。
+CARLA と SUMO を同時に見る場合は、最初から両方 forward しておくと便利です。
+
+```bash
+ssh -N -L 6092:localhost:6092 -L 6093:localhost:6093 <user>@<server>
+```
+
 ## 5. CARLA package を import する
 
 package を CARLA container の `Import` ディレクトリへ入れて import します。
@@ -202,6 +209,42 @@ CARLA_PACKAGE_MAP_NAME=odaibatest5 \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
+この runner は既定で SUMO GUI も noVNC 上に起動します。
+SUMO GUI は AV を追尾する view に自動設定されます。
+
+```text
+CARLA noVNC: http://localhost:6092/vnc.html
+SUMO noVNC:  http://localhost:6093/vnc.html
+Password:    headless
+```
+
+SUMO の寄り具合を変えたい場合は `SUMO_GUI_TRACK_ZOOM` を調整します。
+値を大きくすると近く、小さくすると広く見えます。
+
+```bash
+cd /home/h-kawai/TeraSim
+SUMO_GUI_TRACK_ZOOM=650 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
+```
+
+追尾対象を変える場合は `SUMO_GUI_TRACK_VEHICLE` を指定します。
+
+SUMO GUI が不要な場合だけ、次のように無効化します。
+
+```bash
+cd /home/h-kawai/TeraSim
+ENABLE_SUMO_GUI=0 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
+```
+
+port が衝突する場合は `SUMO_NOVNC_PORT` と `SUMO_VNC_PORT` を変更してください。
+
+```bash
+cd /home/h-kawai/TeraSim
+SUMO_NOVNC_PORT=6094 SUMO_VNC_PORT=5914 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
+```
+
 この wrapper は次を自動でやります。
 
 - `carla-novnc-test` の container IP を自動検出
@@ -209,6 +252,8 @@ CARLA_PACKAGE_MAP_NAME=odaibatest5 \
 - TeraSim port を空き port から自動選択
 - `cosim_odaiba_ll2_generated.yaml` を使用
 - Odaiba 用の `SUMO_TO_CARLA_OFFSET_*` を注入
+- SUMO GUI/noVNC 用の runtime config を `/tmp` に生成
+- SUMO GUI を `SUMO_GUI_TRACK_VEHICLE` に追従させる
 
 host 側の公開 port `2010` を明示的に使いたい場合だけ、こちらです。
 

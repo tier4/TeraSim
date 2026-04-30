@@ -9,6 +9,44 @@ CARLA_MAP_LOAD_TIMEOUT=${CARLA_MAP_LOAD_TIMEOUT:-600}
 CARLA_HOST=${CARLA_HOST:-localhost}
 TERASIM_PORT=${TERASIM_PORT:-8000}
 CARLA_COSIM_ASYNC_MODE=${CARLA_COSIM_ASYNC_MODE:-0}
+ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
+SUMO_DISPLAY=${SUMO_DISPLAY:-:20}
+SUMO_NOVNC_PORT=${SUMO_NOVNC_PORT:-6093}
+SUMO_VNC_PORT=${SUMO_VNC_PORT:-5913}
+VNC_PASSWORD=${VNC_PASSWORD:-headless}
+SUMO_GUI_TRACK_VEHICLE=${SUMO_GUI_TRACK_VEHICLE:-AV}
+SUMO_GUI_TRACK_ZOOM=${SUMO_GUI_TRACK_ZOOM:-900}
+
+ORIGINAL_TERASIM_CONFIG=${TERASIM_CONFIG}
+RUNTIME_TERASIM_CONFIG=""
+SUMO_NOVNC_PID=""
+TERASIM_PID=""
+
+is_enabled() {
+    case "${1,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cleanup() {
+    if [ -n "${TERASIM_PID}" ]; then
+        kill "${TERASIM_PID}" 2>/dev/null || true
+        wait "${TERASIM_PID}" 2>/dev/null || true
+        TERASIM_PID=""
+    fi
+
+    if [ -n "${SUMO_NOVNC_PID}" ]; then
+        kill "${SUMO_NOVNC_PID}" 2>/dev/null || true
+        wait "${SUMO_NOVNC_PID}" 2>/dev/null || true
+        SUMO_NOVNC_PID=""
+    fi
+}
+trap cleanup EXIT INT TERM
 
 echo "=========================================="
 echo " TeraSim-CARLA Odaiba LL2 Packaged Co-Sim"
@@ -16,9 +54,62 @@ echo "  CARLA map: ${CARLA_PACKAGE_MAP_NAME}"
 echo "  Max time: ${MAX_SIM_TIME}s"
 echo "  Config: ${TERASIM_CONFIG}"
 echo "  TeraSim port: ${TERASIM_PORT}"
+echo "  SUMO GUI/noVNC: ${ENABLE_SUMO_GUI}"
+echo "  SUMO GUI track vehicle: ${SUMO_GUI_TRACK_VEHICLE}"
+echo "  SUMO GUI track zoom: ${SUMO_GUI_TRACK_ZOOM}"
 echo "=========================================="
 
-echo "[1/5] Starting Redis server..."
+if is_enabled "${ENABLE_SUMO_GUI}"; then
+    echo "[1/6] Starting SUMO noVNC desktop..."
+    export SUMO_DISPLAY
+    export SUMO_NOVNC_PORT
+    export SUMO_VNC_PORT
+    export VNC_PASSWORD
+    export SUMO_GUI_TRACK_VEHICLE
+    export SUMO_GUI_TRACK_ZOOM
+    export DISPLAY="${SUMO_DISPLAY}"
+    export USE_LIBSUMO=0
+
+    start_sumo_novnc.sh >/tmp/sumo-novnc.log 2>&1 &
+    SUMO_NOVNC_PID=$!
+    sleep 1
+    if ! kill -0 "${SUMO_NOVNC_PID}" 2>/dev/null; then
+        echo "ERROR: SUMO noVNC desktop failed to start."
+        cat /tmp/sumo-novnc.log || true
+        exit 1
+    fi
+
+    RUNTIME_TERASIM_CONFIG="/tmp/$(basename "${TERASIM_CONFIG}" .yaml)_sumo_gui_$$.yaml"
+    TERASIM_CONFIG_SOURCE="${TERASIM_CONFIG}" \
+    TERASIM_RUNTIME_CONFIG="${RUNTIME_TERASIM_CONFIG}" \
+    python3 - <<'PY'
+import os
+import yaml
+
+source_path = os.environ["TERASIM_CONFIG_SOURCE"]
+runtime_path = os.environ["TERASIM_RUNTIME_CONFIG"]
+
+with open(source_path, "r") as file:
+    config = yaml.safe_load(file)
+
+simulator = config.setdefault("simulator", {})
+parameters = simulator.setdefault("parameters", {})
+parameters["gui_flag"] = True
+
+with open(runtime_path, "w") as file:
+    yaml.safe_dump(config, file, sort_keys=False)
+PY
+    TERASIM_CONFIG="${RUNTIME_TERASIM_CONFIG}"
+
+    echo "  SUMO noVNC: http://localhost:${SUMO_NOVNC_PORT}/vnc.html"
+    echo "  SUMO VNC password: ${VNC_PASSWORD}"
+    echo "  Runtime TeraSim config: ${TERASIM_CONFIG}"
+    echo "  Source TeraSim config: ${ORIGINAL_TERASIM_CONFIG}"
+else
+    echo "[1/6] SUMO GUI/noVNC disabled."
+fi
+
+echo "[2/6] Starting Redis server..."
 if python3 -c "
 import socket
 s = socket.socket()
@@ -32,14 +123,14 @@ else
     redis-server &
 fi
 
-echo "[2/5] Starting TeraSim server..."
+echo "[3/6] Starting TeraSim server..."
 uvicorn terasim_service.api:app --host 0.0.0.0 --port "${TERASIM_PORT}" &
 TERASIM_PID=$!
 
-echo "[3/5] Waiting 30s for TeraSim server to be ready..."
+echo "[4/6] Waiting 30s for TeraSim server to be ready..."
 sleep 30
 
-echo "[4/5] Checking CARLA server..."
+echo "[5/6] Checking CARLA server..."
 echo "------------------------------------------"
 
 python3 -u -c "
@@ -52,7 +143,7 @@ print(f'CARLA server version: {version}')
 
 echo "  CARLA is available."
 
-echo "[5/5] Loading packaged CARLA map and starting co-simulation..."
+echo "[6/6] Loading packaged CARLA map and starting co-simulation..."
 echo "------------------------------------------"
 
 python3 -u -c "
@@ -160,17 +251,17 @@ if [ "${CARLA_COSIM_ASYNC_MODE}" = "1" ]; then
     CARLA_COSIM_ARGS+=(--async_mode)
 fi
 
+CARLA_EXIT=0
 python3 /app/examples/scripts/carla_cosim_main_local_alignment.py \
-    "${CARLA_COSIM_ARGS[@]}" || true
-CARLA_EXIT=$?
+    "${CARLA_COSIM_ARGS[@]}" || CARLA_EXIT=$?
 
 echo "=========================================="
 echo " CARLA client exited (code: $CARLA_EXIT)"
-echo " Stopping TeraSim server..."
+echo " Stopping TeraSim server and SUMO noVNC desktop..."
 echo "=========================================="
 
-kill $TERASIM_PID 2>/dev/null || true
-wait $TERASIM_PID 2>/dev/null || true
+cleanup
+trap - EXIT INT TERM
 
 echo "=========================================="
 echo " Simulation complete. Container exiting."

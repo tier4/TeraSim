@@ -2,6 +2,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import numpy as np
+import os
 import redis
 from redis.exceptions import RedisError
 import time
@@ -164,6 +165,23 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.error_count = 0
         self.last_successful_operation = time.time()
 
+        self.sumo_gui_track_vehicle_id = os.getenv("SUMO_GUI_TRACK_VEHICLE", "AV")
+        self.sumo_gui_track_zoom = self._parse_optional_float(
+            os.getenv("SUMO_GUI_TRACK_ZOOM", "900")
+        )
+        self.sumo_gui_tracking_active = False
+        self.sumo_gui_tracking_warning_logged = False
+        self.sumo_gui_tracking_missing_logged = False
+
+    @staticmethod
+    def _parse_optional_float(value):
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _setup_logger(self, base_dir: str) -> logging.Logger:
         """Setup logger for the plugin.
 
@@ -271,6 +289,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                 # Start Streamlit visualization
                 self._start_streamlit_service()
 
+            self._update_sumo_gui_tracking(simulator)
+
             return True
         except RedisError as e:
             self.logger.error(f"Failed to initialize Redis: {e}")
@@ -343,8 +363,44 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "ticked", ex=self.key_expiry
         )
+        self._update_sumo_gui_tracking(simulator)
         self.logger.info("Simulation step finished!")
         return True
+
+    def _update_sumo_gui_tracking(self, simulator: Simulator):
+        """Keep SUMO GUI centered on the configured vehicle when GUI mode is active."""
+        if not self.sumo_gui_track_vehicle_id:
+            return
+        if not getattr(simulator, "gui_flag", False):
+            return
+
+        try:
+            if self.sumo_gui_track_vehicle_id not in traci.vehicle.getIDList():
+                self.sumo_gui_tracking_active = False
+                if not self.sumo_gui_tracking_missing_logged:
+                    self.logger.info(
+                        "Waiting for SUMO GUI tracked vehicle %s to appear",
+                        self.sumo_gui_track_vehicle_id,
+                    )
+                    self.sumo_gui_tracking_missing_logged = True
+                return
+
+            if not self.sumo_gui_tracking_active:
+                simulator.track_vehicle_gui(self.sumo_gui_track_vehicle_id)
+                if self.sumo_gui_track_zoom is not None:
+                    simulator.set_zoom(self.sumo_gui_track_zoom)
+                self.sumo_gui_tracking_active = True
+                self.sumo_gui_tracking_missing_logged = False
+                self.logger.info(
+                    "SUMO GUI tracking %s at zoom %s",
+                    self.sumo_gui_track_vehicle_id,
+                    self.sumo_gui_track_zoom,
+                )
+        except Exception as e:
+            self.sumo_gui_tracking_active = False
+            if not self.sumo_gui_tracking_warning_logged:
+                self.logger.warning(f"SUMO GUI tracking failed: {e}")
+                self.sumo_gui_tracking_warning_logged = True
 
     def function_before_env_stop(self, simulator: Simulator, ctx):
         """Handle simulation stopping logic. Default implementation does nothing.
@@ -1035,5 +1091,4 @@ class TeraSimCoSimPlugin(BasePlugin):
                 
         except Exception as e:
             self.logger.error(f"Failed to start visualization service: {e}")
-
 

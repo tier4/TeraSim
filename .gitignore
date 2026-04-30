@@ -197,3 +197,5 @@ apps/deploy/examples/maps
 examples/maps/odaiba/
 examples/maps/odaiba_ll2/
 examples/maps/odaiba_ll2_exp/
+
+logs/
