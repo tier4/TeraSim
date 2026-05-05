@@ -11,12 +11,17 @@ FOLLOW_HEIGHT=${FOLLOW_HEIGHT:-5.0}
 FOLLOW_PITCH=${FOLLOW_PITCH:--18.0}
 TOPDOWN_HEIGHT=${TOPDOWN_HEIGHT:-60.0}
 UPDATE_INTERVAL=${UPDATE_INTERVAL:-0.05}
+WAIT_FOR_TICK=${WAIT_FOR_TICK:-1}
+DRAW_LABEL=${DRAW_LABEL:-0}
+LABEL_LIFE_TIME=${LABEL_LIFE_TIME:-0.04}
 
 echo "Following CARLA actor on noVNC"
 echo "  container: ${CARLA_CONTAINER}"
 echo "  host:      ${CARLA_HOST}:${CARLA_PORT}"
 echo "  role_name: ${ROLE_NAME}"
 echo "  mode:      ${CAMERA_MODE}"
+echo "  wait tick: ${WAIT_FOR_TICK}"
+echo "  label:     ${DRAW_LABEL}"
 echo
 echo "Stop with Ctrl-C"
 
@@ -30,6 +35,9 @@ docker exec -i \
   -e FOLLOW_PITCH="${FOLLOW_PITCH}" \
   -e TOPDOWN_HEIGHT="${TOPDOWN_HEIGHT}" \
   -e UPDATE_INTERVAL="${UPDATE_INTERVAL}" \
+  -e WAIT_FOR_TICK="${WAIT_FOR_TICK}" \
+  -e DRAW_LABEL="${DRAW_LABEL}" \
+  -e LABEL_LIFE_TIME="${LABEL_LIFE_TIME}" \
   "${CARLA_CONTAINER}" \
   bash -lc 'python3.10 - <<'"'"'PY'"'"'
 import math
@@ -47,13 +55,20 @@ def get_env_float(name: str, default: float) -> float:
     return float(value)
 
 
+def get_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def draw_label(world: carla.World, actor: carla.Actor, text: str) -> None:
     world.debug.draw_string(
         actor.get_location() + carla.Location(z=3.0),
         text,
         draw_shadow=False,
         color=carla.Color(r=255, g=180, b=0),
-        life_time=0.1,
+        life_time=get_env_float("LABEL_LIFE_TIME", 0.04),
         persistent_lines=False,
     )
 
@@ -111,6 +126,8 @@ def main() -> int:
     follow_pitch = get_env_float("FOLLOW_PITCH", -18.0)
     topdown_height = get_env_float("TOPDOWN_HEIGHT", 60.0)
     update_interval = get_env_float("UPDATE_INTERVAL", 0.05)
+    wait_for_tick = get_env_bool("WAIT_FOR_TICK", True)
+    draw_label_enabled = get_env_bool("DRAW_LABEL", False)
 
     client = carla.Client(host, port)
     client.set_timeout(10.0)
@@ -139,7 +156,16 @@ def main() -> int:
             print(f"Following actor id={actor.id} type={actor.type_id}", flush=True)
             last_actor_id = actor.id
 
-        draw_label(world, actor, f"{role_name} [{actor.id}]")
+        if wait_for_tick:
+            try:
+                world.wait_for_tick(2.0)
+            except RuntimeError:
+                time.sleep(update_interval)
+        else:
+            time.sleep(update_interval)
+
+        if draw_label_enabled:
+            draw_label(world, actor, f"{role_name} [{actor.id}]")
         spectator.set_transform(
             build_camera_transform(
                 actor.get_transform(),
@@ -150,7 +176,6 @@ def main() -> int:
                 topdown_height,
             )
         )
-        time.sleep(update_interval)
 
 
 if __name__ == "__main__":
