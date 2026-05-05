@@ -310,8 +310,8 @@ class MotionDiagnostics:
     def install(self) -> None:
         original_process_vehicle = self.carla_cosim._process_vehicle
 
-        def wrapped_process_vehicle(veh_id, veh_info, cosim_id_record):
-            original_process_vehicle(veh_id, veh_info, cosim_id_record)
+        def wrapped_process_vehicle(veh_id, veh_info, cosim_id_record, *args, **kwargs):
+            original_process_vehicle(veh_id, veh_info, cosim_id_record, *args, **kwargs)
             self.record_vehicle(veh_id, veh_info)
 
         self.carla_cosim._process_vehicle = wrapped_process_vehicle
@@ -485,6 +485,7 @@ class ActorSyncProfiler:
         "sim_time",
         "state_get",
         "validate",
+        "actor_index_build",
         "vehicle_count",
         "vru_count",
         "vehicle_loop",
@@ -518,6 +519,7 @@ class ActorSyncProfiler:
             key: []
             for key in [
                 "state_get",
+                "actor_index_build",
                 "vehicle_loop",
                 "vru_loop",
                 "cleanup_vehicle",
@@ -608,6 +610,7 @@ class ActorSyncProfiler:
             "sim_time": snapshot.timestamp.elapsed_seconds,
             "state_get": 0.0,
             "validate": 0.0,
+            "actor_index_build": 0.0,
             "vehicle_count": 0,
             "vru_count": 0,
             "vehicle_loop": 0.0,
@@ -646,6 +649,7 @@ class ActorSyncProfiler:
                 f"rows={self.rows_written} "
                 f"total={row['total']:.3f}s "
                 f"state_get={row['state_get']:.3f}s "
+                f"index={row['actor_index_build']:.3f}s "
                 f"vehicle_loop={row['vehicle_loop']:.3f}s "
                 f"cleanup={row['cleanup_vehicle'] + row['cleanup_pedestrian']:.3f}s "
                 f"lookup={row['lookup_total']:.3f}s/{row['lookup_calls']}calls"
@@ -690,6 +694,11 @@ class ActorSyncProfiler:
             row["vru_count"] = len(vrus)
 
             cosim_id_record = set()
+            current_frame = cosim.world.get_snapshot().frame
+
+            stage_start = time.perf_counter()
+            vehicle_actor_index, pedestrian_actor_index = cosim._build_actor_role_indexes()
+            row["actor_index_build"] = self._elapsed(stage_start)
 
             stage_start = time.perf_counter()
             for veh_id, veh_info in vehicles.items():
@@ -706,7 +715,14 @@ class ActorSyncProfiler:
                     print(veh_info)
 
                 process_start = time.perf_counter()
-                cosim._process_vehicle(veh_id, veh_info, cosim_id_record)
+                cosim._process_vehicle(
+                    veh_id,
+                    veh_info,
+                    cosim_id_record,
+                    carla_actor=vehicle_actor_index.get(veh_id),
+                    actor_index=vehicle_actor_index,
+                    current_frame=current_frame,
+                )
                 elapsed = self._elapsed(process_start)
                 row["vehicle_process_calls"] += 1
                 row["vehicle_process_max"] = max(row["vehicle_process_max"], elapsed)
@@ -714,8 +730,20 @@ class ActorSyncProfiler:
 
             stage_start = time.perf_counter()
             for vru_id, vru_info in vrus.items():
+                vru_actor_index = (
+                    vehicle_actor_index
+                    if cosim._vru_uses_vehicle_blueprint(vru_info)
+                    else pedestrian_actor_index
+                )
                 process_start = time.perf_counter()
-                cosim._process_vru(vru_id, vru_info, cosim_id_record)
+                cosim._process_vru(
+                    vru_id,
+                    vru_info,
+                    cosim_id_record,
+                    carla_actor=vru_actor_index.get(vru_id),
+                    actor_index=vru_actor_index,
+                    current_frame=current_frame,
+                )
                 elapsed = self._elapsed(process_start)
                 row["vru_process_calls"] += 1
                 row["vru_process_max"] = max(row["vru_process_max"], elapsed)
@@ -728,6 +756,8 @@ class ActorSyncProfiler:
             stage_start = time.perf_counter()
             cosim._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
             row["cleanup_pedestrian"] = self._elapsed(stage_start)
+
+            cosim._prune_spawn_failures(vehicles.keys(), vrus.keys())
         finally:
             row["total"] = self._elapsed(total_start)
             self.active_row = None
