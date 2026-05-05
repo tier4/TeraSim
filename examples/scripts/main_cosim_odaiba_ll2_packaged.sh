@@ -237,6 +237,16 @@ sleep 5
 
 echo "  Config: ${TERASIM_CONFIG}"
 echo "  CARLA co-sim async mode: ${CARLA_COSIM_ASYNC_MODE}"
+if [ -n "${CARLA_COSIM_MOTION_LOG:-}" ]; then
+    echo "  CARLA co-sim motion log: ${CARLA_COSIM_MOTION_LOG}"
+    echo "  CARLA co-sim diagnostic roles: ${CARLA_COSIM_DIAG_ROLE_NAMES:-AV}"
+fi
+if [ -n "${CARLA_COSIM_PROFILE_LOG:-}" ]; then
+    echo "  CARLA co-sim profile log: ${CARLA_COSIM_PROFILE_LOG}"
+fi
+if [ -n "${CARLA_COSIM_ACTOR_PROFILE_LOG:-}" ]; then
+    echo "  CARLA co-sim actor profile log: ${CARLA_COSIM_ACTOR_PROFILE_LOG}"
+fi
 echo "------------------------------------------"
 
 CARLA_COSIM_ARGS=(

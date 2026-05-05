@@ -292,7 +292,64 @@ cd /home/h-kawai/TeraSim
 FOLLOW_DISTANCE=8 FOLLOW_HEIGHT=3.5 ./scripts/follow_carla_actor_novnc.sh
 ```
 
-## 9. 終了理由を確認する
+## 9. CARLA 車両のかくつきを切り分ける
+
+CARLA の noVNC 画面で車両が前後に揺れて見える場合は、まず画面ではなく
+CARLA API 上の actor transform を記録します。co-sim は SUMO の各 tick の位置を
+CARLA actor に `set_transform()` で反映しているので、API 上の進行方向変位が
+負になっているかを見ると、表示だけの問題か実際の actor 状態かを切り分けられます。
+
+co-sim を動かしたまま、別 terminal で AV を 45 秒記録します。
+
+```bash
+cd /home/h-kawai/TeraSim
+ROLE_NAME=AV DURATION=45 OUTPUT_CSV=outputs/odaiba_carla_actor_motion.csv \
+./scripts/record_carla_actor_motion.sh
+```
+
+複数車両をまとめて見る場合:
+
+```bash
+cd /home/h-kawai/TeraSim
+ROLE_NAME=all DURATION=45 OUTPUT_CSV=outputs/odaiba_carla_all_actor_motion.csv \
+./scripts/record_carla_actor_motion.sh
+```
+
+判定の見方:
+
+- `backward_events=0` なら、CARLA API 上の actor transform は後退していません。
+  この場合は noVNC/ブラウザ表示、spectator 追尾、描画 FPS、または 0.1 秒 tick の離散更新が
+  前後の揺れに見えている可能性が高いです。
+- `backward_events>0` なら、CARLA の actor transform 自体に後退方向の step があります。
+  CSV の `backward=1` の行で `sim_time`, `frame`, `signed_forward_delta`, `x`, `y`, `yaw`
+  を確認してください。
+
+さらに SUMO 入力値から作った target transform と、`set_transform()` 後に CARLA から読める
+actual transform を同時に記録したい場合は、co-sim 起動時に内部ログを有効にします。
+
+```bash
+cd /home/h-kawai/TeraSim
+CARLA_COSIM_MOTION_LOG=/app/outputs/odaiba_carla_set_transform_motion.csv \
+CARLA_COSIM_DIAG_ROLE_NAMES=AV \
+CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
+```
+
+host 側では次に出ます。
+
+```text
+outputs/odaiba_carla_set_transform_motion.csv
+```
+
+この内部ログでも `backward_events=0` なら、少なくとも co-sim が CARLA に設定している
+tick ごとの transform は後退していません。内部ログで `backward_events>0` の場合は、
+SUMO 側の軌跡、座標変換、または yaw の不連続を優先して見ます。
+
+既定の後退判定は `signed_forward_delta < -0.05m` です。ノイズをさらに無視したい場合は
+`BACKWARD_THRESHOLD=-0.10` または `CARLA_COSIM_DIAG_BACKWARD_THRESHOLD=-0.10` のように
+閾値を下げてください。
+
+## 10. 終了理由を確認する
 
 各 run の出力は次に入ります。
 
@@ -330,7 +387,7 @@ tail -n 20 "$BASE/run.log"
 curl -s http://127.0.0.1:<TERASIM_PORT>/simulation_result/<simulation_id> | python3 -m json.tool
 ```
 
-## 10. よくある詰まりどころ
+## 11. よくある詰まりどころ
 
 ### `Map '...' not found`
 
@@ -372,7 +429,7 @@ SUMO_TO_CARLA_OFFSET_Y=45335.1
 SUMO_TO_CARLA_OFFSET_Z=0.0
 ```
 
-## 11. まとめ
+## 12. まとめ
 
 今回の Odaiba packaged co-sim の最短ルートは次です。
 
