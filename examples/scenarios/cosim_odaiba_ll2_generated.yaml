@@ -22,7 +22,7 @@ environment:
     run_time: 600
     MOBIL_lc_flag: true
     stochastic_acc_flag: false
-    sumo_net_file_path: /app/examples/maps/odaiba_ll2/network_0505.net.xml
+    sumo_net_file_path: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network2.net.xml
     sumo_cfg_file_path: /app/examples/maps/odaiba_ll2/simulation.sumocfg
     drive_rule: righthand
     adversity_sampling_probability: 1.0
@@ -77,53 +77,151 @@ environment:
       cache_radius: 100
       control_radius: 50
       route:
-      - edge_729
-      - edge_730
-      - edge_3228
-      - edge_734
-      - edge_836
-      - edge_736
-      - edge_839
-      - edge_738
-      - edge_830
-      - edge_739
-      - edge_740
-      - edge_1380
-      - edge_1146
-      - edge_1033
+      - edge_755
+      - edge_760
+      - edge_765
+      - edge_773
+      - edge_852
+      - edge_3149
+      - edge_776
+      - edge_855
+      - edge_778
+      - edge_3244
+      - edge_782
+      - edge_795
+      - edge_732
+      - edge_731
+      - edge_809
+      - edge_728
+      - edge_877
+      - edge_857
+      - edge_858
+      - edge_884
+      - edge_900
+      - edge_860
+      - edge_936
+      - edge_942
+      - edge_945
+      - edge_947
+      - edge_949
+      - edge_954
+      - edge_955
+      - edge_958
+      - edge_963
+      - edge_991
+      - edge_559
+      - edge_560
+      - edge_561
+      - edge_562
+      - edge_564
+      - edge_565
+      - edge_567
+      - edge_1537
+      - edge_569
+      - edge_570
+      - edge_571
+      - edge_667
+      - edge_618
+      - edge_616
+      - edge_640
+      - edge_611
+      - edge_612
+      - edge_627
+      - edge_603
+      - edge_604
+      - edge_655
+      - edge_598
+      - edge_716
+      - edge_1824
+      - edge_1829
+      - edge_1832
+      - edge_1833
+      - edge_1865
+      - edge_1836
+      - edge_3045
+      - edge_1843
+      - edge_1844
+      - edge_2436
+      - edge_2381
+      - edge_2456
+      - edge_2391
+      - edge_2396
+      - edge_2460
+      - edge_2229
+      - edge_2230
+      - edge_2272
+      - edge_2234
+      - edge_2235
+      - edge_2296
+      - edge_2246
+      - edge_2247
+      - edge_2250
+      - edge_2331
+      - edge_2254
+      - edge_2334
+      - edge_2257
+      - edge_2258
+      - edge_3069
+      - edge_2259
+      - edge_2261
+      - edge_1685
+      - edge_1798
+      - edge_1730
+      - edge_1703
+      - edge_1670
+      - edge_1645
+      - edge_1642
+      - edge_1643
+      - edge_2124
+      - edge_2123
+      - edge_2122
+      - edge_2117
+      - edge_2111
+      - edge_2109
+      - edge_2107
+      - edge_2104
+      - edge_2169
+      - edge_2101
+      - edge_1605
+      - edge_1603
+      - edge_3222
+      - edge_1287
+      - edge_1288
+      - edge_1292
+      - edge_1295
+      - edge_1042
       - edge_1389
       - edge_1072
+      - edge_1075
       - edge_1077
       - edge_1120
       - edge_1124
+      - edge_3259
       - edge_400
+      - edge_386
       - edge_417
+      - edge_157
       - edge_420
+      - edge_360
       - edge_426
       - edge_432
       - edge_427
+      - edge_308
       - edge_125
       - edge_127
-      - edge_1317
-      - edge_754
-      - edge_467
-      - edge_98
-      - edge_99
-      - edge_2475
-      - edge_2480
-      - edge_1597
-      - edge_1591
-      - edge_1586
-      - edge_2095
-      - edge_2094
-      - edge_2092
-      - edge_2164
-      - edge_2177
-      - edge_2089
-      - edge_2101
-      - edge_2102
-      - edge_1605
-      - edge_1603
+      - edge_281
+      - edge_110
+      - edge_109
+      - edge_200
+      - edge_85
+      - edge_81
+      - edge_82
+      - edge_194
+      - edge_80
+      - edge_76
+      - edge_77
+      - edge_79
+      - edge_301
 simulator:
   module: terasim.simulator
   class: Simulator
@@ -137,7 +235,7 @@ simulator:
     - tripinfo
     traffic_scale: 1.0
 input:
-  sumo_net_file: /app/examples/maps/odaiba_ll2/network_0505.net.xml
+  sumo_net_file: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network2.net.xml
   sumo_config_file: /app/examples/maps/odaiba_ll2/simulation.sumocfg
 logging:
   levels:

@@ -63,6 +63,8 @@ class CarlaCosim(object):
         self.async_mode = args.async_mode
         self.step_length = args.step_length
         self._spawn_failures = {}
+        self._missing_angle_warnings = set()
+        self._invalid_location_warnings = set()
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -685,6 +687,72 @@ class CarlaCosim(object):
     def _clear_spawn_failure(self, actor_type, actor_id):
         self._spawn_failures.pop(self._spawn_failure_key(actor_type, actor_id), None)
 
+    @staticmethod
+    def _as_finite_float(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(number):
+            return number
+        return None
+
+    def _warn_invalid_sumo_location_once(self, actor_type, actor_id, raw_location):
+        key = (actor_type, actor_id)
+        if key in self._invalid_location_warnings:
+            return
+        self._invalid_location_warnings.add(key)
+        print(
+            f"Warning: {actor_type} {actor_id!r} has invalid SUMO location "
+            f"{raw_location}; skipping this tick.",
+            flush=True,
+        )
+
+    def _resolve_sumo_location(self, actor_type, actor_id, actor_info):
+        raw_location = {
+            "x": actor_info.get("x"),
+            "y": actor_info.get("y"),
+            "z": actor_info.get("z"),
+        }
+        sumo_location = [
+            self._as_finite_float(raw_location["x"]),
+            self._as_finite_float(raw_location["y"]),
+            self._as_finite_float(raw_location["z"]),
+        ]
+        if any(value is None for value in sumo_location):
+            self._warn_invalid_sumo_location_once(actor_type, actor_id, raw_location)
+            return None
+        return sumo_location
+
+    def _warn_missing_sumo_angle_once(self, actor_type, actor_id, action):
+        key = (actor_type, actor_id, action)
+        if key in self._missing_angle_warnings:
+            return
+        self._missing_angle_warnings.add(key)
+        print(
+            f"Warning: {actor_type} {actor_id!r} has missing sumo_angle; {action}.",
+            flush=True,
+        )
+
+    def _resolve_sumo_angle(self, actor_type, actor_id, actor_info, carla_actor=None):
+        angle = self._as_finite_float(actor_info.get("sumo_angle"))
+        if angle is not None:
+            return angle
+
+        orientation = self._as_finite_float(actor_info.get("orientation"))
+        if orientation is not None:
+            self._warn_missing_sumo_angle_once(actor_type, actor_id, "using orientation fallback")
+            return (90.0 - math.degrees(orientation)) % 360.0
+
+        if carla_actor is not None:
+            self._warn_missing_sumo_angle_once(actor_type, actor_id, "using previous CARLA yaw fallback")
+            return (carla_actor.get_transform().rotation.yaw + 90.0) % 360.0
+
+        self._warn_missing_sumo_angle_once(actor_type, actor_id, "skipping this tick")
+        return None
+
     def _prune_spawn_failures(self, vehicle_ids, vru_ids):
         active_keys = {
             self._spawn_failure_key("vehicle", vehicle_id) for vehicle_id in vehicle_ids
@@ -708,8 +776,13 @@ class CarlaCosim(object):
         """Process a vehicle actor."""
         cosim_id_record.add(veh_id)
 
-        sumo_location = [veh_info["x"], veh_info["y"], veh_info["z"]]
-        sumo_rotation = [0.0, veh_info["sumo_angle"], 0.0]
+        sumo_location = self._resolve_sumo_location("vehicle", veh_id, veh_info)
+        if sumo_location is None:
+            return
+        sumo_angle = self._resolve_sumo_angle("vehicle", veh_id, veh_info, carla_actor)
+        if sumo_angle is None:
+            return
+        sumo_rotation = [0.0, sumo_angle, 0.0]
         shape = [veh_info["length"], veh_info["width"], veh_info["height"]]
 
         vehicle = carla_actor
@@ -772,8 +845,13 @@ class CarlaCosim(object):
         """Process a pedestrian actor."""
         cosim_id_record.add(vru_id)
 
-        sumo_location = [vru_info["x"], vru_info["y"], vru_info["z"]]
-        sumo_rotation = [0.0, vru_info["sumo_angle"], 0.0]
+        sumo_location = self._resolve_sumo_location("vru", vru_id, vru_info)
+        if sumo_location is None:
+            return
+        sumo_angle = self._resolve_sumo_angle("vru", vru_id, vru_info, carla_actor)
+        if sumo_angle is None:
+            return
+        sumo_rotation = [0.0, sumo_angle, 0.0]
         shape = [vru_info["length"], vru_info["width"], vru_info["height"]]
 
         pedestrian = carla_actor
@@ -822,7 +900,7 @@ class CarlaCosim(object):
 
         if carla_id > 0:
             if not self._vru_uses_vehicle_blueprint(vru_info):
-                radians = math.radians(90 - vru_info["sumo_angle"])
+                radians = math.radians(90 - sumo_angle)
                 orientation = math.atan2(math.sin(radians), math.cos(radians))
                 direction_x, direction_y = math.cos(orientation), math.sin(orientation)
                 walker_control = carla.WalkerControl(
