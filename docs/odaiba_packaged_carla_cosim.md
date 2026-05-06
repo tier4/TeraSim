@@ -13,6 +13,9 @@ examples/maps/odaiba_ll2/
   network.net.xml
 ```
 
+SUMO net を別ファイル名で試す場合も同じディレクトリに置けば使えます。
+たとえば `network_0505.net.xml` を使う場合は、後述の `SUMO_NET_FILE` で指定します。
+
 この packaged-map 方式では、`.xodr` は co-sim 実行に必須ではありません。
 CARLA 側は package を import して `load_world()` で地図を開きます。
 
@@ -21,7 +24,8 @@ CARLA 側は package を import して `load_world()` で地図を開きます�
 ## 1. 事前に分かっていること
 
 - CARLA 側の map 名は `odaibatest5`
-- SUMO 側は `examples/maps/odaiba_ll2/network.net.xml` を使う
+- SUMO 側の既定は `examples/maps/odaiba_ll2/network.net.xml`
+- 別の SUMO net を使う場合は `SUMO_NET_FILE=examples/maps/odaiba_ll2/<file>.net.xml` で切り替える
 - Odaiba の OpenDRIVE 変換では次の offset を使っている
 
 ```yaml
@@ -173,6 +177,17 @@ cd /home/h-kawai/TeraSim
 ./scripts/prepare_odaiba_ll2_sumo_artifacts.sh
 ```
 
+別の SUMO net を使いたい場合は `SUMO_NET_FILE` を指定します。この指定は
+`simulation.sumocfg` と `examples/scenarios/cosim_odaiba_ll2_generated.yaml` の
+`sumo_net_file_path` / `input.sumo_net_file` にも反映されます。
+
+```bash
+cd /home/h-kawai/TeraSim
+SUMO_NET_FILE=examples/maps/odaiba_ll2/network_0505.net.xml \
+PERIOD=1.0 FORCE_NEW_AV_ROUTE=1 \
+./scripts/prepare_odaiba_ll2_sumo_artifacts.sh
+```
+
 交通量を増やしたい場合:
 
 ```bash
@@ -193,11 +208,12 @@ PERIOD=0.5 AV_ROUTE_SEED=$(date +%s) FORCE_NEW_AV_ROUTE=1 \
 - `SEED` は背景交通の randomTrips 用です
 - `AV_ROUTE_SEED` は AV route だけを変える seed です
 - `FORCE_NEW_AV_ROUTE=1` を付けると、既存 `metadata.json` に保存済みの route を無視して新しく作ります
+- `SUMO_NET_FILE` は使う SUMO net です。旧名の `NET_PATH` も互換用に使えますが、通常は `SUMO_NET_FILE` を使ってください
 
 補足:
 
 - `metadata.json` が無ければ空ファイルから自動生成されます
-- `metadata.json` に AV route が無ければ、`network.net.xml` から fallback route を自動生成します
+- `metadata.json` に AV route が無ければ、指定した SUMO net から fallback route を自動生成します
 
 ## 7. TeraSim-CARLA co-sim を起動する
 
@@ -290,6 +306,26 @@ CAMERA_MODE=topdown ./scripts/follow_carla_actor_novnc.sh
 ```bash
 cd /home/h-kawai/TeraSim
 FOLLOW_DISTANCE=8 FOLLOW_HEIGHT=3.5 ./scripts/follow_carla_actor_novnc.sh
+```
+
+Ctrl-C で終了しない場合は、別 terminal から追尾 wrapper を止めます。
+
+```bash
+cd /home/h-kawai/TeraSim
+pkill -TERM -f 'scripts/follow_carla_actor_novnc.sh'
+```
+
+それでも CARLA container 内に追尾用 Python が残っている場合は、container 内の
+`python3.10 -` を止めます。このコマンドは spectator 追尾用の Python を止めるためのものです。
+
+```bash
+docker exec carla-novnc-test bash -lc "pkill -TERM -f 'python3.10 -' || true"
+```
+
+残っているか確認したい場合:
+
+```bash
+docker exec carla-novnc-test bash -lc "pgrep -af 'python3.10 -' || true"
 ```
 
 ## 9. CARLA 車両のかくつきを切り分ける
@@ -437,6 +473,6 @@ SUMO_TO_CARLA_OFFSET_Z=0.0
 2. `docker compose -f docker-compose.carla-novnc.yml build`
 3. `docker compose -f docker-compose.carla-novnc.yml up -d`
 4. package を `ImportAssets.sh` で import
-5. `./scripts/prepare_odaiba_ll2_sumo_artifacts.sh`
+5. `SUMO_NET_FILE=examples/maps/odaiba_ll2/network_0505.net.xml ./scripts/prepare_odaiba_ll2_sumo_artifacts.sh`
 6. `CARLA_PACKAGE_MAP_NAME=odaibatest5 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh`
 7. `./scripts/follow_carla_actor_novnc.sh`
