@@ -51,6 +51,7 @@ package を別 offset で作っている場合だけ、実行時にこの env �
 - `scripts/prepare_odaiba_ll2_sumo_artifacts.sh`
 - `scripts/run_cosim_odaiba_ll2_packaged_generated.sh`
 - `scripts/follow_carla_actor_novnc.sh`
+- `scripts/show_carla_vehicle_camera_novnc.sh`
 
 これらは次の生成済み scenario を前提にします。
 
@@ -306,6 +307,21 @@ CAMERA_MODE=topdown ./scripts/follow_carla_actor_novnc.sh
 ```bash
 cd /home/h-kawai/TeraSim
 FOLLOW_DISTANCE=8 FOLLOW_HEIGHT=3.5 ./scripts/follow_carla_actor_novnc.sh
+```
+
+AV に CARLA camera sensor を attach して、自車目線の RGB camera window を
+noVNC desktop 上に出す場合:
+
+```bash
+cd /home/h-kawai/TeraSim
+./scripts/show_carla_vehicle_camera_novnc.sh
+```
+
+ボンネット視点や後方追従風の sensor view:
+
+```bash
+CAMERA_PRESET=hood ./scripts/show_carla_vehicle_camera_novnc.sh
+CAMERA_PRESET=chase ATTACHMENT_TYPE=SpringArmGhost ./scripts/show_carla_vehicle_camera_novnc.sh
 ```
 
 Ctrl-C で終了しない場合は、別 terminal から追尾 wrapper を止めます。

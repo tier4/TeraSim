@@ -22,7 +22,7 @@ environment:
     run_time: 600
     MOBIL_lc_flag: true
     stochastic_acc_flag: false
-    sumo_net_file_path: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network2.net.xml
+    sumo_net_file_path: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml
     sumo_cfg_file_path: /app/examples/maps/odaiba_ll2/simulation.sumocfg
     drive_rule: righthand
     adversity_sampling_probability: 1.0
@@ -96,8 +96,8 @@ environment:
       - edge_877
       - edge_857
       - edge_858
-      - edge_884
-      - edge_900
+      - edge_885
+      - edge_901
       - edge_860
       - edge_936
       - edge_942
@@ -129,7 +129,7 @@ environment:
       - edge_627
       - edge_603
       - edge_604
-      - edge_655
+      - edge_1533
       - edge_598
       - edge_716
       - edge_1824
@@ -235,7 +235,7 @@ simulator:
     - tripinfo
     traffic_scale: 1.0
 input:
-  sumo_net_file: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network2.net.xml
+  sumo_net_file: /app/examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml
   sumo_config_file: /app/examples/maps/odaiba_ll2/simulation.sumocfg
 logging:
   levels:
