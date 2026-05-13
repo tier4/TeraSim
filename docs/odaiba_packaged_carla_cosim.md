@@ -204,6 +204,30 @@ PERIOD=0.5 AV_ROUTE_SEED=$(date +%s) FORCE_NEW_AV_ROUTE=1 \
 ./scripts/prepare_odaiba_ll2_sumo_artifacts.sh
 ```
 
+AV route file を明示して固定したい場合:
+
+```bash
+cd /home/h-kawai/TeraSim
+SUMO_NET_FILE=examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml \
+PERIOD=0.5 \
+AV_ROUTE_FILE=examples/maps/odaiba_ll2/teleport-mirai-loop.rou.xml \
+./scripts/prepare_odaiba_ll2_sumo_artifacts.sh
+```
+
+route file に複数の `<route>` がある場合は `AV_ROUTE_ID=<route id>` も指定できます。
+`AV_ROUTE_FILE` を指定しない場合は、従来どおり `metadata.json` の AV route、
+または fallback route を使います。
+
+co-sim 起動時にまとめて指定することもできます。
+
+```bash
+cd /home/h-kawai/TeraSim
+PERIOD=0.5 \
+AV_ROUTE_FILE=examples/maps/odaiba_ll2/teleport-mirai-loop.rou.xml \
+CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
+```
+
 補足:
 
 - `SEED` は背景交通の randomTrips 用です

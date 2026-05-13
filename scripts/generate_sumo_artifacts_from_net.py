@@ -113,6 +113,66 @@ def filter_regular_route_edge_ids(route_edge_ids: list[str]) -> list[str]:
     return regular_route_edge_ids
 
 
+def parse_route_edge_tokens(route_text: str) -> list[str]:
+    return [edge_id.strip() for edge_id in route_text.replace(",", " ").split() if edge_id.strip()]
+
+
+def load_av_route_edge_ids(route_path: Path, route_id: str | None = None) -> tuple[list[str], str | None]:
+    route_text = route_path.read_text(encoding="utf-8")
+    try:
+        root = ET.fromstring(route_text)
+    except ET.ParseError:
+        return parse_route_edge_tokens(route_text), None
+
+    route_elements = [elem for elem in root.findall(".//route") if elem.get("edges")]
+    if not route_elements:
+        raise ValueError(f"No <route edges=...> entry found in {route_path}")
+
+    selected_route = None
+    if route_id:
+        for route in route_elements:
+            if route.get("id") == route_id:
+                selected_route = route
+                break
+        if selected_route is None:
+            raise ValueError(f"Route id {route_id!r} not found in {route_path}")
+    else:
+        for preferred_id in ("av_route", route_path.stem):
+            for route in route_elements:
+                if route.get("id") == preferred_id:
+                    selected_route = route
+                    break
+            if selected_route is not None:
+                break
+        if selected_route is None:
+            if len(route_elements) != 1:
+                route_ids = [route.get("id") for route in route_elements]
+                raise ValueError(
+                    f"Multiple route entries found in {route_path}; specify --av-route-id. "
+                    f"Available route ids: {route_ids}"
+                )
+            selected_route = route_elements[0]
+
+    return parse_route_edge_tokens(selected_route.get("edges", "")), selected_route.get("id")
+
+
+def get_saved_av_route_edges(
+    sumo_net: sumolib.net.Net,
+    route_edge_ids: list[str],
+) -> list[sumolib.net.edge.Edge]:
+    regular_route_edge_ids = filter_regular_route_edge_ids(route_edge_ids)
+    route_edges = []
+    missing_edge_ids = []
+    for edge_id in regular_route_edge_ids:
+        try:
+            route_edges.append(sumo_net.getEdge(edge_id))
+        except Exception:
+            missing_edge_ids.append(edge_id)
+    if missing_edge_ids:
+        raise ValueError(f"Saved AV route edges not found in SUMO net: {missing_edge_ids}")
+    return route_edges
+
+
 def generate_av_fallback_route(net_path: Path, seed: int | None = None) -> list[sumolib.net.edge.Edge]:
     if seed is not None:
         random.seed(seed)
@@ -162,6 +222,8 @@ def save_av_route_metadata(
     *,
     seed: int | None = None,
     force_new_route: bool = False,
+    av_route_file: Path | None = None,
+    av_route_id: str | None = None,
 ) -> list[str]:
     metadata = ensure_metadata(metadata_path)
     sumo_net = sumolib.net.readNet(str(net_path), withInternal=True)
@@ -171,27 +233,45 @@ def save_av_route_metadata(
         metadata.pop("av_route_sumo", None)
         metadata.pop("av_route_edge_ids", None)
 
-    if metadata.get("av_route"):
+    if av_route_file is not None:
+        av_route_edge_ids, selected_route_id = load_av_route_edge_ids(av_route_file, av_route_id)
+        av_route_objects = get_saved_av_route_edges(sumo_net, av_route_edge_ids)
+        metadata["av_route_name"] = selected_route_id or av_route_file.stem
+        metadata["av_route_source"] = "route_file"
+        metadata["av_route_file"] = str(av_route_file)
+    elif metadata.get("av_route_edge_ids"):
         try:
-            av_route_xy = [
-                sumo_net.convertLonLat2XY(point[1], point[0])
-                for point in metadata["av_route"]
-            ]
-            av_route_edges = sumolib.route.mapTrace(
-                av_route_xy,
-                sumo_net,
-                delta=10,
-                fillGaps=100,
-                verbose=False,
+            av_route_objects = get_saved_av_route_edges(sumo_net, metadata["av_route_edge_ids"])
+        except Exception as exc:
+            print(
+                f"Warning: saved av_route_edge_ids could not be used ({exc}); "
+                "falling back to av_route coordinates.",
+                file=sys.stderr,
             )
-        except Exception:
-            av_route_edges = []
-        if not av_route_edges:
-            av_route_objects = generate_av_fallback_route(net_path, seed=seed)
-        else:
-            av_route_objects = av_route_edges
+            av_route_objects = []
     else:
-        av_route_objects = generate_av_fallback_route(net_path, seed=seed)
+        av_route_objects = []
+
+    if not av_route_objects:
+        if metadata.get("av_route"):
+            try:
+                av_route_xy = [
+                    sumo_net.convertLonLat2XY(point[1], point[0])
+                    for point in metadata["av_route"]
+                ]
+                av_route_edges = sumolib.route.mapTrace(
+                    av_route_xy,
+                    sumo_net,
+                    delta=10,
+                    fillGaps=100,
+                    verbose=False,
+                )
+            except Exception:
+                av_route_edges = []
+            av_route_objects = av_route_edges
+
+        if not av_route_objects:
+            av_route_objects = generate_av_fallback_route(net_path, seed=seed)
 
     av_route_objects = filter_regular_route_edges(list(av_route_objects))
     if not av_route_objects:
@@ -358,6 +438,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Discard any saved AV route metadata and generate a fresh AV route.",
     )
+    parser.add_argument(
+        "--av-route-file",
+        default=None,
+        help=(
+            "Optional AV route file. Supports SUMO route XML with <route edges=...> "
+            "or a plain text edge list. When omitted, existing metadata/fallback behavior is used."
+        ),
+    )
+    parser.add_argument(
+        "--av-route-id",
+        default=None,
+        help="Route id to read from --av-route-file when the file contains multiple routes.",
+    )
     return parser.parse_args()
 
 
@@ -380,6 +473,8 @@ def main() -> int:
         metadata_path,
         seed=av_route_seed,
         force_new_route=args.force_new_av_route,
+        av_route_file=Path(args.av_route_file).resolve() if args.av_route_file else None,
+        av_route_id=args.av_route_id,
     )
     generate_vehicle_routes(
         net_path,

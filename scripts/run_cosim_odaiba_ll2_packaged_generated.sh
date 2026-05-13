@@ -1,6 +1,17 @@
 #!/bin/bash
 set -e
 
+if [ -n "${AV_ROUTE_FILE:-}" ]; then
+  SUMO_NET_FILE=${SUMO_NET_FILE:-examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml}
+  PERIOD=${PERIOD:-2.0}
+  echo "Preparing Odaiba LL2 SUMO artifacts with AV route file: ${AV_ROUTE_FILE}"
+  SUMO_NET_FILE="${SUMO_NET_FILE}" \
+  PERIOD="${PERIOD}" \
+  AV_ROUTE_FILE="${AV_ROUTE_FILE}" \
+  AV_ROUTE_ID="${AV_ROUTE_ID:-}" \
+  ./scripts/prepare_odaiba_ll2_sumo_artifacts.sh
+fi
+
 CARLA_CONTAINER_NAME=${CARLA_CONTAINER_NAME:-carla-novnc-test}
 CARLA_HOST_AUTODETECTED=0
 if [ -z "${CARLA_HOST:-}" ]; then

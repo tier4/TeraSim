@@ -10,6 +10,8 @@ PERIOD=${PERIOD:-2.0}
 SEED=${SEED:-2026}
 AV_ROUTE_SEED=${AV_ROUTE_SEED:-$SEED}
 FORCE_NEW_AV_ROUTE=${FORCE_NEW_AV_ROUTE:-0}
+AV_ROUTE_FILE=${AV_ROUTE_FILE:-}
+AV_ROUTE_ID=${AV_ROUTE_ID:-}
 
 cd "$(dirname "$0")/.."
 
@@ -50,9 +52,18 @@ METADATA_PATH="$(to_container_path "$METADATA_PATH")"
 SCENARIO_PATH="$(to_container_path "$SCENARIO_PATH")"
 SCENARIO_SUMO_NET_FILE=${SCENARIO_SUMO_NET_FILE:-$(to_container_abs_path "$SUMO_NET_FILE")}
 SCENARIO_SUMO_CONFIG_FILE=${SCENARIO_SUMO_CONFIG_FILE:-$(to_container_abs_path "$OUTPUT_DIR")/simulation.sumocfg}
+if [ -n "$AV_ROUTE_FILE" ]; then
+  AV_ROUTE_FILE="$(to_container_path "$AV_ROUTE_FILE")"
+fi
 
 echo "Using SUMO net: ${SCENARIO_SUMO_NET_FILE}"
 echo "Using SUMO config: ${SCENARIO_SUMO_CONFIG_FILE}"
+if [ -n "$AV_ROUTE_FILE" ]; then
+  echo "Using AV route file: ${AV_ROUTE_FILE}"
+  if [ -n "$AV_ROUTE_ID" ]; then
+    echo "Using AV route id: ${AV_ROUTE_ID}"
+  fi
+fi
 echo "Updating scenario: ${SCENARIO_PATH}"
 
 exec docker run --rm \
@@ -69,12 +80,20 @@ exec docker run --rm \
   -e SEED="$SEED" \
   -e AV_ROUTE_SEED="$AV_ROUTE_SEED" \
   -e FORCE_NEW_AV_ROUTE="$FORCE_NEW_AV_ROUTE" \
+  -e AV_ROUTE_FILE="$AV_ROUTE_FILE" \
+  -e AV_ROUTE_ID="$AV_ROUTE_ID" \
   -v "$PWD:/app" \
   -w /app \
   terasim-service:cosim \
   bash -lc 'GEN_ARGS=()
   if [ "$FORCE_NEW_AV_ROUTE" = "1" ]; then
     GEN_ARGS+=(--force-new-av-route)
+  fi
+  if [ -n "$AV_ROUTE_FILE" ]; then
+    GEN_ARGS+=(--av-route-file "$AV_ROUTE_FILE")
+  fi
+  if [ -n "$AV_ROUTE_ID" ]; then
+    GEN_ARGS+=(--av-route-id "$AV_ROUTE_ID")
   fi
   python3 /app/scripts/generate_sumo_artifacts_from_net.py \
     --net "$NET_PATH" \

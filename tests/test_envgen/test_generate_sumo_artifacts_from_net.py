@@ -28,6 +28,14 @@ class FakeEdge:
         return self.special
 
 
+class FakeNet:
+    def __init__(self, edge_ids):
+        self.edges = {edge_id: FakeEdge(edge_id) for edge_id in edge_ids}
+
+    def getEdge(self, edge_id):
+        return self.edges[edge_id]
+
+
 def test_filter_regular_route_edges_removes_internal_special_and_consecutive_duplicates():
     module = load_generator_module()
 
@@ -51,6 +59,47 @@ def test_filter_regular_route_edges_removes_internal_special_and_consecutive_dup
         "edge_2381",
         "edge_2456",
     ]
+
+
+def test_get_saved_av_route_edges_uses_saved_ids_and_filters_internal_duplicates():
+    module = load_generator_module()
+
+    route_edges = module.get_saved_av_route_edges(
+        FakeNet(["edge_459", "edge_426", "edge_3"]),
+        ["edge_459", ":node_1_0", "edge_426", "edge_426", "edge_3"],
+    )
+
+    assert [edge.getID() for edge in route_edges] == ["edge_459", "edge_426", "edge_3"]
+
+
+def test_load_av_route_edge_ids_from_sumo_route_xml(tmp_path):
+    module = load_generator_module()
+    route_path = tmp_path / "teleport-mirai-loop.rou.xml"
+    route_path.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<routes>
+  <route id="other" edges="edge_1 edge_2" />
+  <route id="teleport-mirai-loop" edges="edge_459 edge_357 edge_426" />
+</routes>
+""",
+        encoding="utf-8",
+    )
+
+    route_edges, route_id = module.load_av_route_edge_ids(route_path)
+
+    assert route_id == "teleport-mirai-loop"
+    assert route_edges == ["edge_459", "edge_357", "edge_426"]
+
+
+def test_load_av_route_edge_ids_from_text_file(tmp_path):
+    module = load_generator_module()
+    route_path = tmp_path / "av_route.txt"
+    route_path.write_text("edge_459, edge_357\nedge_426\n", encoding="utf-8")
+
+    route_edges, route_id = module.load_av_route_edge_ids(route_path)
+
+    assert route_id is None
+    assert route_edges == ["edge_459", "edge_357", "edge_426"]
 
 
 def test_ensure_vtypes_and_av_route_writes_only_regular_route_edges(tmp_path):
