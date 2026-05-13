@@ -24,6 +24,7 @@ from terasim_service.utils.carla.tools import (
 )
 
 carla_cosim_module = importlib.import_module("terasim_service.utils.carla.cosim")
+carla_tools_module = importlib.import_module("terasim_service.utils.carla.tools")
 
 
 def parse_args():
@@ -505,6 +506,12 @@ class ActorSyncProfiler:
         "spawn_calls",
         "spawn_total",
         "spawn_max",
+        "spawn_success",
+        "spawn_failed",
+        "apply_batch_sync_time",
+        "apply_batch_sync_max",
+        "apply_batch_sync_success_time",
+        "apply_batch_sync_failed_time",
         "total",
         "result",
     ]
@@ -527,6 +534,9 @@ class ActorSyncProfiler:
                 "lookup_total",
                 "sumo_to_carla_total",
                 "spawn_total",
+                "apply_batch_sync_time",
+                "apply_batch_sync_success_time",
+                "apply_batch_sync_failed_time",
                 "total",
             ]
         }
@@ -535,6 +545,7 @@ class ActorSyncProfiler:
         self.original_lookup = carla_cosim_module.get_actor_id_from_attribute
         self.original_sumo_to_carla = carla_cosim_module.sumo_to_carla
         self.original_spawn_actor = carla_cosim_module.spawn_actor
+        self.original_spawn_actor_profile_hook = carla_tools_module.get_spawn_actor_profile_hook()
 
         directory = os.path.dirname(log_path)
         if directory:
@@ -597,9 +608,23 @@ class ActorSyncProfiler:
                     row["spawn_total"] += elapsed
                     row["spawn_max"] = max(row["spawn_max"], elapsed)
 
+        def record_spawn_apply_batch(elapsed, success, error):
+            row = self.active_row
+            if row is None:
+                return
+            row["apply_batch_sync_time"] += elapsed
+            row["apply_batch_sync_max"] = max(row["apply_batch_sync_max"], elapsed)
+            if success:
+                row["spawn_success"] += 1
+                row["apply_batch_sync_success_time"] += elapsed
+            else:
+                row["spawn_failed"] += 1
+                row["apply_batch_sync_failed_time"] += elapsed
+
         carla_cosim_module.get_actor_id_from_attribute = timed_lookup
         carla_cosim_module.sumo_to_carla = timed_sumo_to_carla
         carla_cosim_module.spawn_actor = timed_spawn_actor
+        carla_tools_module.set_spawn_actor_profile_hook(record_spawn_apply_batch)
         self.carla_cosim.sync_cosim_actor_to_carla = self.profiled_sync_actor
 
     def _new_row(self) -> dict:
@@ -630,6 +655,12 @@ class ActorSyncProfiler:
             "spawn_calls": 0,
             "spawn_total": 0.0,
             "spawn_max": 0.0,
+            "spawn_success": 0,
+            "spawn_failed": 0,
+            "apply_batch_sync_time": 0.0,
+            "apply_batch_sync_max": 0.0,
+            "apply_batch_sync_success_time": 0.0,
+            "apply_batch_sync_failed_time": 0.0,
             "total": 0.0,
             "result": "ok",
         }
@@ -652,6 +683,9 @@ class ActorSyncProfiler:
                 f"index={row['actor_index_build']:.3f}s "
                 f"vehicle_loop={row['vehicle_loop']:.3f}s "
                 f"cleanup={row['cleanup_vehicle'] + row['cleanup_pedestrian']:.3f}s "
+                f"spawn_success={row['spawn_success']} "
+                f"spawn_failed={row['spawn_failed']} "
+                f"apply_batch={row['apply_batch_sync_time']:.3f}s "
                 f"lookup={row['lookup_total']:.3f}s/{row['lookup_calls']}calls"
             )
 
@@ -767,6 +801,7 @@ class ActorSyncProfiler:
         carla_cosim_module.get_actor_id_from_attribute = self.original_lookup
         carla_cosim_module.sumo_to_carla = self.original_sumo_to_carla
         carla_cosim_module.spawn_actor = self.original_spawn_actor
+        carla_tools_module.set_spawn_actor_profile_hook(self.original_spawn_actor_profile_hook)
         self.carla_cosim.sync_cosim_actor_to_carla = self.original_sync_actor
 
         if self.file.closed:

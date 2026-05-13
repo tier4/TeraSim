@@ -1,6 +1,7 @@
 import time
 import json
 import math
+import os
 import re
 import carla
 import random
@@ -35,6 +36,17 @@ AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
 
 
+def _env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
+        return default
+
+
 class CarlaCosim(object):
     def __init__(self, args):
         self.args = args
@@ -65,6 +77,14 @@ class CarlaCosim(object):
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
+        self.spawn_failure_backoff_seconds = max(
+            0.0,
+            _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS", 5.0),
+        )
+        self.spawn_failure_backoff_max_seconds = max(
+            self.spawn_failure_backoff_seconds,
+            _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS", 30.0),
+        )
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -666,20 +686,30 @@ class CarlaCosim(object):
         failure = self._spawn_failures.get(self._spawn_failure_key(actor_type, actor_id))
         if failure is None:
             return True
-        if current_frame >= failure["next_retry_frame"]:
-            return True
 
         dx = sumo_location[0] - failure["x"]
         dy = sumo_location[1] - failure["y"]
-        return dx * dx + dy * dy >= self.SPAWN_RETRY_DISTANCE * self.SPAWN_RETRY_DISTANCE
+        if dx * dx + dy * dy >= self.SPAWN_RETRY_DISTANCE * self.SPAWN_RETRY_DISTANCE:
+            return True
+
+        next_retry_time = failure.get("next_retry_time")
+        if next_retry_time is not None:
+            return time.monotonic() >= next_retry_time
+        return current_frame >= failure.get("next_retry_frame", current_frame)
 
     def _record_spawn_failure(self, actor_type, actor_id, sumo_location, current_frame):
         key = self._spawn_failure_key(actor_type, actor_id)
         previous = self._spawn_failures.get(key, {})
         failures = previous.get("failures", 0) + 1
+        exponent = min(failures - 1, 30)
+        delay = min(
+            self.spawn_failure_backoff_max_seconds,
+            self.spawn_failure_backoff_seconds * (2 ** exponent),
+        )
         self._spawn_failures[key] = {
             "failures": failures,
             "next_retry_frame": current_frame + self.SPAWN_RETRY_FRAMES,
+            "next_retry_time": time.monotonic() + delay,
             "x": sumo_location[0],
             "y": sumo_location[1],
         }

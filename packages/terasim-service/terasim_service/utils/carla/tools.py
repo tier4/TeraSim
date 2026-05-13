@@ -2,6 +2,7 @@ import carla
 import logging
 import math
 import pyproj
+import time
 import utm
 
 
@@ -9,6 +10,16 @@ ZONE_NUMBER = 17
 ZONE_LETTER = "T"
 GNSS_ORIGIN = [42.3005934157, -83.699283188811]
 _SPAWN_DIAGNOSTIC_LOGGED = set()
+_SPAWN_ACTOR_PROFILE_HOOK = None
+
+
+def get_spawn_actor_profile_hook():
+    return _SPAWN_ACTOR_PROFILE_HOOK
+
+
+def set_spawn_actor_profile_hook(hook):
+    global _SPAWN_ACTOR_PROFILE_HOOK
+    _SPAWN_ACTOR_PROFILE_HOOK = hook
 
 TLS_NODES = {
     "NODE_11": [(83,), (92,), None, (88,), (89,), (86,), None, (84,)],
@@ -249,7 +260,17 @@ def spawn_actor(client, blueprint, transform, *, world=None, actor_role=None):
             carla.command.SetSimulatePhysics(carla.command.FutureActor, False)
         )
     ]
-    response = client.apply_batch_sync(batch, True)[0]
+    profile_hook = _SPAWN_ACTOR_PROFILE_HOOK
+    if profile_hook is None:
+        response = client.apply_batch_sync(batch, True)[0]
+    else:
+        apply_start = time.perf_counter()
+        response = client.apply_batch_sync(batch, True)[0]
+        apply_elapsed = time.perf_counter() - apply_start
+        try:
+            profile_hook(apply_elapsed, not response.error, response.error)
+        except Exception:
+            logging.exception("Spawn actor profile hook failed.")
     if response.error:
         logging.error("Spawn carla actor failed. %s", response.error)
         diagnostic_key = actor_role or (
