@@ -79,12 +79,46 @@ def get_random_trips_script() -> str:
     raise FileNotFoundError("Could not locate randomTrips.py")
 
 
+def is_regular_route_edge(edge: sumolib.net.edge.Edge) -> bool:
+    edge_id = edge.getID()
+    return not edge_id.startswith(":") and not edge.isSpecial()
+
+
+def filter_regular_route_edges(
+    route_edges: list[sumolib.net.edge.Edge],
+) -> list[sumolib.net.edge.Edge]:
+    regular_route_edges = []
+    previous_edge_id = None
+    for edge in route_edges:
+        if not is_regular_route_edge(edge):
+            continue
+        edge_id = edge.getID()
+        if edge_id == previous_edge_id:
+            continue
+        regular_route_edges.append(edge)
+        previous_edge_id = edge_id
+    return regular_route_edges
+
+
+def filter_regular_route_edge_ids(route_edge_ids: list[str]) -> list[str]:
+    regular_route_edge_ids = []
+    previous_edge_id = None
+    for edge_id in route_edge_ids:
+        if edge_id.startswith(":"):
+            continue
+        if edge_id == previous_edge_id:
+            continue
+        regular_route_edge_ids.append(edge_id)
+        previous_edge_id = edge_id
+    return regular_route_edge_ids
+
+
 def generate_av_fallback_route(net_path: Path, seed: int | None = None) -> list[sumolib.net.edge.Edge]:
     if seed is not None:
         random.seed(seed)
 
     sumo_net = sumolib.net.readNet(str(net_path), withInternal=True)
-    regular_edges = [edge for edge in sumo_net.getEdges() if not edge.isSpecial()]
+    regular_edges = [edge for edge in sumo_net.getEdges() if is_regular_route_edge(edge)]
     if not regular_edges:
         raise RuntimeError(f"No regular edges found in {net_path}")
 
@@ -116,7 +150,9 @@ def generate_av_fallback_route(net_path: Path, seed: int | None = None) -> list[
                 continue
 
     if best_route_edges:
-        return list(best_route_edges)
+        regular_route_edges = filter_regular_route_edges(list(best_route_edges))
+        if regular_route_edges:
+            return regular_route_edges
     return [max(regular_edges, key=lambda edge: edge.getLength())]
 
 
@@ -157,6 +193,10 @@ def save_av_route_metadata(
     else:
         av_route_objects = generate_av_fallback_route(net_path, seed=seed)
 
+    av_route_objects = filter_regular_route_edges(list(av_route_objects))
+    if not av_route_objects:
+        av_route_objects = generate_av_fallback_route(net_path, seed=seed)
+
     av_route_with_internal = sumolib.route.addInternal(sumo_net, av_route_objects)
 
     latlon_points = []
@@ -168,13 +208,14 @@ def save_av_route_metadata(
     except Exception:
         latlon_points = []
 
+    av_route_edge_ids = filter_regular_route_edge_ids([edge.getID() for edge in av_route_objects])
     metadata["av_route_sumo"] = latlon_points
-    metadata["av_route_edge_ids"] = [edge.getID() for edge in av_route_objects]
+    metadata["av_route_edge_ids"] = av_route_edge_ids
     if "av_route" not in metadata and latlon_points:
         metadata["av_route"] = latlon_points
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
-    return [edge.getID() for edge in av_route_objects]
+    return av_route_edge_ids
 
 
 def create_minimal_routes(routes_path: Path) -> None:
@@ -244,6 +285,10 @@ def generate_vehicle_routes(
 
 
 def ensure_vtypes_and_av_route(routes_path: Path, av_route_edges: list[str]) -> None:
+    av_route_edges = filter_regular_route_edge_ids(av_route_edges)
+    if not av_route_edges:
+        raise ValueError("AV route must contain at least one regular SUMO edge")
+
     if routes_path.exists():
         tree = ET.parse(routes_path)
         root = tree.getroot()
