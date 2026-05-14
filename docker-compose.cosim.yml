@@ -18,7 +18,7 @@ services:
     command: ["/bin/bash", "/app/examples/scripts/main_cosim.sh"]
 
   # mcity_carla:
-  #   image: public.ecr.aws/x0u0p9b6/mcity-digital-twin:0.9.15
+  #   image: public.ecr.aws/x0u0p9b6/mcity-digital-twin:0.9.16
   #   container_name: mcity_carla
   #   privileged: true
   #   network_mode: host
