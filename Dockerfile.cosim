@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir -e packages/terasim && \
     pip install --no-cache-dir -e packages/terasim-service
 
 # Install CARLA Python client (must match CARLA server version)
-RUN pip install --no-cache-dir carla==0.9.15
+RUN pip install --no-cache-dir carla==0.9.16
 
 # Build Cython extensions for NDE-NADE (collision detection, geometry, trajectory utils)
 RUN cd packages/terasim-nde-nade && \
