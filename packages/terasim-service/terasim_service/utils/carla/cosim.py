@@ -99,6 +99,14 @@ class CarlaCosim(object):
         self.batch_spawn_enabled = _env_bool("CARLA_COSIM_BATCH_SPAWN", False)
         if self.batch_spawn_enabled:
             print("CARLA co-sim SpawnActor batching enabled.", flush=True)
+        self.spawn_z_clearance = max(
+            0.0,
+            _env_float("CARLA_COSIM_SPAWN_Z_CLEARANCE", self.SPAWN_Z_CLEARANCE),
+        )
+        print(
+            f"CARLA co-sim spawn Z clearance: {self.spawn_z_clearance:.1f}m.",
+            flush=True,
+        )
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -994,7 +1002,7 @@ class CarlaCosim(object):
                 return
             blueprint = self._select_vehicle_blueprint(veh_id, veh_info)
             # Spawn elevated to avoid collision with road geometry, then set correct transform
-            sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
+            sumo_offset = self._get_carla_offset(sumo_location, self.spawn_z_clearance)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
@@ -1070,7 +1078,7 @@ class CarlaCosim(object):
                 return
             blueprint = self._select_vru_blueprint(vru_id, vru_info)
             # Spawn elevated to avoid collision with road geometry
-            sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
+            sumo_offset = self._get_carla_offset(sumo_location, self.spawn_z_clearance)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
             sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)
