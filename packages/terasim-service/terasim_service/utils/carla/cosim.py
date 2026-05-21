@@ -20,6 +20,7 @@ from .tools import (
     destroy_all_actors,
     draw_text,
     get_actor_id_from_attribute,
+    log_spawn_actor_failure,
     sumo_to_carla,
     spawn_actor,
 )
@@ -95,6 +96,9 @@ class CarlaCosim(object):
         self.batch_transform_enabled = _env_bool("CARLA_COSIM_BATCH_TRANSFORM", False)
         if self.batch_transform_enabled:
             print("CARLA co-sim ApplyTransform batching enabled.", flush=True)
+        self.batch_spawn_enabled = _env_bool("CARLA_COSIM_BATCH_SPAWN", False)
+        if self.batch_spawn_enabled:
+            print("CARLA co-sim SpawnActor batching enabled.", flush=True)
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -499,6 +503,7 @@ class CarlaCosim(object):
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
         transform_batch = []
+        spawn_requests = []
 
         for veh_id, veh_info in vehicles.items():
             if self.control_av and veh_id == AV_SUMO_ID:
@@ -521,6 +526,7 @@ class CarlaCosim(object):
                 actor_index=vehicle_actor_index,
                 current_frame=current_frame,
                 transform_batch=transform_batch,
+                spawn_requests=spawn_requests,
             )
         
         for vru_id, vru_info in vrus.items():
@@ -537,8 +543,10 @@ class CarlaCosim(object):
                 actor_index=vru_actor_index,
                 current_frame=current_frame,
                 transform_batch=transform_batch,
+                spawn_requests=spawn_requests,
             )
 
+        self._flush_actor_spawn_batch(spawn_requests, transform_batch)
         self._flush_actor_transform_batch(transform_batch)
         self._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
         self._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
@@ -674,6 +682,140 @@ class CarlaCosim(object):
     @staticmethod
     def _spawn_failure_key(actor_type, actor_id):
         return actor_type, actor_id
+
+    def _fresh_blueprint(self, blueprint):
+        try:
+            return self.world.get_blueprint_library().find(blueprint.id)
+        except Exception:
+            return blueprint
+
+    def _select_vehicle_blueprint(self, veh_id, veh_info):
+        if "BIKE" in veh_info["type"]:
+            blueprint = random.choice(self.bike_blueprints)
+        elif "MOTOR" in veh_info["type"]:
+            blueprint = random.choice(self.motor_blueprints)
+        elif "POLICE" in veh_info["type"]:
+            blueprint = random.choice(self.police_car_blueprints)
+        else:
+            blueprint = random.choice(self.vehicle_blueprints)
+        blueprint = self._fresh_blueprint(blueprint)
+        blueprint.set_attribute("role_name", veh_id)
+        if veh_id == AV_SUMO_ID:
+            blueprint.set_attribute("color", "255, 0, 0")
+        else:
+            blueprint.set_attribute("color", "0, 102, 204")
+        return blueprint
+
+    def _select_vru_blueprint(self, vru_id, vru_info):
+        if "BIKE" in vru_info["type"]:
+            blueprint = random.choice(self.bike_blueprints)
+        elif "MOTOR" in vru_info["type"]:
+            blueprint = random.choice(self.motor_blueprints)
+        else:
+            blueprint = random.choice(self.pedestrian_blueprints)
+        blueprint = self._fresh_blueprint(blueprint)
+        blueprint.set_attribute("role_name", vru_id)
+        return blueprint
+
+    @staticmethod
+    def _empty_spawn_batch_stats():
+        return {
+            "spawn_calls": 0,
+            "spawn_total": 0.0,
+            "spawn_max": 0.0,
+            "spawn_success": 0,
+            "spawn_failed": 0,
+            "apply_batch_sync_time": 0.0,
+            "apply_batch_sync_max": 0.0,
+            "apply_batch_sync_success_time": 0.0,
+            "apply_batch_sync_failed_time": 0.0,
+        }
+
+    def _queue_actor_spawn(self, spawn_requests, request):
+        if self.batch_spawn_enabled and spawn_requests is not None:
+            spawn_requests.append(request)
+            return True
+        return False
+
+    def _flush_actor_spawn_batch(self, spawn_requests, transform_batch=None):
+        stats = self._empty_spawn_batch_stats()
+        if not spawn_requests:
+            return stats
+
+        commands = [
+            carla.command.SpawnActor(request["blueprint"], request["spawn_transform"]).then(
+                carla.command.SetSimulatePhysics(carla.command.FutureActor, False)
+            )
+            for request in spawn_requests
+        ]
+
+        total_start = time.perf_counter()
+        apply_start = time.perf_counter()
+        responses = self.client.apply_batch_sync(commands, True)
+        apply_elapsed = time.perf_counter() - apply_start
+
+        stats["spawn_calls"] = len(spawn_requests)
+        stats["apply_batch_sync_time"] = apply_elapsed
+        stats["apply_batch_sync_max"] = apply_elapsed
+
+        response_count = len(responses)
+        success_count = sum(1 for response in responses if not response.error)
+        failed_count = response_count - success_count
+        stats["spawn_success"] = success_count
+        stats["spawn_failed"] = failed_count
+        if response_count:
+            stats["apply_batch_sync_success_time"] = apply_elapsed * success_count / response_count
+            stats["apply_batch_sync_failed_time"] = apply_elapsed * failed_count / response_count
+
+        for request, response in zip(spawn_requests, responses):
+            actor_type = request["actor_type"]
+            actor_id = request["actor_id"]
+            if response.error:
+                log_spawn_actor_failure(
+                    self.world,
+                    request["blueprint"],
+                    request["spawn_transform"],
+                    actor_id,
+                    response.error,
+                )
+                self._record_spawn_failure(
+                    actor_type, actor_id, request["sumo_location"], request["current_frame"]
+                )
+                continue
+
+            actor = self.world.get_actor(response.actor_id)
+            if actor is None:
+                self._record_spawn_failure(
+                    actor_type, actor_id, request["sumo_location"], request["current_frame"]
+                )
+                continue
+
+            self._clear_spawn_failure(actor_type, actor_id)
+            actor_index = request.get("actor_index")
+            if actor_index is not None:
+                actor_index[actor_id] = actor
+            self._queue_actor_transform(actor, request["post_spawn_transform"], transform_batch)
+            if actor_type == "vru":
+                self._apply_vru_walker_control(request["actor_info"], request["sumo_angle"], actor)
+
+        stats["spawn_total"] = time.perf_counter() - total_start
+        stats["spawn_max"] = stats["spawn_total"]
+        return stats
+
+    def _apply_vru_walker_control(self, vru_info, sumo_angle, pedestrian):
+        if self._vru_uses_vehicle_blueprint(vru_info):
+            return
+        radians = math.radians(90 - sumo_angle)
+        orientation = math.atan2(math.sin(radians), math.cos(radians))
+        direction_x, direction_y = math.cos(orientation), math.sin(orientation)
+        walker_control = carla.WalkerControl(
+            direction=carla.Vector3D(direction_x, direction_y, 0),
+            speed=vru_info["speed"],
+        )
+        try:
+            pedestrian.apply_control(walker_control)
+        except Exception:
+            pass
 
     def _queue_actor_transform(self, actor, transform, transform_batch=None):
         """Queue or apply a CARLA actor transform according to batching settings."""
@@ -830,6 +972,7 @@ class CarlaCosim(object):
         actor_index=None,
         current_frame=None,
         transform_batch=None,
+        spawn_requests=None,
     ):
         """Process a vehicle actor."""
         cosim_id_record.add(veh_id)
@@ -849,22 +992,28 @@ class CarlaCosim(object):
                 current_frame = self.world.get_snapshot().frame
             if not self._should_retry_spawn("vehicle", veh_id, sumo_location, current_frame):
                 return
-            if "BIKE" in veh_info["type"]:
-                blueprint = random.choice(self.bike_blueprints)
-            elif "MOTOR" in veh_info["type"]:
-                blueprint = random.choice(self.motor_blueprints)
-            elif "POLICE" in veh_info["type"]:
-                blueprint = random.choice(self.police_car_blueprints)
-            else:
-                blueprint = random.choice(self.vehicle_blueprints)
-            blueprint.set_attribute("role_name", veh_id)
-            if veh_id == AV_SUMO_ID:
-                blueprint.set_attribute("color", "255, 0, 0")
-            else:
-                blueprint.set_attribute("color", "0, 102, 204")
+            blueprint = self._select_vehicle_blueprint(veh_id, veh_info)
             # Spawn elevated to avoid collision with road geometry, then set correct transform
             sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
+            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+            if self._queue_actor_spawn(
+                spawn_requests,
+                {
+                    "actor_type": "vehicle",
+                    "actor_id": veh_id,
+                    "actor_info": veh_info,
+                    "blueprint": blueprint,
+                    "spawn_transform": spawn_transform,
+                    "post_spawn_transform": carla_trasform,
+                    "sumo_location": sumo_location,
+                    "current_frame": current_frame,
+                    "actor_index": actor_index,
+                    "sumo_angle": sumo_angle,
+                },
+            ):
+                return
             carla_id = spawn_actor(
                 self.client,
                 blueprint,
@@ -881,8 +1030,6 @@ class CarlaCosim(object):
                 if actor_index is not None:
                     actor_index[veh_id] = vehicle
                 # Immediately set the correct road-level transform
-                sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
-                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
                 vehicle.set_transform(carla_trasform)
             else:
                 self._record_spawn_failure("vehicle", veh_id, sumo_location, current_frame)
@@ -900,6 +1047,7 @@ class CarlaCosim(object):
         actor_index=None,
         current_frame=None,
         transform_batch=None,
+        spawn_requests=None,
     ):
         """Process a pedestrian actor."""
         cosim_id_record.add(vru_id)
@@ -920,16 +1068,29 @@ class CarlaCosim(object):
                 current_frame = self.world.get_snapshot().frame
             if not self._should_retry_spawn("vru", vru_id, sumo_location, current_frame):
                 return
-            if "BIKE" in vru_info["type"]:
-                blueprint = random.choice(self.bike_blueprints)
-            elif "MOTOR" in vru_info["type"]:
-                blueprint = random.choice(self.motor_blueprints)
-            else:
-                blueprint = random.choice(self.pedestrian_blueprints)
-            blueprint.set_attribute("role_name", vru_id)
+            blueprint = self._select_vru_blueprint(vru_id, vru_info)
             # Spawn elevated to avoid collision with road geometry
             sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
             spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
+            sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)
+            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+            if self._queue_actor_spawn(
+                spawn_requests,
+                {
+                    "actor_type": "vru",
+                    "actor_id": vru_id,
+                    "actor_info": vru_info,
+                    "blueprint": blueprint,
+                    "spawn_transform": spawn_transform,
+                    "post_spawn_transform": carla_trasform,
+                    "sumo_location": sumo_location,
+                    "current_frame": current_frame,
+                    "actor_index": actor_index,
+                    "sumo_angle": sumo_angle,
+                },
+            ):
+                return
             carla_id = spawn_actor(
                 self.client,
                 blueprint,
@@ -945,9 +1106,6 @@ class CarlaCosim(object):
                     return
                 if actor_index is not None:
                     actor_index[vru_id] = pedestrian
-                z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
-                sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)
-                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
                 pedestrian.set_transform(carla_trasform)
             else:
                 self._record_spawn_failure("vru", vru_id, sumo_location, current_frame)
@@ -958,24 +1116,7 @@ class CarlaCosim(object):
             self._queue_actor_transform(pedestrian, carla_trasform, transform_batch)
 
         if carla_id > 0:
-            if not self._vru_uses_vehicle_blueprint(vru_info):
-                radians = math.radians(90 - sumo_angle)
-                orientation = math.atan2(math.sin(radians), math.cos(radians))
-                direction_x, direction_y = math.cos(orientation), math.sin(orientation)
-                walker_control = carla.WalkerControl(
-                    direction=carla.Vector3D(
-                        direction_x, direction_y, 0
-                    ),
-                    speed=vru_info["speed"],
-                )
-                try:
-                    pedestrian.apply_control(walker_control)
-                except:
-                    pass
-            else:
-                # control = carla.VehicleControl()
-                # self.world.get_actor(carla_id).apply_control(control)
-                pass
+            self._apply_vru_walker_control(vru_info, sumo_angle, pedestrian)
 
     def _cleanup_actors(self, actor_type, pattern, cosim_id_record):
         """Clean up CARLA actors not in the cosim actor record."""

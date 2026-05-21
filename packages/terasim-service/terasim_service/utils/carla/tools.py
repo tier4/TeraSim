@@ -246,6 +246,19 @@ def _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role):
     )
 
 
+def log_spawn_actor_failure(world, blueprint, transform, actor_role, error):
+    logging.error("Spawn carla actor failed. %s", error)
+    diagnostic_key = actor_role or (
+        blueprint.id,
+        round(transform.location.x, 1),
+        round(transform.location.y, 1),
+        round(transform.location.z, 1),
+    )
+    if world is not None and diagnostic_key not in _SPAWN_DIAGNOSTIC_LOGGED:
+        _SPAWN_DIAGNOSTIC_LOGGED.add(diagnostic_key)
+        _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role)
+
+
 def spawn_actor(client, blueprint, transform, *, world=None, actor_role=None):
     """
     Spawns a new actor.
@@ -272,16 +285,7 @@ def spawn_actor(client, blueprint, transform, *, world=None, actor_role=None):
         except Exception:
             logging.exception("Spawn actor profile hook failed.")
     if response.error:
-        logging.error("Spawn carla actor failed. %s", response.error)
-        diagnostic_key = actor_role or (
-            blueprint.id,
-            round(transform.location.x, 1),
-            round(transform.location.y, 1),
-            round(transform.location.z, 1),
-        )
-        if world is not None and diagnostic_key not in _SPAWN_DIAGNOSTIC_LOGGED:
-            _SPAWN_DIAGNOSTIC_LOGGED.add(diagnostic_key)
-            _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role)
+        log_spawn_actor_failure(world, blueprint, transform, actor_role, response.error)
         return -1
 
     return response.actor_id

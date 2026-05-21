@@ -689,6 +689,24 @@ class ActorSyncProfiler:
                 f"lookup={row['lookup_total']:.3f}s/{row['lookup_calls']}calls"
             )
 
+    @staticmethod
+    def _merge_spawn_batch_stats(row: dict, stats: dict) -> None:
+        row["spawn_calls"] += stats.get("spawn_calls", 0)
+        row["spawn_total"] += stats.get("spawn_total", 0.0)
+        row["spawn_max"] = max(row["spawn_max"], stats.get("spawn_max", 0.0))
+        row["spawn_success"] += stats.get("spawn_success", 0)
+        row["spawn_failed"] += stats.get("spawn_failed", 0)
+        row["apply_batch_sync_time"] += stats.get("apply_batch_sync_time", 0.0)
+        row["apply_batch_sync_max"] = max(
+            row["apply_batch_sync_max"], stats.get("apply_batch_sync_max", 0.0)
+        )
+        row["apply_batch_sync_success_time"] += stats.get(
+            "apply_batch_sync_success_time", 0.0
+        )
+        row["apply_batch_sync_failed_time"] += stats.get(
+            "apply_batch_sync_failed_time", 0.0
+        )
+
     def profiled_sync_actor(self):
         cosim = self.carla_cosim
         row = self._new_row()
@@ -730,6 +748,7 @@ class ActorSyncProfiler:
             cosim_id_record = set()
             current_frame = cosim.world.get_snapshot().frame
             transform_batch = []
+            spawn_requests = []
 
             stage_start = time.perf_counter()
             vehicle_actor_index, pedestrian_actor_index = cosim._build_actor_role_indexes()
@@ -758,6 +777,7 @@ class ActorSyncProfiler:
                     actor_index=vehicle_actor_index,
                     current_frame=current_frame,
                     transform_batch=transform_batch,
+                    spawn_requests=spawn_requests,
                 )
                 elapsed = self._elapsed(process_start)
                 row["vehicle_process_calls"] += 1
@@ -780,12 +800,15 @@ class ActorSyncProfiler:
                     actor_index=vru_actor_index,
                     current_frame=current_frame,
                     transform_batch=transform_batch,
+                    spawn_requests=spawn_requests,
                 )
                 elapsed = self._elapsed(process_start)
                 row["vru_process_calls"] += 1
                 row["vru_process_max"] = max(row["vru_process_max"], elapsed)
             row["vru_loop"] = self._elapsed(stage_start)
 
+            spawn_stats = cosim._flush_actor_spawn_batch(spawn_requests, transform_batch)
+            self._merge_spawn_batch_stats(row, spawn_stats)
             cosim._flush_actor_transform_batch(transform_batch)
 
             stage_start = time.perf_counter()
