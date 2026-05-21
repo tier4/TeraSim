@@ -14,7 +14,7 @@ def avoidable_maneuver_challenge_hook(veh_id):
         veh_id (str): ID of the vehicle.
     """
     traci.vehicle.highlight(
-        veh_id, (255, 0, 0, 120), duration=traci.simulation.getDeltaT(), alphaMax=0.1
+        veh_id, (255, 0, 0, 120), duration=traci.simulation.getDeltaT(), alphaMax=120
     )
 
 def unavoidable_maneuver_challenge_hook(veh_id):
@@ -24,7 +24,7 @@ def unavoidable_maneuver_challenge_hook(veh_id):
         veh_id (str): ID of the vehicle.
     """
     traci.vehicle.highlight(
-        veh_id, (128, 128, 128, 255), duration=traci.simulation.getDeltaT(), alphaMax=0.1
+        veh_id, (128, 128, 128, 255), duration=traci.simulation.getDeltaT(), alphaMax=255
     )
 
 def adversarial_hook(veh_id):
@@ -33,7 +33,7 @@ def adversarial_hook(veh_id):
     Args:
         veh_id (str): ID of the vehicle.
     """
-    traci.vehicle.highlight(veh_id, (255, 0, 0, 255), duration=2, alphaMax=0.1)
+    traci.vehicle.highlight(veh_id, (255, 0, 0, 255), duration=2, alphaMax=255)
 
 def get_nde_cmd_from_cmd_info(env_command_information, agent_type):
     """Get the NDE command distribution of the specific type of agents from the command information.
