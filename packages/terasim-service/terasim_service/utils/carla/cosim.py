@@ -47,6 +47,13 @@ def _env_float(name, default):
         return default
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 class CarlaCosim(object):
     def __init__(self, args):
         self.args = args
@@ -85,6 +92,9 @@ class CarlaCosim(object):
             self.spawn_failure_backoff_seconds,
             _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS", 30.0),
         )
+        self.batch_transform_enabled = _env_bool("CARLA_COSIM_BATCH_TRANSFORM", False)
+        if self.batch_transform_enabled:
+            print("CARLA co-sim ApplyTransform batching enabled.", flush=True)
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -488,6 +498,7 @@ class CarlaCosim(object):
         vehicle_actor_index, pedestrian_actor_index = self._build_actor_role_indexes()
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
+        transform_batch = []
 
         for veh_id, veh_info in vehicles.items():
             if self.control_av and veh_id == AV_SUMO_ID:
@@ -509,6 +520,7 @@ class CarlaCosim(object):
                 carla_actor=vehicle_actor_index.get(veh_id),
                 actor_index=vehicle_actor_index,
                 current_frame=current_frame,
+                transform_batch=transform_batch,
             )
         
         for vru_id, vru_info in vrus.items():
@@ -524,8 +536,10 @@ class CarlaCosim(object):
                 carla_actor=vru_actor_index.get(vru_id),
                 actor_index=vru_actor_index,
                 current_frame=current_frame,
+                transform_batch=transform_batch,
             )
 
+        self._flush_actor_transform_batch(transform_batch)
         self._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
         self._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
         self._prune_spawn_failures(vehicles.keys(), vrus.keys())
@@ -660,6 +674,19 @@ class CarlaCosim(object):
     @staticmethod
     def _spawn_failure_key(actor_type, actor_id):
         return actor_type, actor_id
+
+    def _queue_actor_transform(self, actor, transform, transform_batch=None):
+        """Queue or apply a CARLA actor transform according to batching settings."""
+        if self.batch_transform_enabled and transform_batch is not None:
+            transform_batch.append(carla.command.ApplyTransform(actor.id, transform))
+            return
+        actor.set_transform(transform)
+
+    def _flush_actor_transform_batch(self, transform_batch):
+        """Apply queued actor transforms in one CARLA batch call."""
+        if not transform_batch:
+            return []
+        return self.client.apply_batch_sync(transform_batch, False)
 
     def _build_actor_role_indexes(self):
         """Build role_name indexes once per tick instead of scanning CARLA per actor."""
@@ -802,6 +829,7 @@ class CarlaCosim(object):
         carla_actor=None,
         actor_index=None,
         current_frame=None,
+        transform_batch=None,
     ):
         """Process a vehicle actor."""
         cosim_id_record.add(veh_id)
@@ -861,7 +889,7 @@ class CarlaCosim(object):
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            vehicle.set_transform(carla_trasform)
+            self._queue_actor_transform(vehicle, carla_trasform, transform_batch)
 
     def _process_vru(
         self,
@@ -871,6 +899,7 @@ class CarlaCosim(object):
         carla_actor=None,
         actor_index=None,
         current_frame=None,
+        transform_batch=None,
     ):
         """Process a pedestrian actor."""
         cosim_id_record.add(vru_id)
@@ -926,7 +955,7 @@ class CarlaCosim(object):
             z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
             sumo_offset = self._get_carla_offset(sumo_location, z_off)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            pedestrian.set_transform(carla_trasform)
+            self._queue_actor_transform(pedestrian, carla_trasform, transform_batch)
 
         if carla_id > 0:
             if not self._vru_uses_vehicle_blueprint(vru_info):

@@ -729,6 +729,7 @@ class ActorSyncProfiler:
 
             cosim_id_record = set()
             current_frame = cosim.world.get_snapshot().frame
+            transform_batch = []
 
             stage_start = time.perf_counter()
             vehicle_actor_index, pedestrian_actor_index = cosim._build_actor_role_indexes()
@@ -756,6 +757,7 @@ class ActorSyncProfiler:
                     carla_actor=vehicle_actor_index.get(veh_id),
                     actor_index=vehicle_actor_index,
                     current_frame=current_frame,
+                    transform_batch=transform_batch,
                 )
                 elapsed = self._elapsed(process_start)
                 row["vehicle_process_calls"] += 1
@@ -777,11 +779,14 @@ class ActorSyncProfiler:
                     carla_actor=vru_actor_index.get(vru_id),
                     actor_index=vru_actor_index,
                     current_frame=current_frame,
+                    transform_batch=transform_batch,
                 )
                 elapsed = self._elapsed(process_start)
                 row["vru_process_calls"] += 1
                 row["vru_process_max"] = max(row["vru_process_max"], elapsed)
             row["vru_loop"] = self._elapsed(stage_start)
+
+            cosim._flush_actor_transform_batch(transform_batch)
 
             stage_start = time.perf_counter()
             cosim._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
