@@ -742,6 +742,7 @@ class ActorSyncProfiler:
 
             vehicles = terasim_states["agent_details"]["vehicle"]
             vrus = terasim_states["agent_details"]["vru"]
+            vehicles, vrus = cosim._filter_actor_details_by_radius(vehicles, vrus)
             row["vehicle_count"] = len(vehicles)
             row["vru_count"] = len(vrus)
 

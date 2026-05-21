@@ -107,6 +107,22 @@ class CarlaCosim(object):
             f"CARLA co-sim spawn Z clearance: {self.spawn_z_clearance:.1f}m.",
             flush=True,
         )
+        self.actor_filter_enabled = _env_bool("CARLA_COSIM_ACTOR_FILTER", False)
+        self.actor_filter_center_id = (
+            os.environ.get("CARLA_COSIM_ACTOR_FILTER_CENTER_ID") or AV_SUMO_ID
+        )
+        self.actor_filter_radius = max(
+            0.0,
+            _env_float("CARLA_COSIM_ACTOR_FILTER_RADIUS", 300.0),
+        )
+        self._actor_filter_missing_center_warned = False
+        if self.actor_filter_enabled:
+            print(
+                "CARLA co-sim actor radius filter enabled: "
+                f"center={self.actor_filter_center_id} "
+                f"radius={self.actor_filter_radius:.1f}m.",
+                flush=True,
+            )
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -484,6 +500,49 @@ class CarlaCosim(object):
                     elif light_state == "R" or light_state == "r":
                         light_actor.set_state(carla.TrafficLightState.Red)
 
+    @staticmethod
+    def _actor_xy(actor_info):
+        try:
+            return float(actor_info["x"]), float(actor_info["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _filter_actor_details_by_radius(self, vehicles, vrus):
+        if not self.actor_filter_enabled:
+            return vehicles, vrus
+
+        center_info = vehicles.get(self.actor_filter_center_id)
+        center_xy = self._actor_xy(center_info) if center_info is not None else None
+        if center_xy is None:
+            if not self._actor_filter_missing_center_warned:
+                print(
+                    "Warning: CARLA co-sim actor radius filter center "
+                    f"{self.actor_filter_center_id!r} is not available; "
+                    "using unfiltered actors.",
+                    flush=True,
+                )
+                self._actor_filter_missing_center_warned = True
+            return vehicles, vrus
+
+        center_x, center_y = center_xy
+        radius_squared = self.actor_filter_radius * self.actor_filter_radius
+
+        filtered_vehicles = {}
+        for veh_id, veh_info in vehicles.items():
+            if veh_id in {self.actor_filter_center_id, AV_SUMO_ID}:
+                filtered_vehicles[veh_id] = veh_info
+                continue
+            vehicle_xy = self._actor_xy(veh_info)
+            if vehicle_xy is None:
+                filtered_vehicles[veh_id] = veh_info
+                continue
+            dx = vehicle_xy[0] - center_x
+            dy = vehicle_xy[1] - center_y
+            if dx * dx + dy * dy <= radius_squared:
+                filtered_vehicles[veh_id] = veh_info
+
+        return filtered_vehicles, vrus
+
     def sync_cosim_actor_to_carla(self):
         """Update all actors in cosim to CARLA.
         """
@@ -510,6 +569,7 @@ class CarlaCosim(object):
         vehicle_actor_index, pedestrian_actor_index = self._build_actor_role_indexes()
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
+        vehicles, vrus = self._filter_actor_details_by_radius(vehicles, vrus)
         transform_batch = []
         spawn_requests = []
 
