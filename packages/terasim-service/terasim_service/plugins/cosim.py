@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -177,6 +178,62 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         self._last_idle_state_write_wall_time = 0.0
 
+        self.state_filter_enabled = self._parse_bool_env("TERASIM_COSIM_STATE_FILTER", False)
+        self.state_filter_center_id = os.getenv("TERASIM_COSIM_STATE_FILTER_CENTER_ID", "AV")
+        self.state_filter_radius = self._parse_optional_float(
+            os.getenv("TERASIM_COSIM_STATE_FILTER_RADIUS", "")
+        )
+        self.state_filter_missing_center_logged = False
+        self.state_filter_error_logged = False
+        if self.state_filter_enabled:
+            self.logger.info(
+                "TeraSim co-sim state filter enabled: center=%s radius=%s",
+                self.state_filter_center_id,
+                self.state_filter_radius,
+            )
+
+        self.step_profile_log = os.getenv("TERASIM_COSIM_STEP_PROFILE_LOG", "").strip()
+        self.step_profile_print_every = self._parse_int_env(
+            "TERASIM_COSIM_STEP_PROFILE_PRINT_EVERY", 20
+        )
+        self._step_profile_file = None
+        self._step_profile_writer = None
+        self._step_profile_rows = 0
+        self._current_step_start_perf = None
+        self._current_step_start_wall_time = None
+        self._last_state_write_profile = {}
+        self._step_profile_fieldnames = [
+            "wall_time",
+            "completed_sumo_time",
+            "completed_tick_count",
+            "total",
+            "env_step",
+            "after_total",
+            "state_write",
+            "state_check_status",
+            "state_get_ids",
+            "state_vehicle_filter",
+            "state_raw_vehicle_count",
+            "state_vehicle_loop",
+            "state_vru_loop",
+            "state_construction_loop",
+            "state_tls_loop",
+            "state_construction_zone",
+            "state_json_dump",
+            "state_redis_set",
+            "state_redis_expire",
+            "state_total",
+            "state_vehicle_count",
+            "state_vru_count",
+            "state_construction_count",
+            "state_tls_count",
+            "state_json_bytes",
+            "completion_redis",
+            "gui_tracking",
+            "result",
+        ]
+        self._open_step_profile()
+
     @staticmethod
     def _parse_float_env(name, default):
         value = os.getenv(name)
@@ -186,6 +243,57 @@ class TeraSimCoSimPlugin(BasePlugin):
             return float(value)
         except ValueError:
             return default
+
+    @staticmethod
+    def _parse_int_env(name, default):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _parse_bool_env(name, default=False):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _open_step_profile(self):
+        if not self.step_profile_log or self._step_profile_writer is not None:
+            return
+        profile_path = Path(self.step_profile_log)
+        if profile_path.parent != Path(""):
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self._step_profile_file = open(profile_path, "w", newline="")
+        self._step_profile_writer = csv.DictWriter(
+            self._step_profile_file, fieldnames=self._step_profile_fieldnames
+        )
+        self._step_profile_writer.writeheader()
+        self._step_profile_file.flush()
+
+    def _record_step_profile(self, row):
+        if self._step_profile_writer is None or self._step_profile_file is None:
+            return
+        self._step_profile_rows += 1
+        output_row = {field: row.get(field, "") for field in self._step_profile_fieldnames}
+        self._step_profile_writer.writerow(output_row)
+        self._step_profile_file.flush()
+        if (
+            self.step_profile_print_every
+            and self._step_profile_rows % self.step_profile_print_every == 0
+        ):
+            self.logger.info(
+                "step profile rows=%s total=%.3fs env_step=%.3fs "
+                "state_write=%.3fs vehicles=%s",
+                self._step_profile_rows,
+                float(output_row.get("total") or 0.0),
+                float(output_row.get("env_step") or 0.0),
+                float(output_row.get("state_write") or 0.0),
+                output_row.get("state_vehicle_count", ""),
+            )
 
     @staticmethod
     def _parse_optional_float(value):
@@ -374,6 +482,8 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "running", ex=self.key_expiry
         )
+        self._current_step_start_perf = time.perf_counter()
+        self._current_step_start_wall_time = time.time()
         self.logger.info("Simulation step started")
         return True
     
@@ -385,9 +495,28 @@ class TeraSimCoSimPlugin(BasePlugin):
         Returns:
             bool: True if the simulation step was successful, False otherwise.
         """
+        after_start = time.perf_counter()
+        step_start = self._current_step_start_perf or after_start
+        row = {
+            "wall_time": self._current_step_start_wall_time or time.time(),
+            "env_step": after_start - step_start,
+            "result": "ok",
+        }
+
+        state_start = time.perf_counter()
         state_write_success = self._write_simulation_state(simulator)
+        row["state_write"] = time.perf_counter() - state_start
+        state_profile = self._last_state_write_profile or {}
+        for key, value in state_profile.items():
+            row[f"state_{key}"] = value
         if not state_write_success:
+            row["result"] = "state_write_failed"
+            row["after_total"] = time.perf_counter() - after_start
+            row["total"] = time.perf_counter() - step_start
+            self._record_step_profile(row)
             return False
+
+        completion_start = time.perf_counter()
         completed_sumo_time = traci.simulation.getTime()
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:completed_sumo_time",
@@ -403,8 +532,17 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "ticked", ex=self.key_expiry
         )
+        row["completion_redis"] = time.perf_counter() - completion_start
+        row["completed_sumo_time"] = completed_sumo_time
+        row["completed_tick_count"] = completed_tick_count
+
         self._last_idle_state_write_wall_time = time.time()
+        gui_start = time.perf_counter()
         self._update_sumo_gui_tracking(simulator)
+        row["gui_tracking"] = time.perf_counter() - gui_start
+        row["after_total"] = time.perf_counter() - after_start
+        row["total"] = time.perf_counter() - step_start
+        self._record_step_profile(row)
         self.logger.info(
             "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s",
             completed_sumo_time,
@@ -593,69 +731,161 @@ class TeraSimCoSimPlugin(BasePlugin):
         vehicle_ids = [id for id in all_ids if id not in vru_ids and id not in construction_ids]
         return vehicle_ids, vru_ids, construction_ids
 
+    def _filter_vehicle_ids_for_state(self, vehicle_ids):
+        if (
+            not self.state_filter_enabled
+            or self.state_filter_radius is None
+            or self.state_filter_radius <= 0
+        ):
+            return vehicle_ids, {}
+
+        center_id = self.state_filter_center_id
+        if center_id not in vehicle_ids:
+            if not self.state_filter_missing_center_logged:
+                self.logger.info(
+                    "TeraSim co-sim state filter center %s is not in SUMO vehicles; "
+                    "returning full state until it appears",
+                    center_id,
+                )
+                self.state_filter_missing_center_logged = True
+            return vehicle_ids, {}
+
+        try:
+            center_position = traci.vehicle.getPosition3D(center_id)
+            radius_sq = self.state_filter_radius * self.state_filter_radius
+            filtered_vehicle_ids = []
+            position_cache = {}
+            for vid in vehicle_ids:
+                position = center_position if vid == center_id else traci.vehicle.getPosition3D(vid)
+                dx = position[0] - center_position[0]
+                dy = position[1] - center_position[1]
+                if vid == center_id or dx * dx + dy * dy <= radius_sq:
+                    filtered_vehicle_ids.append(vid)
+                    position_cache[vid] = position
+            self.state_filter_missing_center_logged = False
+            return filtered_vehicle_ids, position_cache
+        except Exception as e:
+            if not self.state_filter_error_logged:
+                self.logger.warning(
+                    "TeraSim co-sim state filter failed; returning full state: %s", e
+                )
+                self.state_filter_error_logged = True
+            return vehicle_ids, {}
+
     def _write_simulation_state(self, simulator):
         """Write the current simulation state to Redis.
 
         Args:
             simulator (Simulator): The simulator object.
         """
+        profile = {
+            "check_status": 0.0,
+            "get_ids": 0.0,
+            "vehicle_filter": 0.0,
+            "vehicle_loop": 0.0,
+            "vru_loop": 0.0,
+            "construction_loop": 0.0,
+            "tls_loop": 0.0,
+            "construction_zone": 0.0,
+            "json_dump": 0.0,
+            "redis_set": 0.0,
+            "redis_expire": 0.0,
+            "total": 0.0,
+            "vehicle_count": 0,
+            "raw_vehicle_count": 0,
+            "vru_count": 0,
+            "construction_count": 0,
+            "tls_count": 0,
+            "json_bytes": 0,
+            "result": "ok",
+        }
+        total_start = time.perf_counter()
+        self._last_state_write_profile = profile
+
+        stage_start = time.perf_counter()
         if not self._check_simulation_status():
+            profile["check_status"] = time.perf_counter() - stage_start
+            profile["result"] = "status_not_ok"
+            profile["total"] = time.perf_counter() - total_start
             return False
+        profile["check_status"] = time.perf_counter() - stage_start
+
         try:
             simulation_state = SimulationState()
             simulation_state.simulation_time = traci.simulation.getTime()
 
-            # Get all interested agent IDs
+            stage_start = time.perf_counter()
             vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
+            profile["get_ids"] = time.perf_counter() - stage_start
+            profile["raw_vehicle_count"] = len(vehicle_ids)
+
+            stage_start = time.perf_counter()
+            vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(vehicle_ids)
+            profile["vehicle_filter"] = time.perf_counter() - stage_start
+            profile["vehicle_count"] = len(vehicle_ids)
+            profile["vru_count"] = len(vru_ids)
+            profile["construction_count"] = len(construction_ids)
             simulation_state.agent_count = {
                 "vehicle": len(vehicle_ids),
                 "vru": len(vru_ids),
                 "construction": len(construction_ids),
             }
 
-            # Add vehicle states
             vehicles = {}
+            stage_start = time.perf_counter()
             for vid in vehicle_ids:
                 vehicle_state = AgentStateSimplified()
-                vehicle_state.x,vehicle_state.y,vehicle_state.z = traci.vehicle.getPosition3D(vid)
-                vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
+                position = vehicle_position_cache.get(vid)
+                if position is None:
+                    position = traci.vehicle.getPosition3D(vid)
+                vehicle_state.x, vehicle_state.y, vehicle_state.z = position
+                vehicle_state.lon, vehicle_state.lat = traci.simulation.convertGeo(
+                    vehicle_state.x, vehicle_state.y
+                )
                 vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
-                vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
+                vehicle_state.orientation = np.radians(
+                    (90 - vehicle_state.sumo_angle) % 360
+                )
                 vehicle_state.speed = traci.vehicle.getSpeed(vid)
                 vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
                 vehicle_state.length = traci.vehicle.getLength(vid)
                 vehicle_state.width = traci.vehicle.getWidth(vid)
                 vehicle_state.height = traci.vehicle.getHeight(vid)
                 vehicle_state.type = traci.vehicle.getTypeID(vid)
-                vehicle_state.angular_velocity = 0.0  # rad/s
+                vehicle_state.angular_velocity = 0.0
                 now_time = simulation_state.simulation_time
                 now_orientation = vehicle_state.orientation
-                last_orientation, last_time = self.last_orientations.get(vid, (now_orientation, now_time))
+                last_orientation, last_time = self.last_orientations.get(
+                    vid, (now_orientation, now_time)
+                )
                 dt = now_time - last_time
                 if dt > 0:
-                    dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
+                    dtheta = np.arctan2(
+                        np.sin(now_orientation - last_orientation),
+                        np.cos(now_orientation - last_orientation),
+                    )
                     vehicle_state.angular_velocity = dtheta / dt
                 else:
                     vehicle_state.angular_velocity = 0.0
                 self.last_orientations[vid] = (now_orientation, now_time)
                 vehicles[vid] = vehicle_state
-
+            profile["vehicle_loop"] = time.perf_counter() - stage_start
             simulation_state.agent_details["vehicle"] = vehicles
 
-            # Add VRU states
-            # Get current vehicle and person lists to determine actual object type
             current_vehicle_list = traci.vehicle.getIDList()
             current_person_list = traci.person.getIDList()
-            
+
             vrus = {}
+            stage_start = time.perf_counter()
             for vru_id in vru_ids:
                 vru_state = AgentStateSimplified()
-                
-                # Determine if this VRU is actually a vehicle or person
                 if vru_id in current_vehicle_list:
-                    # VRU is actually a vehicle (disguised as pedestrian)
-                    vru_state.x, vru_state.y, vru_state.z = traci.vehicle.getPosition3D(vru_id)
-                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
+                    vru_state.x, vru_state.y, vru_state.z = (
+                        traci.vehicle.getPosition3D(vru_id)
+                    )
+                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(
+                        vru_state.x, vru_state.y
+                    )
                     vru_state.sumo_angle = traci.vehicle.getAngle(vru_id)
                     vru_state.speed = traci.vehicle.getSpeed(vru_id)
                     vru_state.acceleration = traci.vehicle.getAcceleration(vru_id)
@@ -663,48 +893,66 @@ class TeraSimCoSimPlugin(BasePlugin):
                     vru_state.width = traci.vehicle.getWidth(vru_id)
                     vru_state.height = traci.vehicle.getHeight(vru_id)
                     vru_state.type = traci.vehicle.getTypeID(vru_id)
-                    vru_state.angular_velocity = 0.0  # rad/s
+                    vru_state.angular_velocity = 0.0
                     now_time = simulation_state.simulation_time
                     now_orientation = np.radians((90 - vru_state.sumo_angle) % 360)
-                    last_orientation, last_time = self.last_orientations.get(vru_id, (now_orientation, now_time))
+                    last_orientation, last_time = self.last_orientations.get(
+                        vru_id, (now_orientation, now_time)
+                    )
                     dt = now_time - last_time
                     if dt > 0:
-                        dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
+                        dtheta = np.arctan2(
+                            np.sin(now_orientation - last_orientation),
+                            np.cos(now_orientation - last_orientation),
+                        )
                         vru_state.angular_velocity = dtheta / dt
                     else:
                         vru_state.angular_velocity = 0.0
                     self.last_orientations[vru_id] = (now_orientation, now_time)
                     vru_state.orientation = now_orientation
                 elif vru_id in current_person_list:
-                    # VRU is actually a person
-                    vru_state.x, vru_state.y, vru_state.z = traci.person.getPosition3D(vru_id)
-                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
+                    vru_state.x, vru_state.y, vru_state.z = (
+                        traci.person.getPosition3D(vru_id)
+                    )
+                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(
+                        vru_state.x, vru_state.y
+                    )
                     vru_state.sumo_angle = traci.person.getAngle(vru_id)
                     vru_state.speed = traci.person.getSpeed(vru_id)
-                    vru_state.acceleration = traci.person.getAcceleration(vru_id) if hasattr(traci.person, 'getAcceleration') else 0.0
+                    vru_state.acceleration = (
+                        traci.person.getAcceleration(vru_id)
+                        if hasattr(traci.person, "getAcceleration")
+                        else 0.0
+                    )
                     vru_state.length = traci.person.getLength(vru_id)
                     vru_state.width = traci.person.getWidth(vru_id)
                     vru_state.height = traci.person.getHeight(vru_id)
                     vru_state.type = traci.person.getTypeID(vru_id)
-                    vru_state.angular_velocity = 0.0  # rad/s
+                    vru_state.angular_velocity = 0.0
                     vru_state.orientation = np.radians((90 - vru_state.sumo_angle) % 360)
                 else:
-                    # VRU ID not found in either list, log warning and skip
-                    self.logger.warning(f"VRU ID {vru_id} not found in vehicle or person lists, skipping")
+                    self.logger.warning(
+                        f"VRU ID {vru_id} not found in vehicle or person lists, skipping"
+                    )
                     continue
-                    
                 vrus[vru_id] = vru_state
-
+            profile["vru_loop"] = time.perf_counter() - stage_start
             simulation_state.agent_details["vru"] = vrus
 
-            # Add construction objects
             construction_objects = {}
+            stage_start = time.perf_counter()
             for cid in construction_ids:
                 construction_state = AgentStateSimplified()
-                construction_state.x, construction_state.y, construction_state.z = traci.vehicle.getPosition3D(cid)
-                construction_state.lon, construction_state.lat = traci.simulation.convertGeo(construction_state.x, construction_state.y)
+                construction_state.x, construction_state.y, construction_state.z = (
+                    traci.vehicle.getPosition3D(cid)
+                )
+                construction_state.lon, construction_state.lat = traci.simulation.convertGeo(
+                    construction_state.x, construction_state.y
+                )
                 construction_state.sumo_angle = traci.vehicle.getAngle(cid)
-                construction_state.orientation = np.radians((90 - construction_state.sumo_angle) % 360)
+                construction_state.orientation = np.radians(
+                    (90 - construction_state.sumo_angle) % 360
+                )
                 construction_state.speed = traci.vehicle.getSpeed(cid)
                 construction_state.acceleration = traci.vehicle.getAcceleration(cid)
                 construction_state.length = traci.vehicle.getLength(cid)
@@ -713,106 +961,116 @@ class TeraSimCoSimPlugin(BasePlugin):
                 construction_state.type = traci.vehicle.getTypeID(cid)
                 construction_state.angular_velocity = 0.0
                 construction_objects[cid] = construction_state
-                
+            profile["construction_loop"] = time.perf_counter() - stage_start
             simulation_state.construction_objects = construction_objects
 
-            # Add traffic light states
             traffic_lights = {}
+            stage_start = time.perf_counter()
             for tl_id in traci.trafficlight.getIDList():
                 sumo_signal = SUMOSignal()
-                sumo_signal.x, sumo_signal.y = 0,0
+                sumo_signal.x, sumo_signal.y = 0, 0
                 sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
-                tls_information = {
-                    "programs": {}
-                }
+                tls_information = {"programs": {}}
                 tls = self.simulator.sumo_net.getTLS(tl_id)
                 programs = tls.getPrograms()
                 for program_id, program in programs.items():
-                    # Get the program parameters
                     program_parameters = program.getParams()
                     tls_information["programs"][program_id] = {
                         "parameters": program_parameters
                     }
                 sumo_signal.information = json.dumps(tls_information)
                 traffic_lights[tl_id] = sumo_signal
-
+            profile["tls_loop"] = time.perf_counter() - stage_start
+            profile["tls_count"] = len(traffic_lights)
             simulation_state.traffic_light_details = traffic_lights
 
-            # Add construction zone shapes
-            if self.construction_zone_shapes is None and simulator.env.static_adversity is not None and simulator.env.static_adversity.adversities is not None:
+            stage_start = time.perf_counter()
+            if (
+                self.construction_zone_shapes is None
+                and simulator.env.static_adversity is not None
+                and simulator.env.static_adversity.adversities is not None
+            ):
                 self.construction_zone_shapes = {}
                 for adversity in simulator.env.static_adversity.adversities:
                     if isinstance(adversity, ConstructionAdversity):
                         lane_shape = traci.lane.getShape(adversity._lane_id)
-                        if lane_shape: # convert to list of lists
+                        if lane_shape:
                             lane_shape = interpolate_by_distance(lane_shape, 2.0)
                             lane_index = int(adversity._lane_id.split("_")[-1])
                             edge_id = traci.lane.getEdgeID(adversity._lane_id)
                             if lane_index == 0:
-                                # From right to left
                                 direction = 1
                             elif lane_index == traci.edge.getLaneNumber(edge_id) - 1:
-                                # From left to right
                                 direction = -1
                             else:
-                                # Middle lane, no construction zone
                                 continue
-                            construction_zone_shape = generate_construction_zone_shape(lane_shape, traci.lane.getWidth(adversity._lane_id), direction)
-                            self.construction_zone_shapes[adversity._lane_id] = construction_zone_shape
-
+                            construction_zone_shape = generate_construction_zone_shape(
+                                lane_shape,
+                                traci.lane.getWidth(adversity._lane_id),
+                                direction,
+                            )
+                            self.construction_zone_shapes[adversity._lane_id] = (
+                                construction_zone_shape
+                            )
+            profile["construction_zone"] = time.perf_counter() - stage_start
             simulation_state.construction_zone_details = self.construction_zone_shapes
-            
-            # Write to Redis with expiration
-            self.redis_client.set(
-                f"simulation:{self.simulation_uuid}:state", simulation_state.model_dump_json()
-            )
+
+            stage_start = time.perf_counter()
+            state_json = simulation_state.model_dump_json()
+            profile["json_dump"] = time.perf_counter() - stage_start
+            profile["json_bytes"] = len(state_json)
+
+            stage_start = time.perf_counter()
+            self.redis_client.set(f"simulation:{self.simulation_uuid}:state", state_json)
+            profile["redis_set"] = time.perf_counter() - stage_start
+
+            stage_start = time.perf_counter()
             self.redis_client.expire(
                 f"simulation:{self.simulation_uuid}:state", self.key_expiry
             )
-            
-            # If we reach here, TeraSim is working normally
+            profile["redis_expire"] = time.perf_counter() - stage_start
+
             self.error_count = 0
             self.last_successful_operation = time.time()
+            profile["total"] = time.perf_counter() - total_start
             return True
 
         except Exception as e:
+            profile["result"] = "exception"
+            profile["total"] = time.perf_counter() - total_start
             self.error_count += 1
             error_msg = str(e).lower()
-            
-            # Check if this is a critical error
+
             critical_errors = [
                 "no network loaded",
-                "connection lost", 
+                "connection lost",
                 "traci",
                 "sumo",
-                "simulation crashed"
+                "simulation crashed",
             ]
-            
+
             is_critical = any(err in error_msg for err in critical_errors)
-            
+
             self.logger.error(f"TeraSim error #{self.error_count}: {e}")
-            
-            # Stop if critical error or too many consecutive errors
+
             if is_critical or self.error_count >= 3:
-                self.logger.critical(f"TeraSim appears broken, stopping simulation")
-                # Set error flag for cleanup task to handle
+                self.logger.critical("TeraSim appears broken, stopping simulation")
                 self.redis_client.set(
-                    f"simulation:{self.simulation_uuid}:error_stop", 
+                    f"simulation:{self.simulation_uuid}:error_stop",
                     f"terasim_error_{self.error_count}",
-                    ex=300  # 5 minutes expiry
+                    ex=300,
                 )
                 return False
-                
-            # Also stop if no successful operation for too long
-            if time.time() - self.last_successful_operation > 300:  # 5 minutes
+
+            if time.time() - self.last_successful_operation > 300:
                 self.logger.critical("TeraSim not responding for 5 minutes, stopping")
                 self.redis_client.set(
-                    f"simulation:{self.simulation_uuid}:error_stop", 
+                    f"simulation:{self.simulation_uuid}:error_stop",
                     "terasim_timeout",
-                    ex=300
+                    ex=300,
                 )
                 return False
-                
+
             return True
 
     def _handle_agent_command(self, command_data):
