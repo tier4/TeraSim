@@ -743,8 +743,15 @@ class TeraSimCoSimPlugin(BasePlugin):
                         lon, lat = command.data["lonlat"]
                         x, y = traci.simulation.convertGeo(lon, lat, fromGeo=True)
                     if command.agent_type == "vehicle":
+                        # 3-cosim fix: keepRoute=0 (snap to closest lane in the network),
+                        # not 2 (free / off-road). With keepRoute=2 an externally-driven
+                        # vehicle (e.g. the Autoware ego mirrored as SUMO "AV" via control_av)
+                        # lands slightly off the lane centerline -> getLaneID()=="" -> it drops
+                        # out of the AV context subscription -> NADE stops controlling traffic
+                        # around it -> background vehicles no longer yield and rear-end the ego.
+                        # keepRoute=0 keeps the AV on a lane so SUMO traffic avoids it.
                         traci.vehicle.moveToXY(
-                            command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 2
+                            command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
                         )
 
                         if "speed" in command.data:
