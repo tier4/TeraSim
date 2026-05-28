@@ -114,7 +114,10 @@ class NADEWithAV(NADE):
             # Set SpeedMode and LaneChangeMode to 0 for external control
             traci.vehicle.setSpeedMode(AV_ID, 0)
             traci.vehicle.setLaneChangeMode(AV_ID, 0)
-        traci.vehicle.setSpeed(AV_ID, speed)
+            traci.vehicle.setSpeed(AV_ID, speed)
+        else:
+            # Hand back speed control to SUMO's car-following model
+            traci.vehicle.setSpeed(AV_ID, -1)
         
         # Set control mode to external
         self.av_control_mode = "external"
@@ -596,7 +599,7 @@ class NADEWithAV(NADE):
             env_command_information (dict): Command information from the environment.
             env_observation (dict): Observation from the environment.
         """
-        if AV_ID in traci.vehicle.getIDList():
+        if AV_ID in traci.vehicle.getIDList() and AV_ID in env_command_information[AgentType.VEHICLE]:
             AV_control_command_cache = env_command_information[AgentType.VEHICLE][AV_ID]["command_cache"]
             (
                 nade_control_commands,
@@ -628,6 +631,13 @@ class NADEWithAV(NADE):
                 nade_control_commands[AgentType.VEHICLE][AV_ID] = AV_control_command_cache
             self.execute_control_commands(nade_control_commands)
             self.record_step_data(env_command_information)
+        elif AV_ID in traci.vehicle.getIDList():
+            # 3-cosim guard: AV exists in SUMO but its command info is not ready this
+            # step (the AV context subscription only returns results the step after it
+            # is set up at insertion). Skip NADE decision/control for this step instead
+            # of crashing with KeyError('AV'); background traffic keeps flowing on SUMO
+            # car-following. Resolves the transient at AV insertion in cosim mode.
+            logger.warning("AV in traci but not yet in env_command_information; skipping NADE step this tick (transient at AV insertion)")
 
     def calculate_total_distance(self):
         """Calculate the total distance traveled by the AV.
