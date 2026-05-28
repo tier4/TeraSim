@@ -1,8 +1,12 @@
 import time
 import json
 import math
+import re
 import carla
 import random
+import xml.etree.ElementTree as ET
+import yaml
+import statistics
 
 from .tools import (
     carla_to_sumo,
@@ -36,7 +40,7 @@ class CarlaCosim(object):
         self.args = args
 
         self.client = carla.Client(args.carla_host, args.carla_port)
-        self.client.set_timeout(10.0)
+        self.client.set_timeout(getattr(args, 'carla_timeout', 10.0))
 
         self.world = self.client.get_world()
         if args.map_name:
@@ -79,6 +83,211 @@ class CarlaCosim(object):
             if terasim_status.get("status", None) == "wait_for_tick":
                 break
             time.sleep(0.1)
+
+        # Auto-calibrate SUMO-CARLA coordinate transformation
+        self.sumo_carla_offset = [0.0, 0.0]
+        self._coord_transformer = None
+        self._sumo_net_offset = [0.0, 0.0]
+        self._xodr_origin_utm = [0.0, 0.0]
+        net_file = self._get_net_file_from_config(args.terasim_config)
+        if net_file:
+            result = self._calibrate_sumo_carla_offset(net_file)
+            if result is not None:
+                # Offset-based mode
+                self.sumo_carla_offset = result
+                print(f"SUMO-CARLA coordinate offset: dx={self.sumo_carla_offset[0]:.2f}, dy={self.sumo_carla_offset[1]:.2f}")
+            else:
+                print("Using projection-based coordinate transformation")
+
+    @staticmethod
+    def _get_net_file_from_config(config_path):
+        """Extract SUMO net file path from the TeraSim scenario YAML config."""
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            # Try input.sumo_net_file first, then environment.parameters.sumo_net_file_path
+            net_file = config.get('input', {}).get('sumo_net_file')
+            if not net_file:
+                net_file = config.get('environment', {}).get('parameters', {}).get('sumo_net_file_path')
+            return net_file
+        except Exception as e:
+            print(f"Warning: Could not read config for net file path: {e}")
+            return None
+
+    @staticmethod
+    def _parse_xodr_origin(xodr_proj):
+        """Extract lat_0/lon_0 and UTM zone from an xodr geoReference proj string.
+        Returns (origin_lat, origin_lon, utm_zone) or (None, None, None) if not parseable.
+        """
+        import re
+        lat_0 = lon_0 = utm_zone = None
+        m = re.search(r'\+lat_0=([0-9.eE+-]+)', xodr_proj)
+        if m:
+            lat_0 = float(m.group(1))
+        m = re.search(r'\+lon_0=([0-9.eE+-]+)', xodr_proj)
+        if m:
+            lon_0 = float(m.group(1))
+        m = re.search(r'\+zone=(\d+)', xodr_proj)
+        if m:
+            utm_zone = int(m.group(1))
+        return lat_0, lon_0, utm_zone
+
+    def _calibrate_sumo_carla_offset(self, net_file):
+        """Build a coordinate transformer between SUMO net.xml and CARLA (xodr) coordinate systems.
+
+        OpenDRIVE files from Lanelet2 pipelines use coordinates that are local offsets from the
+        geoReference origin (lat_0, lon_0) projected into standard UTM. pyproj ignores lat_0/lon_0
+        for +proj=utm, so we handle this by:
+        1. Detecting the SUMO coordinate system (EPSG:3857 for Lanelet2 conversions)
+        2. Converting SUMO CRS -> standard UTM (matching xodr zone)
+        3. Subtracting the geoReference origin (projected to the same UTM) to get xodr-local coords
+
+        Returns [offset_x, offset_y] for simple offset mode, or sets self._coord_transformer
+        for full projection-based conversion (returns None).
+        """
+        # Parse SUMO net.xml <location> for projection info
+        sumo_proj = None
+        sumo_net_offset = [0.0, 0.0]
+        try:
+            tree = ET.parse(net_file)
+            root = tree.getroot()
+            loc_elem = root.find('.//location')
+            if loc_elem is not None:
+                sumo_proj = loc_elem.get('projParameter', '!')
+                offset_str = loc_elem.get('netOffset', '0.00,0.00')
+                parts = offset_str.split(',')
+                sumo_net_offset = [float(parts[0]), float(parts[1])]
+                print(f"SUMO net.xml: projParameter='{sumo_proj}', netOffset={sumo_net_offset}")
+        except Exception as e:
+            print(f"Warning: Could not parse SUMO net file {net_file}: {e}")
+
+        # Get xodr geoReference from CARLA map
+        xodr_proj = None
+        try:
+            opendrive_str = self.world.get_map().to_opendrive()
+            xodr_tree = ET.fromstring(opendrive_str)
+            geo_elem = xodr_tree.find('.//geoReference')
+            if geo_elem is not None and geo_elem.text:
+                xodr_proj = geo_elem.text.strip()
+                print(f"CARLA xodr geoReference: '{xodr_proj}'")
+        except Exception as e:
+            print(f"Warning: Could not get xodr geoReference from CARLA: {e}")
+
+        # Attempt projection-based transformation with origin offset handling
+        if xodr_proj:
+            try:
+                import pyproj
+
+                # Parse xodr origin (lat_0, lon_0) and UTM zone
+                origin_lat, origin_lon, utm_zone = self._parse_xodr_origin(xodr_proj)
+
+                # Determine SUMO CRS
+                sumo_crs = None
+                if sumo_proj and sumo_proj != '!':
+                    sumo_crs = pyproj.CRS(sumo_proj)
+                elif sumo_proj == '!':
+                    # Detect CRS empirically from coordinate ranges
+                    tree = ET.parse(net_file)
+                    root = tree.getroot()
+                    conv_boundary = root.find('.//location').get('convBoundary', '')
+                    cb_parts = conv_boundary.split(',')
+                    sample_x = (float(cb_parts[0]) + float(cb_parts[2])) / 2
+                    sample_y = (float(cb_parts[1]) + float(cb_parts[3])) / 2
+
+                    wgs84 = pyproj.CRS('EPSG:4326')
+                    for crs_code in ['EPSG:3857', 'EPSG:32654', 'EPSG:6677']:
+                        try:
+                            candidate = pyproj.CRS(crs_code)
+                            to_wgs84 = pyproj.Transformer.from_crs(candidate, wgs84, always_xy=True)
+                            lon, lat = to_wgs84.transform(sample_x, sample_y)
+                            if 100.0 < lon < 180.0 and -60.0 < lat < 85.0:
+                                sumo_crs = candidate
+                                print(f"Detected SUMO CRS as {crs_code} (sample -> lon={lon:.4f}, lat={lat:.4f})")
+                                break
+                        except Exception:
+                            continue
+
+                if sumo_crs is None:
+                    print("Warning: Could not determine SUMO CRS. Falling back to empirical calibration.")
+                    return self._empirical_calibration(net_file)
+
+                # Build transformer: SUMO CRS -> standard UTM (same zone as xodr)
+                if utm_zone:
+                    utm_crs = pyproj.CRS(f'EPSG:326{utm_zone:02d}')
+                else:
+                    # Default to UTM zone from xodr proj string
+                    utm_crs = pyproj.CRS(xodr_proj)
+
+                self._coord_transformer = pyproj.Transformer.from_crs(sumo_crs, utm_crs, always_xy=True)
+                self._sumo_net_offset = sumo_net_offset
+
+                # Compute xodr origin in standard UTM
+                self._xodr_origin_utm = [0.0, 0.0]
+                if origin_lat is not None and origin_lon is not None:
+                    wgs84 = pyproj.CRS('EPSG:4326')
+                    to_utm = pyproj.Transformer.from_crs(wgs84, utm_crs, always_xy=True)
+                    ox, oy = to_utm.transform(origin_lon, origin_lat)
+                    self._xodr_origin_utm = [ox, oy]
+                    print(f"xodr origin ({origin_lat:.6f}, {origin_lon:.6f}) in UTM: ({ox:.2f}, {oy:.2f})")
+
+                print(f"Using projection-based transform: SUMO -> UTM{utm_zone} - origin")
+                return None  # Signal to use transformer instead of offset
+
+            except Exception as e:
+                print(f"Warning: Projection-based calibration failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Fallback: empirical median-based calibration
+        return self._empirical_calibration(net_file)
+
+    def _empirical_calibration(self, net_file):
+        """Fallback: compute offset by comparing matching road coordinates."""
+        sumo_edges = {}
+        try:
+            tree = ET.parse(net_file)
+            root = tree.getroot()
+            for edge_elem in root.iter('edge'):
+                edge_id = edge_elem.get('id', '')
+                if edge_id.startswith(':'):
+                    continue
+                for lane_elem in edge_elem.iter('lane'):
+                    shape_str = lane_elem.get('shape', '')
+                    if shape_str:
+                        points = [tuple(map(float, p.split(','))) for p in shape_str.split()]
+                        mid = points[len(points) // 2]
+                        sumo_edges[edge_id] = (mid[0], mid[1])
+                        break
+        except Exception as e:
+            print(f"Warning: Could not parse net file: {e}")
+            return [0.0, 0.0]
+
+        carla_roads = {}
+        try:
+            for w in self.world.get_map().generate_waypoints(200.0):
+                rid = str(w.road_id)
+                if rid not in carla_roads:
+                    carla_roads[rid] = (w.transform.location.x, w.transform.location.y)
+        except Exception as e:
+            print(f"Warning: Could not get CARLA waypoints: {e}")
+            return [0.0, 0.0]
+
+        dxs, dys = [], []
+        for edge_id, (sx, sy) in sumo_edges.items():
+            if edge_id in carla_roads:
+                cx, cy = carla_roads[edge_id]
+                dxs.append(cx - sx)
+                dys.append(cy + sy)
+
+        if len(dxs) < 10:
+            print(f"Warning: Only {len(dxs)} matching roads. Offset may be inaccurate.")
+            if not dxs:
+                return [0.0, 0.0]
+
+        offset_x = statistics.median(dxs)
+        offset_y = statistics.median(dys)
+        print(f"Empirical calibration from {len(dxs)} matching roads")
+        return [offset_x, offset_y]
 
     def tick(self):
         if self.async_mode:
@@ -138,12 +347,27 @@ class CarlaCosim(object):
         velocity = AV.get_velocity()
         speed = (velocity.x**2 + velocity.y**2 + velocity.z**2) ** 0.5
 
-        av_sumo_location, av_sumo_rotation = carla_to_sumo(
-            transform.location, 
-            transform.rotation, 
-            self.av_shape, 
-            [0.0, 0.0, 0.0]
-        )
+        # Reverse transform: CARLA -> SUMO
+        if self._coord_transformer is not None:
+            # Direct reverse: CARLA location -> xodr coords -> UTM -> SUMO CRS
+            # CARLA: x = xodr_x, y = -xodr_y
+            xodr_x = transform.location.x
+            xodr_y = -transform.location.y
+            sumo_x, sumo_y = self._transform_xodr_to_sumo(xodr_x, xodr_y)
+            # Apply vehicle shape correction (SUMO position is front bumper)
+            yaw = math.radians(90.0 - (-1 * transform.rotation.yaw + 90))
+            sumo_x += math.cos(yaw) * self.av_shape[0] / 2.0
+            sumo_y += math.sin(yaw) * self.av_shape[0] / 2.0
+            av_sumo_location = [sumo_x, sumo_y, transform.location.z]
+            av_sumo_rotation = [transform.rotation.pitch, transform.rotation.yaw + 90, transform.rotation.roll]
+        else:
+            av_offset = [self.sumo_carla_offset[0], self.sumo_carla_offset[1], 0.0]
+            av_sumo_location, av_sumo_rotation = carla_to_sumo(
+                transform.location,
+                transform.rotation,
+                self.av_shape,
+                av_offset
+            )
 
         av_command = {
             "agent_id": AV_SUMO_ID,
@@ -202,6 +426,14 @@ class CarlaCosim(object):
                     light_actor = self.world.get_actor(light_id)
                     if not light_actor:
                         print(f"Traffic light with ID {light_id} not found in CARLA.")
+                        continue
+
+                    # Defensive guard: CARLA may return a non-TrafficLight Actor
+                    # when SUMO's TLS program parameters are not mapped to a
+                    # real CARLA landmark_id (e.g. netconvert --tls.guess nets
+                    # like Town01). Calling set_state on such an actor raises
+                    # AttributeError and aborts the whole cosim tick.
+                    if not isinstance(light_actor, carla.TrafficLight):
                         continue
 
                     light_state = sumo_tls[i]
@@ -324,6 +556,61 @@ class CarlaCosim(object):
                     )
                     print(f"created construction cone: {id}")
 
+    def _transform_sumo_to_xodr(self, sumo_x, sumo_y):
+        """Transform SUMO coordinates to xodr/CARLA coordinate system.
+
+        Steps: SUMO internal coords -> raw CRS coords -> standard UTM -> subtract xodr origin.
+        Returns (xodr_x, xodr_y) where xodr_y still needs to be negated for CARLA.
+        """
+        if self._coord_transformer is not None:
+            # SUMO internal coords = raw coords + netOffset
+            raw_x = sumo_x - self._sumo_net_offset[0]
+            raw_y = sumo_y - self._sumo_net_offset[1]
+            # Transform to standard UTM
+            utm_x, utm_y = self._coord_transformer.transform(raw_x, raw_y)
+            # Subtract xodr origin to get xodr-local coordinates
+            xodr_x = utm_x - self._xodr_origin_utm[0]
+            xodr_y = utm_y - self._xodr_origin_utm[1]
+            return xodr_x, xodr_y
+        return None, None
+
+    def _transform_xodr_to_sumo(self, xodr_x, xodr_y):
+        """Reverse transform: xodr/CARLA coordinates -> SUMO coordinates.
+
+        Steps: add xodr origin -> standard UTM -> SUMO CRS -> add netOffset.
+        """
+        if self._coord_transformer is not None:
+            # xodr-local -> standard UTM
+            utm_x = xodr_x + self._xodr_origin_utm[0]
+            utm_y = xodr_y + self._xodr_origin_utm[1]
+            # Reverse transform: UTM -> SUMO CRS
+            # _coord_transformer goes SUMO CRS -> UTM, we need the inverse
+            raw_x, raw_y = self._coord_transformer.transform(utm_x, utm_y, direction='INVERSE')
+            # Add netOffset
+            sumo_x = raw_x + self._sumo_net_offset[0]
+            sumo_y = raw_y + self._sumo_net_offset[1]
+            return sumo_x, sumo_y
+        return None, None
+
+    def _get_carla_offset(self, sumo_location, z_offset):
+        """Get the offset for sumo_to_carla, incorporating coordinate transformation.
+        If using projection-based transform, converts SUMO coords to xodr coords and
+        computes the effective offset. Otherwise, returns the calibrated static offset.
+        """
+        if self._coord_transformer is not None:
+            xodr_x, xodr_y = self._transform_sumo_to_xodr(sumo_location[0], sumo_location[1])
+            # sumo_to_carla computes: carla_x = sumo_x - cos*shape/2 + offset_x
+            #                          carla_y = -(sumo_y - sin*shape/2) + offset_y
+            # We want: carla_x ≈ xodr_x, carla_y ≈ -xodr_y
+            # So: offset_x = xodr_x - sumo_x (approximately, ignoring shape term)
+            #     offset_y = -xodr_y - (-sumo_y) = sumo_y - xodr_y
+            return [xodr_x - sumo_location[0], sumo_location[1] - xodr_y, z_offset]
+        return [self.sumo_carla_offset[0], self.sumo_carla_offset[1], z_offset]
+
+    # Elevated spawn height to avoid collision with OpenDRIVE-generated road geometry
+    # (guardrails, curbs, barriers). After spawn, correct transform is set immediately.
+    SPAWN_Z_CLEARANCE = 5.0
+
     def _process_vehicle(self, veh_id, veh_info, cosim_id_record):
         """Process a vehicle actor."""
         cosim_id_record.add(veh_id)
@@ -348,11 +635,18 @@ class CarlaCosim(object):
                 blueprint.set_attribute("color", "255, 0, 0")
             else:
                 blueprint.set_attribute("color", "0, 102, 204")
-            sumo_offset = [0.0, 0.0, shape[2]] # spawn the vehicle higher than the ground to make sure it is available
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            carla_id = spawn_actor(self.client, blueprint, carla_trasform)
+            # Spawn elevated to avoid collision with road geometry, then set correct transform
+            sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
+            spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            carla_id = spawn_actor(self.client, blueprint, spawn_transform)
+            if carla_id > 0:
+                # Immediately set the correct road-level transform
+                sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
+                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+                vehicle = self.world.get_actor(carla_id)
+                vehicle.set_transform(carla_trasform)
         else:
-            sumo_offset = [0.0, 0.0, 0.0] # move the vehicle back to the ground
+            sumo_offset = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             vehicle = self.world.get_actor(carla_id)
             vehicle.set_transform(carla_trasform)
@@ -375,14 +669,19 @@ class CarlaCosim(object):
             else:
                 blueprint = random.choice(self.pedestrian_blueprints)
             blueprint.set_attribute("role_name", vru_id)
-            sumo_offset = [0.0, 0.0, shape[2]] # spawn the VRU higher than the ground to make sure it is available
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            carla_id = spawn_actor(self.client, blueprint, carla_trasform)
+            # Spawn elevated to avoid collision with road geometry
+            sumo_offset = self._get_carla_offset(sumo_location, self.SPAWN_Z_CLEARANCE)
+            spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            carla_id = spawn_actor(self.client, blueprint, spawn_transform)
+            if carla_id > 0:
+                z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
+                sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)
+                carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+                pedestrian = self.world.get_actor(carla_id)
+                pedestrian.set_transform(carla_trasform)
         else:
-            # move the VRU back to the ground
-            sumo_offset = [0.0, 0.0, shape[2]/2.0]
-            if "BIKE" in vru_info["type"]:
-                sumo_offset = [0.0, 0.0, 0.0]
+            z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
+            sumo_offset = self._get_carla_offset(sumo_location, z_off)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             pedestrian = self.world.get_actor(carla_id)
             pedestrian.set_transform(carla_trasform)
