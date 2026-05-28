@@ -27,6 +27,18 @@ carla_cosim_module = importlib.import_module("terasim_service.utils.carla.cosim"
 carla_tools_module = importlib.import_module("terasim_service.utils.carla.tools")
 
 
+def _extract_sumo_time(terasim_states: dict | None) -> float | None:
+    if not isinstance(terasim_states, dict):
+        return None
+    value = terasim_states.get("simulation_time")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_args():
     argparser = argparse.ArgumentParser(
         description="CARLA Co-Simulation Client for TeraSim with local alignment fallback"
@@ -857,6 +869,7 @@ class TickProfiler:
         "frame_after",
         "sim_time_before",
         "sim_time_after",
+        "sumo_time",
         "status_wait",
         "status_polls",
         "sync_av",
@@ -874,6 +887,8 @@ class TickProfiler:
         self.log_path = log_path
         self.print_every = max(print_every, 0)
         self.rows_written = 0
+        self.original_get_terasim_states = carla_cosim_module.get_terasim_states
+        self.current_tick_sumo_time: float | None = None
         self.stage_values: dict[str, list[float]] = {
             key: []
             for key in [
@@ -913,7 +928,20 @@ class TickProfiler:
         return time.perf_counter() - start
 
     def install(self) -> None:
+        def recording_get_terasim_states(host, port, simulation_id):
+            terasim_states = self.original_get_terasim_states(host, port, simulation_id)
+            sumo_time = _extract_sumo_time(terasim_states)
+            if sumo_time is not None:
+                self.current_tick_sumo_time = sumo_time
+            return terasim_states
+
+        carla_cosim_module.get_terasim_states = recording_get_terasim_states
         self.carla_cosim.tick = self.tick
+
+    def _sumo_time_value(self):
+        if self.current_tick_sumo_time is None:
+            return ""
+        return self.current_tick_sumo_time
 
     def _snapshot_values(self) -> tuple[int, float]:
         snapshot = self.carla_cosim.world.get_snapshot()
@@ -944,11 +972,13 @@ class TickProfiler:
     def tick(self) -> bool:
         cosim = self.carla_cosim
         total_start = time.perf_counter()
+        self.current_tick_sumo_time = None
         frame_before, sim_time_before = self._snapshot_values()
         row = {
             "wall_time": time.time(),
             "frame_before": frame_before,
             "sim_time_before": sim_time_before,
+            "sumo_time": "",
             "status_wait": 0.0,
             "status_polls": 0,
             "sync_av": 0.0,
@@ -1038,10 +1068,12 @@ class TickProfiler:
         row["frame_after"] = frame_after
         row["sim_time_after"] = sim_time_after
         row["total"] = self._elapsed(total_start)
+        row["sumo_time"] = self._sumo_time_value()
         self._record(row)
         return True
 
     def close(self) -> None:
+        carla_cosim_module.get_terasim_states = self.original_get_terasim_states
         if self.file.closed:
             return
 
