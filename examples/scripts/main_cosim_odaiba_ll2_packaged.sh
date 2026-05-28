@@ -16,6 +16,7 @@ SUMO_VNC_PORT=${SUMO_VNC_PORT:-5913}
 VNC_PASSWORD=${VNC_PASSWORD:-headless}
 SUMO_GUI_TRACK_VEHICLE=${SUMO_GUI_TRACK_VEHICLE:-AV}
 SUMO_GUI_TRACK_ZOOM=${SUMO_GUI_TRACK_ZOOM:-3000}
+TERASIM_UVICORN_ACCESS_LOG=${TERASIM_UVICORN_ACCESS_LOG:-1}
 
 ORIGINAL_TERASIM_CONFIG=${TERASIM_CONFIG}
 RUNTIME_TERASIM_CONFIG=""
@@ -124,7 +125,11 @@ else
 fi
 
 echo "[3/6] Starting TeraSim server..."
-uvicorn terasim_service.api:app --host 0.0.0.0 --port "${TERASIM_PORT}" &
+UVICORN_ARGS=(terasim_service.api:app --host 0.0.0.0 --port "${TERASIM_PORT}")
+if ! is_enabled "${TERASIM_UVICORN_ACCESS_LOG}"; then
+    UVICORN_ARGS+=(--no-access-log)
+fi
+uvicorn "${UVICORN_ARGS[@]}" &
 TERASIM_PID=$!
 
 echo "[4/6] Waiting 30s for TeraSim server to be ready..."

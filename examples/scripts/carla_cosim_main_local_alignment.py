@@ -27,16 +27,42 @@ carla_cosim_module = importlib.import_module("terasim_service.utils.carla.cosim"
 carla_tools_module = importlib.import_module("terasim_service.utils.carla.tools")
 
 
-def _extract_sumo_time(terasim_states: dict | None) -> float | None:
-    if not isinstance(terasim_states, dict):
+def _extract_float_field(data: dict | None, field_name: str) -> float | None:
+    if not isinstance(data, dict):
         return None
-    value = terasim_states.get("simulation_time")
+    value = data.get(field_name)
     if value is None:
         return None
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_sumo_time(terasim_states: dict | None) -> float | None:
+    return _extract_float_field(terasim_states, "simulation_time")
+
+
+def _extract_completed_sumo_time(status_response: dict | None) -> float | None:
+    return _extract_float_field(status_response, "completed_sumo_time")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
+        return default
 
 
 def parse_args():
@@ -870,6 +896,9 @@ class TickProfiler:
         "sim_time_before",
         "sim_time_after",
         "sumo_time",
+        "sumo_time_wait",
+        "sumo_time_polls",
+        "sumo_time_wait_result",
         "status_wait",
         "status_polls",
         "sync_av",
@@ -882,16 +911,31 @@ class TickProfiler:
         "result",
     ]
 
-    def __init__(self, carla_cosim: CarlaCosim, log_path: str, print_every: int) -> None:
+    def __init__(
+        self,
+        carla_cosim: CarlaCosim,
+        log_path: str,
+        print_every: int,
+        wait_sumo_time: bool,
+        wait_sumo_time_timeout: float,
+        wait_sumo_time_poll_interval: float,
+    ) -> None:
         self.carla_cosim = carla_cosim
         self.log_path = log_path
         self.print_every = max(print_every, 0)
+        self.wait_sumo_time = wait_sumo_time
+        self.wait_sumo_time_timeout = max(wait_sumo_time_timeout, 0.0)
+        self.wait_sumo_time_poll_interval = max(wait_sumo_time_poll_interval, 0.001)
+        self.reuse_tick_state = _env_bool("CARLA_COSIM_REUSE_TICK_STATE", False)
         self.rows_written = 0
         self.original_get_terasim_states = carla_cosim_module.get_terasim_states
         self.current_tick_sumo_time: float | None = None
+        self.previous_sumo_time: float | None = None
+        self.cached_terasim_states: dict | None = None
         self.stage_values: dict[str, list[float]] = {
             key: []
             for key in [
+                "sumo_time_wait",
                 "status_wait",
                 "sync_av",
                 "sync_actor",
@@ -906,21 +950,42 @@ class TickProfiler:
         directory = os.path.dirname(log_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        self.file = open(log_path, "w", newline="")
-        self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
-        self.writer.writeheader()
-        self.file.flush()
+        self.file = open(log_path, "w", newline="") if log_path else None
+        self.writer = (
+            csv.DictWriter(self.file, fieldnames=self.fieldnames) if self.file else None
+        )
+        if self.writer is not None and self.file is not None:
+            self.writer.writeheader()
+            self.file.flush()
 
     @classmethod
     def from_environment(cls, carla_cosim: CarlaCosim) -> "TickProfiler | None":
         log_path = os.environ.get("CARLA_COSIM_PROFILE_LOG", "").strip()
-        if not log_path:
+        wait_sumo_time = _env_bool("CARLA_COSIM_WAIT_SUMO_TIME", False)
+        if not log_path and not wait_sumo_time:
             return None
-        print_every = int(os.environ.get("CARLA_COSIM_PROFILE_PRINT_EVERY", "20"))
-        profiler = cls(carla_cosim, log_path, print_every)
-        print("CARLA co-sim tick profiler enabled")
-        print(f"  log: {log_path}")
-        print(f"  print every: {print_every} ticks")
+        print_every_default = "20" if log_path else "0"
+        print_every = int(os.environ.get("CARLA_COSIM_PROFILE_PRINT_EVERY", print_every_default))
+        wait_timeout = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_TIMEOUT", 10.0)
+        wait_poll_interval = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_POLL_INTERVAL", 0.05)
+        profiler = cls(
+            carla_cosim,
+            log_path,
+            print_every,
+            wait_sumo_time,
+            wait_timeout,
+            wait_poll_interval,
+        )
+        if log_path:
+            print("CARLA co-sim tick profiler enabled")
+            print(f"  log: {log_path}")
+            print(f"  print every: {print_every} ticks")
+        if wait_sumo_time:
+            print("CARLA co-sim SUMO time progress wait enabled")
+            print(f"  timeout: {wait_timeout:.3f}s")
+            print(f"  poll interval: {wait_poll_interval:.3f}s")
+        if profiler.reuse_tick_state:
+            print("CARLA co-sim per-tick TeraSim state reuse enabled")
         return profiler
 
     @staticmethod
@@ -929,7 +994,13 @@ class TickProfiler:
 
     def install(self) -> None:
         def recording_get_terasim_states(host, port, simulation_id):
-            terasim_states = self.original_get_terasim_states(host, port, simulation_id)
+            if self.reuse_tick_state and self.cached_terasim_states is not None:
+                terasim_states = self.cached_terasim_states
+            else:
+                terasim_states = self.original_get_terasim_states(host, port, simulation_id)
+                if self.reuse_tick_state and terasim_states is not None:
+                    self.cached_terasim_states = terasim_states
+
             sumo_time = _extract_sumo_time(terasim_states)
             if sumo_time is not None:
                 self.current_tick_sumo_time = sumo_time
@@ -943,6 +1014,42 @@ class TickProfiler:
             return ""
         return self.current_tick_sumo_time
 
+    def _wait_for_sumo_time_progress(self, row: dict) -> bool:
+        if self.previous_sumo_time is None:
+            row["sumo_time_wait_result"] = "no_previous"
+            return True
+
+        start = time.perf_counter()
+        deadline = start + self.wait_sumo_time_timeout
+        while True:
+            status_response = carla_cosim_module.get_terasim_status(
+                self.carla_cosim.args.terasim_host,
+                self.carla_cosim.args.terasim_port,
+                self.carla_cosim.terasim["simulation_id"],
+            )
+            row["sumo_time_polls"] += 1
+            sumo_time = _extract_completed_sumo_time(status_response)
+            if sumo_time is None:
+                terasim_states = carla_cosim_module.get_terasim_states(
+                    self.carla_cosim.args.terasim_host,
+                    self.carla_cosim.args.terasim_port,
+                    self.carla_cosim.terasim["simulation_id"],
+                )
+                sumo_time = _extract_sumo_time(terasim_states)
+            if sumo_time is not None:
+                self.current_tick_sumo_time = sumo_time
+            if sumo_time is not None and sumo_time > self.previous_sumo_time:
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "advanced"
+                return True
+
+            if time.perf_counter() >= deadline:
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "timeout"
+                return False
+
+            time.sleep(self.wait_sumo_time_poll_interval)
+
     def _snapshot_values(self) -> tuple[int, float]:
         snapshot = self.carla_cosim.world.get_snapshot()
         return snapshot.frame, snapshot.timestamp.elapsed_seconds
@@ -953,8 +1060,9 @@ class TickProfiler:
             value = row.get(key)
             if isinstance(value, (int, float)):
                 values.append(float(value))
-        self.writer.writerow(row)
-        self.file.flush()
+        if self.writer is not None and self.file is not None:
+            self.writer.writerow(row)
+            self.file.flush()
 
         if self.print_every and self.rows_written % self.print_every == 0:
             total_values = self.stage_values["total"]
@@ -963,6 +1071,8 @@ class TickProfiler:
                 "tick profile: "
                 f"ticks={self.rows_written} "
                 f"latest_total={latest_total:.3f}s "
+                f"sumo_time={row.get('sumo_time', '')} "
+                f"sumo_wait={row.get('sumo_time_wait', 0.0):.3f}s "
                 f"status_wait={row.get('status_wait', 0.0):.3f}s "
                 f"sync_actor={row.get('sync_actor', 0.0):.3f}s "
                 f"tick_terasim={row.get('tick_terasim', 0.0):.3f}s "
@@ -973,12 +1083,16 @@ class TickProfiler:
         cosim = self.carla_cosim
         total_start = time.perf_counter()
         self.current_tick_sumo_time = None
+        self.cached_terasim_states = None
         frame_before, sim_time_before = self._snapshot_values()
         row = {
             "wall_time": time.time(),
             "frame_before": frame_before,
             "sim_time_before": sim_time_before,
             "sumo_time": "",
+            "sumo_time_wait": 0.0,
+            "sumo_time_polls": 0,
+            "sumo_time_wait_result": "",
             "status_wait": 0.0,
             "status_polls": 0,
             "sync_av": 0.0,
@@ -1039,6 +1153,18 @@ class TickProfiler:
                 time.sleep(0.05)
             row["status_wait"] = self._elapsed(stage_start)
 
+            if self.wait_sumo_time:
+                wait_ok = self._wait_for_sumo_time_progress(row)
+                if not wait_ok:
+                    row["result"] = "sumo_time_wait_timeout"
+                    frame_after, sim_time_after = self._snapshot_values()
+                    row["frame_after"] = frame_after
+                    row["sim_time_after"] = sim_time_after
+                    row["total"] = self._elapsed(total_start)
+                    row["sumo_time"] = self._sumo_time_value()
+                    self._record(row)
+                    return False
+
             if cosim.control_av:
                 stage_start = time.perf_counter()
                 cosim.sync_carla_av_to_cosim()
@@ -1052,6 +1178,7 @@ class TickProfiler:
             cosim.sync_cosim_tls_to_carla()
             row["sync_tls"] = self._elapsed(stage_start)
 
+            self.cached_terasim_states = None
             stage_start = time.perf_counter()
             carla_cosim_module.tick_terasim(
                 cosim.args.terasim_host,
@@ -1069,13 +1196,13 @@ class TickProfiler:
         row["sim_time_after"] = sim_time_after
         row["total"] = self._elapsed(total_start)
         row["sumo_time"] = self._sumo_time_value()
+        if isinstance(row["sumo_time"], (int, float)):
+            self.previous_sumo_time = float(row["sumo_time"])
         self._record(row)
         return True
 
     def close(self) -> None:
         carla_cosim_module.get_terasim_states = self.original_get_terasim_states
-        if self.file.closed:
-            return
 
         print("CARLA co-sim tick profiler summary")
         for key, values in self.stage_values.items():
@@ -1087,8 +1214,10 @@ class TickProfiler:
                 f"mean={statistics.mean(values):.3f}s "
                 f"max={max(values):.3f}s"
             )
-        print(f"  csv: {self.log_path}")
-        self.file.close()
+        if self.file is not None:
+            print(f"  csv: {self.log_path}")
+            if not self.file.closed:
+                self.file.close()
 
 
 def main():

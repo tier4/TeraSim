@@ -172,6 +172,20 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.sumo_gui_tracking_active = False
         self.sumo_gui_tracking_warning_logged = False
         self.sumo_gui_tracking_missing_logged = False
+        self.idle_state_write_interval = self._parse_float_env(
+            "TERASIM_COSIM_IDLE_STATE_WRITE_INTERVAL", 0.5
+        )
+        self._last_idle_state_write_wall_time = 0.0
+
+    @staticmethod
+    def _parse_float_env(name, default):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
 
     @staticmethod
     def _parse_optional_float(value):
@@ -329,10 +343,21 @@ class TeraSimCoSimPlugin(BasePlugin):
             self.controlled_agents_each_step.clear()
             self._handle_pending_agent_commands()
 
-            # Write current simulation state
-            state_write_success = self._write_simulation_state(simulator)
-            if not state_write_success:
-                return False
+            now = time.time()
+            should_write_idle_state = (
+                self.auto_run
+                or self._last_idle_state_write_wall_time <= 0.0
+                or (
+                    self.idle_state_write_interval > 0.0
+                    and now - self._last_idle_state_write_wall_time
+                    >= self.idle_state_write_interval
+                )
+            )
+            if should_write_idle_state:
+                state_write_success = self._write_simulation_state(simulator)
+                if not state_write_success:
+                    return False
+                self._last_idle_state_write_wall_time = now
 
             if self._is_simulation_paused():
                 time.sleep(0.1)  # Wait while paused
@@ -360,11 +385,31 @@ class TeraSimCoSimPlugin(BasePlugin):
         Returns:
             bool: True if the simulation step was successful, False otherwise.
         """
+        state_write_success = self._write_simulation_state(simulator)
+        if not state_write_success:
+            return False
+        completed_sumo_time = traci.simulation.getTime()
+        self.redis_client.set(
+            f"simulation:{self.simulation_uuid}:completed_sumo_time",
+            completed_sumo_time,
+            ex=self.key_expiry,
+        )
+        completed_tick_count = self.redis_client.incr(
+            f"simulation:{self.simulation_uuid}:completed_tick_count"
+        )
+        self.redis_client.expire(
+            f"simulation:{self.simulation_uuid}:completed_tick_count", self.key_expiry
+        )
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "ticked", ex=self.key_expiry
         )
+        self._last_idle_state_write_wall_time = time.time()
         self._update_sumo_gui_tracking(simulator)
-        self.logger.info("Simulation step finished!")
+        self.logger.info(
+            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s",
+            completed_sumo_time,
+            completed_tick_count,
+        )
         return True
 
     def _update_sumo_gui_tracking(self, simulator: Simulator):
