@@ -428,6 +428,14 @@ class CarlaCosim(object):
                         print(f"Traffic light with ID {light_id} not found in CARLA.")
                         continue
 
+                    # Defensive guard: CARLA may return a non-TrafficLight Actor
+                    # when SUMO's TLS program parameters are not mapped to a
+                    # real CARLA landmark_id (e.g. netconvert --tls.guess nets
+                    # like Town01). Calling set_state on such an actor raises
+                    # AttributeError and aborts the whole cosim tick.
+                    if not isinstance(light_actor, carla.TrafficLight):
+                        continue
+
                     light_state = sumo_tls[i]
                     if light_state == "G" or light_state == "g":
                         light_actor.set_state(carla.TrafficLightState.Green)
