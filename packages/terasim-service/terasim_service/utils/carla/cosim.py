@@ -319,18 +319,34 @@ class CarlaCosim(object):
                 self.sync_carla_av_to_cosim()
 
             self.sync_cosim_actor_to_carla()
-            self.sync_cosim_tls_to_carla()
-            
+            if not getattr(self.args, "skip_tls", False):
+                self.sync_cosim_tls_to_carla()
+
             tick_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
 
-            self.world.tick()
+            # 3-cosim passive mode: the psim bridge (autoware_carla_interface) is the sole
+            # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
+            # psim tick so the two clients stay synchronized on one CARLA server.
+            if getattr(self.args, "passive_tick", False):
+                self.world.wait_for_tick()
+            else:
+                self.world.tick()
         return True
 
     def sync_carla_av_to_cosim(self):
-        vehicle_status, carla_id = get_actor_id_from_attribute(self.world, AV_SUMO_ID)
+        # 3-cosim: the ego that drives in CARLA is the Autoware ego (role "ego_vehicle"), not the
+        # SUMO-spawned "AV". Read that actor's pose and push it to the SUMO AV so background traffic
+        # avoids it. av_carla_role defaults to AV_SUMO_ID for the original single-AV behavior.
+        av_role = getattr(self.args, "av_carla_role", AV_SUMO_ID)
+        vehicle_status, carla_id = get_actor_id_from_attribute(self.world, av_role)
 
         if not vehicle_status:
-            print("AV not found in Carla simulation.")
+            print(f"AV source actor (role={av_role}) not found in Carla simulation.")
+            return
+
+        if not self.av_shape:
+            # av_shape is filled by initialize_av in sync_cosim_actor_to_carla, which runs later in
+            # the same tick. Skip until then to avoid indexing an empty shape on the first tick.
             return
 
         AV = self.world.get_actor(carla_id)
@@ -469,16 +485,18 @@ class CarlaCosim(object):
 
         for veh_id in terasim_states["agent_details"]["vehicle"]:
             if self.control_av and veh_id == AV_SUMO_ID:
-                if self.initialize_av:
-                    continue
-                self.initialize_av = True
-                self.av_shape = [
-                    terasim_states["agent_details"]["vehicle"][veh_id]["length"],
-                    terasim_states["agent_details"]["vehicle"][veh_id]["width"],
-                    terasim_states["agent_details"]["vehicle"][veh_id]["height"],
-                ]
-                print("AV is initialized based on SUMO state.")
-                print(terasim_states["agent_details"]["vehicle"][veh_id])
+                if not self.initialize_av:
+                    self.initialize_av = True
+                    self.av_shape = [
+                        terasim_states["agent_details"]["vehicle"][veh_id]["length"],
+                        terasim_states["agent_details"]["vehicle"][veh_id]["width"],
+                        terasim_states["agent_details"]["vehicle"][veh_id]["height"],
+                    ]
+                    print("AV is initialized based on SUMO state.")
+                # 3-cosim: do NOT spawn the SUMO AV into CARLA. The Autoware ego (role ego_vehicle)
+                # already represents the ego in CARLA; its pose is pushed to this SUMO AV via
+                # sync_carla_av_to_cosim. Spawning a second "AV" actor would collide with the ego.
+                continue
 
             self._process_vehicle(veh_id, terasim_states["agent_details"]["vehicle"][veh_id], cosim_id_record)
         
@@ -708,11 +726,14 @@ class CarlaCosim(object):
 
     def _cleanup_actors(self, actor_type, pattern, cosim_id_record):
         """Clean up CARLA actors not in the cosim actor record."""
+        # Protect ego (and any other role names passed via protected_roles). In 3-cosim the
+        # psim ego has role_name "ego_vehicle", which must not be destroyed as a "stale" actor.
+        protected = getattr(self.args, "protected_roles", None) or ["AV"]
         actors_to_destroy = [
             actor
             for actor in self.world.get_actors().filter(pattern)
             if actor.attributes.get("role_name") not in cosim_id_record
-            and actor.attributes.get("role_name") != "AV"
+            and actor.attributes.get("role_name") not in protected
         ]
 
         for actor in actors_to_destroy:
@@ -722,14 +743,26 @@ class CarlaCosim(object):
         """
         Cleans synchronization and resets the simulation settings.
         """
-        # Configuring carla simulation in async mode.
-        settings = self.world.get_settings()
-        settings.synchronous_mode = False
-        settings.fixed_delta_seconds = None
-        self.world.apply_settings(settings)
+        if not getattr(self.args, "passive_tick", False):
+            # Configuring carla simulation in async mode.
+            # Skipped in 3-cosim passive mode: the psim bridge owns synchronous_mode, and
+            # resetting it here would break psim's sync loop.
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            self.world.apply_settings(settings)
         
-        # destroy all actors in the world
-        destroy_all_actors(self.world)
+        # Destroy actors. In 3-cosim passive mode, keep ego (protected_roles) and clear only the
+        # SUMO-spawned background vehicles/pedestrians; otherwise destroy everything.
+        if getattr(self.args, "passive_tick", False):
+            protected = getattr(self.args, "protected_roles", None) or ["AV"]
+            for actor in self.world.get_actors().filter("vehicle.*"):
+                if actor.attributes.get("role_name") not in protected:
+                    actor.destroy()
+            for actor in self.world.get_actors().filter("walker.*"):
+                actor.destroy()
+        else:
+            destroy_all_actors(self.world)
 
         # stop TeraSim
         stop_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
