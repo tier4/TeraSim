@@ -39,12 +39,28 @@ def _extract_float_field(data: dict | None, field_name: str) -> float | None:
         return None
 
 
+def _extract_int_field(data: dict | None, field_name: str) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get(field_name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_sumo_time(terasim_states: dict | None) -> float | None:
     return _extract_float_field(terasim_states, "simulation_time")
 
 
 def _extract_completed_sumo_time(status_response: dict | None) -> float | None:
     return _extract_float_field(status_response, "completed_sumo_time")
+
+
+def _extract_completed_tick_count(status_response: dict | None) -> int | None:
+    return _extract_int_field(status_response, "completed_tick_count")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -896,6 +912,7 @@ class TickProfiler:
         "sim_time_before",
         "sim_time_after",
         "sumo_time",
+        "completed_tick_count",
         "sumo_time_wait",
         "sumo_time_polls",
         "sumo_time_wait_result",
@@ -931,6 +948,7 @@ class TickProfiler:
         self.original_get_terasim_states = carla_cosim_module.get_terasim_states
         self.current_tick_sumo_time: float | None = None
         self.previous_sumo_time: float | None = None
+        self.previous_completed_tick_count: int | None = None
         self.cached_terasim_states: dict | None = None
         self.stage_values: dict[str, list[float]] = {
             key: []
@@ -967,7 +985,7 @@ class TickProfiler:
         print_every_default = "20" if log_path else "0"
         print_every = int(os.environ.get("CARLA_COSIM_PROFILE_PRINT_EVERY", print_every_default))
         wait_timeout = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_TIMEOUT", 10.0)
-        wait_poll_interval = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_POLL_INTERVAL", 0.05)
+        wait_poll_interval = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_POLL_INTERVAL", 0.001)
         profiler = cls(
             carla_cosim,
             log_path,
@@ -981,7 +999,7 @@ class TickProfiler:
             print(f"  log: {log_path}")
             print(f"  print every: {print_every} ticks")
         if wait_sumo_time:
-            print("CARLA co-sim SUMO time progress wait enabled")
+            print("CARLA co-sim completed tick wait enabled")
             print(f"  timeout: {wait_timeout:.3f}s")
             print(f"  poll interval: {wait_poll_interval:.3f}s")
         if profiler.reuse_tick_state:
@@ -1014,11 +1032,15 @@ class TickProfiler:
             return ""
         return self.current_tick_sumo_time
 
-    def _wait_for_sumo_time_progress(self, row: dict) -> bool:
-        if self.previous_sumo_time is None:
-            row["sumo_time_wait_result"] = "no_previous"
-            return True
+    def _apply_completed_status(self, status_response: dict | None, row: dict) -> None:
+        sumo_time = _extract_completed_sumo_time(status_response)
+        if sumo_time is not None:
+            self.current_tick_sumo_time = sumo_time
+        completed_tick_count = _extract_completed_tick_count(status_response)
+        if completed_tick_count is not None:
+            row["completed_tick_count"] = completed_tick_count
 
+    def _wait_for_initial_terasim_ready(self, row: dict) -> bool:
         start = time.perf_counter()
         deadline = start + self.wait_sumo_time_timeout
         while True:
@@ -1027,25 +1049,75 @@ class TickProfiler:
                 self.carla_cosim.args.terasim_port,
                 self.carla_cosim.terasim["simulation_id"],
             )
-            row["sumo_time_polls"] += 1
-            sumo_time = _extract_completed_sumo_time(status_response)
-            if sumo_time is None:
-                terasim_states = carla_cosim_module.get_terasim_states(
-                    self.carla_cosim.args.terasim_host,
-                    self.carla_cosim.args.terasim_port,
-                    self.carla_cosim.terasim["simulation_id"],
+            row["status_polls"] += 1
+            terasim_status = status_response.get("status", None)
+            self._apply_completed_status(status_response, row)
+
+            if terasim_status in {"ticked", "wait_for_tick"}:
+                completed_tick_count = _extract_completed_tick_count(status_response)
+                self.previous_completed_tick_count = (
+                    completed_tick_count if completed_tick_count is not None else 0
                 )
-                sumo_time = _extract_sumo_time(terasim_states)
-            if sumo_time is not None:
-                self.current_tick_sumo_time = sumo_time
-            if sumo_time is not None and sumo_time > self.previous_sumo_time:
-                row["sumo_time_wait"] = self._elapsed(start)
-                row["sumo_time_wait_result"] = "advanced"
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "no_previous_tick"
                 return True
+
+            if terasim_status is None:
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "terasim_status_none"
+                return False
+
+            if time.perf_counter() >= deadline:
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "initial_status_timeout"
+                return False
+
+            time.sleep(self.wait_sumo_time_poll_interval)
+
+    def _wait_for_completed_tick_progress(self, row: dict) -> bool:
+        if self.previous_completed_tick_count is None:
+            return self._wait_for_initial_terasim_ready(row)
+
+        start = time.perf_counter()
+        deadline = start + self.wait_sumo_time_timeout
+        target_tick_count = self.previous_completed_tick_count
+        while True:
+            status_response = carla_cosim_module.get_terasim_status(
+                self.carla_cosim.args.terasim_host,
+                self.carla_cosim.args.terasim_port,
+                self.carla_cosim.terasim["simulation_id"],
+            )
+            row["sumo_time_polls"] += 1
+            terasim_status = status_response.get("status", None)
+            self._apply_completed_status(status_response, row)
+            completed_tick_count = _extract_completed_tick_count(status_response)
+
+            if completed_tick_count is not None and completed_tick_count > target_tick_count:
+                self.previous_completed_tick_count = completed_tick_count
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "completed_tick_advanced"
+                return True
+
+            # Compatibility fallback for older services that do not expose completed_tick_count.
+            if completed_tick_count is None:
+                sumo_time = _extract_completed_sumo_time(status_response)
+                if (
+                    self.previous_sumo_time is not None
+                    and sumo_time is not None
+                    and sumo_time > self.previous_sumo_time
+                ):
+                    row["sumo_time_wait"] = self._elapsed(start)
+                    row["sumo_time_wait_result"] = "sumo_time_advanced_fallback"
+                    return True
+
+            if terasim_status is None:
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "terasim_status_none"
+                return False
 
             if time.perf_counter() >= deadline:
                 row["sumo_time_wait"] = self._elapsed(start)
-                row["sumo_time_wait_result"] = "timeout"
+                row["sumo_time_wait_result"] = "completed_tick_timeout"
                 return False
 
             time.sleep(self.wait_sumo_time_poll_interval)
@@ -1090,6 +1162,7 @@ class TickProfiler:
             "frame_before": frame_before,
             "sim_time_before": sim_time_before,
             "sumo_time": "",
+            "completed_tick_count": "",
             "sumo_time_wait": 0.0,
             "sumo_time_polls": 0,
             "sumo_time_wait_result": "",
@@ -1129,34 +1202,14 @@ class TickProfiler:
                 time.sleep(sleep_time)
                 row["async_sleep"] = sleep_time
         else:
-            stage_start = time.perf_counter()
-            while True:
-                status_response = carla_cosim_module.get_terasim_status(
-                    cosim.args.terasim_host,
-                    cosim.args.terasim_port,
-                    cosim.terasim["simulation_id"],
-                )
-                row["status_polls"] += 1
-                terasim_status = status_response.get("status", None)
-                if terasim_status in {"ticked", "wait_for_tick"}:
-                    break
-                if terasim_status is None:
-                    print("TeraSim status is None. Exiting...")
-                    row["status_wait"] = self._elapsed(stage_start)
-                    row["result"] = "terasim_status_none"
-                    row["total"] = self._elapsed(total_start)
-                    frame_after, sim_time_after = self._snapshot_values()
-                    row["frame_after"] = frame_after
-                    row["sim_time_after"] = sim_time_after
-                    self._record(row)
-                    return False
-                time.sleep(0.05)
-            row["status_wait"] = self._elapsed(stage_start)
-
             if self.wait_sumo_time:
-                wait_ok = self._wait_for_sumo_time_progress(row)
+                wait_ok = self._wait_for_completed_tick_progress(row)
                 if not wait_ok:
-                    row["result"] = "sumo_time_wait_timeout"
+                    if row.get("sumo_time_wait_result") == "terasim_status_none":
+                        print("TeraSim status is None. Exiting...")
+                        row["result"] = "terasim_status_none"
+                    else:
+                        row["result"] = "completed_tick_wait_timeout"
                     frame_after, sim_time_after = self._snapshot_values()
                     row["frame_after"] = frame_after
                     row["sim_time_after"] = sim_time_after
@@ -1164,6 +1217,31 @@ class TickProfiler:
                     row["sumo_time"] = self._sumo_time_value()
                     self._record(row)
                     return False
+            else:
+                stage_start = time.perf_counter()
+                while True:
+                    status_response = carla_cosim_module.get_terasim_status(
+                        cosim.args.terasim_host,
+                        cosim.args.terasim_port,
+                        cosim.terasim["simulation_id"],
+                    )
+                    row["status_polls"] += 1
+                    terasim_status = status_response.get("status", None)
+                    self._apply_completed_status(status_response, row)
+                    if terasim_status in {"ticked", "wait_for_tick"}:
+                        break
+                    if terasim_status is None:
+                        print("TeraSim status is None. Exiting...")
+                        row["status_wait"] = self._elapsed(stage_start)
+                        row["result"] = "terasim_status_none"
+                        row["total"] = self._elapsed(total_start)
+                        frame_after, sim_time_after = self._snapshot_values()
+                        row["frame_after"] = frame_after
+                        row["sim_time_after"] = sim_time_after
+                        self._record(row)
+                        return False
+                    time.sleep(0.05)
+                row["status_wait"] = self._elapsed(stage_start)
 
             if cosim.control_av:
                 stage_start = time.perf_counter()
