@@ -9,6 +9,7 @@ CARLA_MAP_LOAD_TIMEOUT=${CARLA_MAP_LOAD_TIMEOUT:-600}
 CARLA_HOST=${CARLA_HOST:-localhost}
 TERASIM_PORT=${TERASIM_PORT:-8000}
 CARLA_COSIM_ASYNC_MODE=${CARLA_COSIM_ASYNC_MODE:-0}
+CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.1}
 ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
 SUMO_DISPLAY=${SUMO_DISPLAY:-:20}
 SUMO_NOVNC_PORT=${SUMO_NOVNC_PORT:-6093}
@@ -242,6 +243,7 @@ sleep 5
 
 echo "  Config: ${TERASIM_CONFIG}"
 echo "  CARLA co-sim async mode: ${CARLA_COSIM_ASYNC_MODE}"
+echo "  CARLA co-sim step length: ${CARLA_COSIM_STEP_LENGTH}"
 if [ -n "${CARLA_COSIM_MOTION_LOG:-}" ]; then
     echo "  CARLA co-sim motion log: ${CARLA_COSIM_MOTION_LOG}"
     echo "  CARLA co-sim diagnostic roles: ${CARLA_COSIM_DIAG_ROLE_NAMES:-AV}"
@@ -260,6 +262,7 @@ CARLA_COSIM_ARGS=(
     --carla_port ${CARLA_PORT:-2010}
     --carla_timeout 600
     --terasim_port ${TERASIM_PORT}
+    --step_length "${CARLA_COSIM_STEP_LENGTH}"
 )
 
 if [ "${CARLA_COSIM_ASYNC_MODE}" = "1" ]; then
