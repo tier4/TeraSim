@@ -1,4 +1,5 @@
 import csv
+import functools
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -9,6 +10,8 @@ from redis.exceptions import RedisError
 import time
 import subprocess
 from pathlib import Path
+
+from loguru import logger as loguru_logger
 
 from terasim.overlay import traci
 from terasim.simulator import Simulator
@@ -192,6 +195,19 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self.state_filter_radius,
             )
 
+        self.env_profile_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_ENV_PROFILE", False
+        )
+        self.log_profile_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_LOG_PROFILE", self.env_profile_enabled
+        )
+        self._env_profile_wrapped = False
+        self._log_profile_wrapped = False
+        self._log_profile_original_methods = {}
+        self._current_env_profile = None
+        if self.env_profile_enabled:
+            self.logger.info("TeraSim co-sim env-step profiler enabled")
+
         self.step_profile_log = os.getenv("TERASIM_COSIM_STEP_PROFILE_LOG", "").strip()
         self.step_profile_print_every = self._parse_int_env(
             "TERASIM_COSIM_STEP_PROFILE_PRINT_EVERY", 20
@@ -228,6 +244,35 @@ class TeraSimCoSimPlugin(BasePlugin):
             "state_construction_count",
             "state_tls_count",
             "state_json_bytes",
+            "env_profile_env_step",
+            "env_profile_sumo_step",
+            "env_profile_preparation",
+            "env_profile_nde_decision",
+            "env_profile_get_env_observation",
+            "env_profile_execute_move",
+            "env_profile_nade_decision_and_control",
+            "env_profile_nade_decision",
+            "env_profile_nade_importance_sampling",
+            "env_profile_refresh_control_commands_state",
+            "env_profile_execute_control_commands",
+            "env_profile_record_step_data",
+            "env_profile_try_insert_emergency_vehicle",
+            "env_profile_vehicle_count",
+            "env_profile_vru_count",
+            "loguru_total",
+            "loguru_count",
+            "loguru_trace",
+            "loguru_trace_count",
+            "loguru_debug",
+            "loguru_debug_count",
+            "loguru_info",
+            "loguru_info_count",
+            "loguru_warning",
+            "loguru_warning_count",
+            "loguru_error",
+            "loguru_error_count",
+            "loguru_critical",
+            "loguru_critical_count",
             "completion_redis",
             "gui_tracking",
             "result",
@@ -482,6 +527,8 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "running", ex=self.key_expiry
         )
+        if self.env_profile_enabled:
+            self._current_env_profile = self._new_env_profile()
         self._current_step_start_perf = time.perf_counter()
         self._current_step_start_wall_time = time.time()
         self.logger.info("Simulation step started")
@@ -509,11 +556,18 @@ class TeraSimCoSimPlugin(BasePlugin):
         state_profile = self._last_state_write_profile or {}
         for key, value in state_profile.items():
             row[f"state_{key}"] = value
+        env_profile = self._current_env_profile or {}
+        for key, value in env_profile.items():
+            if key.startswith("loguru_") or key in {"loguru_total", "loguru_count"}:
+                row[key] = value
+            else:
+                row[f"env_profile_{key}"] = value
         if not state_write_success:
             row["result"] = "state_write_failed"
             row["after_total"] = time.perf_counter() - after_start
             row["total"] = time.perf_counter() - step_start
             self._record_step_profile(row)
+            self._current_env_profile = None
             return False
 
         completion_start = time.perf_counter()
@@ -543,6 +597,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         row["after_total"] = time.perf_counter() - after_start
         row["total"] = time.perf_counter() - step_start
         self._record_step_profile(row)
+        self._current_env_profile = None
         self.logger.info(
             "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s",
             completed_sumo_time,
@@ -657,10 +712,173 @@ class TeraSimCoSimPlugin(BasePlugin):
         simulator.start_pipeline.hook(f"{self.plugin_name}_before_env_start", self.function_before_env_start, priority=self.plugin_priority["before_env"]["start"])
         simulator.start_pipeline.hook(f"{self.plugin_name}_after_env_start", self.function_after_env_start, priority=self.plugin_priority["after_env"]["start"])
         simulator.step_pipeline.hook(f"{self.plugin_name}_before_env_step", self.function_before_env_step, priority=self.plugin_priority["before_env"]["step"])
+        if self.env_profile_enabled:
+            self._install_env_profile_wrappers(simulator)
+            self._install_env_profile_pipeline_hooks(simulator)
+        if self.log_profile_enabled:
+            self._install_log_profile_wrappers()
         simulator.step_pipeline.hook(f"{self.plugin_name}_after_env_step", self.function_after_env_step, priority=self.plugin_priority["after_env"]["step"])
         simulator.stop_pipeline.hook(f"{self.plugin_name}_before_env_stop", self.function_before_env_stop, priority=self.plugin_priority["before_env"]["stop"])
         simulator.stop_pipeline.hook(f"{self.plugin_name}_after_env_stop", self.function_after_env_stop, priority=self.plugin_priority["after_env"]["stop"])
     
+    def _new_env_profile(self):
+        profile = {
+            "env_step": 0.0,
+            "sumo_step": 0.0,
+            "preparation": 0.0,
+            "nde_decision": 0.0,
+            "get_env_observation": 0.0,
+            "execute_move": 0.0,
+            "nade_decision_and_control": 0.0,
+            "nade_decision": 0.0,
+            "nade_importance_sampling": 0.0,
+            "refresh_control_commands_state": 0.0,
+            "execute_control_commands": 0.0,
+            "record_step_data": 0.0,
+            "try_insert_emergency_vehicle": 0.0,
+            "vehicle_count": 0,
+            "vru_count": 0,
+            "loguru_total": 0.0,
+            "loguru_count": 0,
+        }
+        for level in ("trace", "debug", "info", "warning", "error", "critical"):
+            profile[f"loguru_{level}"] = 0.0
+            profile[f"loguru_{level}_count"] = 0
+        return profile
+
+    def _add_env_profile_value(self, key, elapsed):
+        if self._current_env_profile is None:
+            return
+        self._current_env_profile[key] = self._current_env_profile.get(key, 0.0) + elapsed
+
+    def _set_env_profile_count(self, key, value):
+        if self._current_env_profile is None:
+            return
+        self._current_env_profile[key] = value
+
+    def _profile_env_step_start(self, simulator, ctx):
+        if self._current_env_profile is not None:
+            self._current_env_profile["_env_step_start"] = time.perf_counter()
+            self._set_env_profile_count(
+                "vehicle_count", len(getattr(simulator.env, "vehicle_list", {}))
+            )
+            self._set_env_profile_count(
+                "vru_count", len(getattr(simulator.env, "vulnerable_road_user_list", {}))
+            )
+        return True
+
+    def _profile_env_step_end(self, simulator, ctx):
+        if self._current_env_profile is not None:
+            start = self._current_env_profile.pop("_env_step_start", None)
+            if start is not None:
+                self._add_env_profile_value("env_step", time.perf_counter() - start)
+        return True
+
+    def _profile_sumo_step_start(self, simulator, ctx):
+        if self._current_env_profile is not None:
+            self._current_env_profile["_sumo_step_start"] = time.perf_counter()
+        return True
+
+    def _profile_sumo_step_end(self, simulator, ctx):
+        if self._current_env_profile is not None:
+            start = self._current_env_profile.pop("_sumo_step_start", None)
+            if start is not None:
+                self._add_env_profile_value("sumo_step", time.perf_counter() - start)
+        return True
+
+    def _install_env_profile_pipeline_hooks(self, simulator):
+        simulator.step_pipeline.hook(
+            f"{self.plugin_name}_profile_env_step_start",
+            self._profile_env_step_start,
+            priority=-1,
+        )
+        simulator.step_pipeline.hook(
+            f"{self.plugin_name}_profile_env_step_end",
+            self._profile_env_step_end,
+            priority=1,
+        )
+        simulator.step_pipeline.hook(
+            f"{self.plugin_name}_profile_sumo_step_start",
+            self._profile_sumo_step_start,
+            priority=9,
+        )
+        simulator.step_pipeline.hook(
+            f"{self.plugin_name}_profile_sumo_step_end",
+            self._profile_sumo_step_end,
+            priority=11,
+        )
+
+    def _install_env_profile_wrappers(self, simulator):
+        if self._env_profile_wrapped or not hasattr(simulator, "env"):
+            return
+
+        method_map = {
+            "preparation": "preparation",
+            "NDE_decision": "nde_decision",
+            "get_env_observation": "get_env_observation",
+            "executeMove": "execute_move",
+            "NADE_decision_and_control": "nade_decision_and_control",
+            "NADE_decision": "nade_decision",
+            "NADE_importance_sampling": "nade_importance_sampling",
+            "refresh_control_commands_state": "refresh_control_commands_state",
+            "execute_control_commands": "execute_control_commands",
+            "record_step_data": "record_step_data",
+            "try_insert_emergency_vehicle": "try_insert_emergency_vehicle",
+        }
+
+        env = simulator.env
+        for method_name, profile_key in method_map.items():
+            if not hasattr(env, method_name):
+                continue
+            original = getattr(env, method_name)
+            if getattr(original, "_terasim_cosim_profile_wrapped", False):
+                continue
+
+            @functools.wraps(original)
+            def wrapped(*args, _original=original, _profile_key=profile_key, **kwargs):
+                start = time.perf_counter()
+                try:
+                    return _original(*args, **kwargs)
+                finally:
+                    self._add_env_profile_value(
+                        _profile_key, time.perf_counter() - start
+                    )
+
+            wrapped._terasim_cosim_profile_wrapped = True
+            setattr(env, method_name, wrapped)
+
+        self._env_profile_wrapped = True
+
+    def _install_log_profile_wrappers(self):
+        if self._log_profile_wrapped:
+            return
+
+        for level in ("trace", "debug", "info", "warning", "error", "critical"):
+            original = getattr(loguru_logger, level)
+            self._log_profile_original_methods[level] = original
+
+            @functools.wraps(original)
+            def wrapped(*args, _original=original, _level=level, **kwargs):
+                start = time.perf_counter()
+                try:
+                    return _original(*args, **kwargs)
+                finally:
+                    elapsed = time.perf_counter() - start
+                    profile = self._current_env_profile
+                    if profile is not None:
+                        profile["loguru_total"] = profile.get("loguru_total", 0.0) + elapsed
+                        profile["loguru_count"] = profile.get("loguru_count", 0) + 1
+                        profile[f"loguru_{_level}"] = (
+                            profile.get(f"loguru_{_level}", 0.0) + elapsed
+                        )
+                        profile[f"loguru_{_level}_count"] = (
+                            profile.get(f"loguru_{_level}_count", 0) + 1
+                        )
+
+            setattr(loguru_logger, level, wrapped)
+
+        self._log_profile_wrapped = True
+
     def _check_simulation_status(self) -> bool:
         """Check if simulation is still running.
 
