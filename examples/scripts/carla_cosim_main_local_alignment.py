@@ -541,6 +541,9 @@ class ActorSyncProfiler:
         "state_get",
         "validate",
         "actor_index_build",
+        "world_actor_count",
+        "world_vehicle_actor_count",
+        "world_pedestrian_actor_count",
         "vehicle_count",
         "vru_count",
         "vehicle_loop",
@@ -550,7 +553,9 @@ class ActorSyncProfiler:
         "vru_process_calls",
         "vru_process_max",
         "cleanup_vehicle",
+        "cleanup_vehicle_count",
         "cleanup_pedestrian",
+        "cleanup_pedestrian_count",
         "lookup_calls",
         "lookup_total",
         "lookup_max",
@@ -562,10 +567,19 @@ class ActorSyncProfiler:
         "spawn_max",
         "spawn_success",
         "spawn_failed",
+        "spawn_batch_size",
+        "spawn_batch_flush_time",
         "apply_batch_sync_time",
         "apply_batch_sync_max",
         "apply_batch_sync_success_time",
         "apply_batch_sync_failed_time",
+        "transform_batch_size",
+        "transform_batch_apply_time",
+        "transform_batch_response_count",
+        "transform_batch_success",
+        "transform_batch_failed",
+        "profiled_time",
+        "unprofiled_time",
         "total",
         "result",
     ]
@@ -588,9 +602,12 @@ class ActorSyncProfiler:
                 "lookup_total",
                 "sumo_to_carla_total",
                 "spawn_total",
+                "spawn_batch_flush_time",
                 "apply_batch_sync_time",
+                "transform_batch_apply_time",
                 "apply_batch_sync_success_time",
                 "apply_batch_sync_failed_time",
+                "unprofiled_time",
                 "total",
             ]
         }
@@ -690,6 +707,9 @@ class ActorSyncProfiler:
             "state_get": 0.0,
             "validate": 0.0,
             "actor_index_build": 0.0,
+            "world_actor_count": 0,
+            "world_vehicle_actor_count": 0,
+            "world_pedestrian_actor_count": 0,
             "vehicle_count": 0,
             "vru_count": 0,
             "vehicle_loop": 0.0,
@@ -699,7 +719,9 @@ class ActorSyncProfiler:
             "vru_process_calls": 0,
             "vru_process_max": 0.0,
             "cleanup_vehicle": 0.0,
+            "cleanup_vehicle_count": 0,
             "cleanup_pedestrian": 0.0,
+            "cleanup_pedestrian_count": 0,
             "lookup_calls": 0,
             "lookup_total": 0.0,
             "lookup_max": 0.0,
@@ -711,10 +733,19 @@ class ActorSyncProfiler:
             "spawn_max": 0.0,
             "spawn_success": 0,
             "spawn_failed": 0,
+            "spawn_batch_size": 0,
+            "spawn_batch_flush_time": 0.0,
             "apply_batch_sync_time": 0.0,
             "apply_batch_sync_max": 0.0,
             "apply_batch_sync_success_time": 0.0,
             "apply_batch_sync_failed_time": 0.0,
+            "transform_batch_size": 0,
+            "transform_batch_apply_time": 0.0,
+            "transform_batch_response_count": 0,
+            "transform_batch_success": 0,
+            "transform_batch_failed": 0,
+            "profiled_time": 0.0,
+            "unprofiled_time": 0.0,
             "total": 0.0,
             "result": "ok",
         }
@@ -737,9 +768,13 @@ class ActorSyncProfiler:
                 f"index={row['actor_index_build']:.3f}s "
                 f"vehicle_loop={row['vehicle_loop']:.3f}s "
                 f"cleanup={row['cleanup_vehicle'] + row['cleanup_pedestrian']:.3f}s "
+                f"world_actors={row['world_actor_count']} "
                 f"spawn_success={row['spawn_success']} "
                 f"spawn_failed={row['spawn_failed']} "
-                f"apply_batch={row['apply_batch_sync_time']:.3f}s "
+                f"spawn_batch={row['spawn_batch_size']} "
+                f"transform_batch={row['transform_batch_size']} "
+                f"transform_apply={row['transform_batch_apply_time']:.3f}s "
+                f"unprofiled={row['unprofiled_time']:.3f}s "
                 f"lookup={row['lookup_total']:.3f}s/{row['lookup_calls']}calls"
             )
 
@@ -808,6 +843,15 @@ class ActorSyncProfiler:
             stage_start = time.perf_counter()
             vehicle_actor_index, pedestrian_actor_index = cosim._build_actor_role_indexes()
             row["actor_index_build"] = self._elapsed(stage_start)
+            row["world_actor_count"] = getattr(
+                cosim, "_last_actor_index_world_actor_count", 0
+            )
+            row["world_vehicle_actor_count"] = getattr(
+                cosim, "_last_actor_index_vehicle_actor_count", len(vehicle_actor_index)
+            )
+            row["world_pedestrian_actor_count"] = getattr(
+                cosim, "_last_actor_index_pedestrian_actor_count", len(pedestrian_actor_index)
+            )
 
             stage_start = time.perf_counter()
             for veh_id, veh_info in vehicles.items():
@@ -862,21 +906,53 @@ class ActorSyncProfiler:
                 row["vru_process_max"] = max(row["vru_process_max"], elapsed)
             row["vru_loop"] = self._elapsed(stage_start)
 
+            row["spawn_batch_size"] = len(spawn_requests)
+            stage_start = time.perf_counter()
             spawn_stats = cosim._flush_actor_spawn_batch(spawn_requests, transform_batch)
+            row["spawn_batch_flush_time"] = self._elapsed(stage_start)
             self._merge_spawn_batch_stats(row, spawn_stats)
-            cosim._flush_actor_transform_batch(transform_batch)
+
+            row["transform_batch_size"] = len(transform_batch)
+            stage_start = time.perf_counter()
+            transform_responses = cosim._flush_actor_transform_batch(transform_batch) or []
+            row["transform_batch_apply_time"] = self._elapsed(stage_start)
+            row["transform_batch_response_count"] = len(transform_responses)
+            transform_failed = sum(
+                1 for response in transform_responses if getattr(response, "error", None)
+            )
+            row["transform_batch_failed"] = transform_failed
+            row["transform_batch_success"] = len(transform_responses) - transform_failed
 
             stage_start = time.perf_counter()
-            cosim._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
+            cleanup_count = cosim._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
             row["cleanup_vehicle"] = self._elapsed(stage_start)
+            row["cleanup_vehicle_count"] = int(cleanup_count or 0)
 
             stage_start = time.perf_counter()
-            cosim._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
+            cleanup_count = cosim._cleanup_actors(
+                "pedestrian", "walker.pedestrian.*", cosim_id_record
+            )
             row["cleanup_pedestrian"] = self._elapsed(stage_start)
+            row["cleanup_pedestrian_count"] = int(cleanup_count or 0)
 
             cosim._prune_spawn_failures(vehicles.keys(), vrus.keys())
         finally:
             row["total"] = self._elapsed(total_start)
+            row["profiled_time"] = sum(
+                row[key]
+                for key in [
+                    "state_get",
+                    "validate",
+                    "actor_index_build",
+                    "vehicle_loop",
+                    "vru_loop",
+                    "spawn_batch_flush_time",
+                    "transform_batch_apply_time",
+                    "cleanup_vehicle",
+                    "cleanup_pedestrian",
+                ]
+            )
+            row["unprofiled_time"] = max(0.0, row["total"] - row["profiled_time"])
             self.active_row = None
             self._record(row)
 

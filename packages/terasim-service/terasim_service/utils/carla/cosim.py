@@ -902,7 +902,10 @@ class CarlaCosim(object):
         """Build role_name indexes once per tick instead of scanning CARLA per actor."""
         vehicle_actor_index = {}
         pedestrian_actor_index = {}
-        for actor in self.world.get_actors():
+        actors = self.world.get_actors()
+        world_actor_count = 0
+        for actor in actors:
+            world_actor_count += 1
             role_name = actor.attributes.get("role_name")
             if not role_name:
                 continue
@@ -910,6 +913,9 @@ class CarlaCosim(object):
                 vehicle_actor_index.setdefault(role_name, actor)
             elif actor.type_id.startswith("walker.pedestrian."):
                 pedestrian_actor_index.setdefault(role_name, actor)
+        self._last_actor_index_world_actor_count = world_actor_count
+        self._last_actor_index_vehicle_actor_count = len(vehicle_actor_index)
+        self._last_actor_index_pedestrian_actor_count = len(pedestrian_actor_index)
         return vehicle_actor_index, pedestrian_actor_index
 
     @staticmethod
@@ -1197,6 +1203,8 @@ class CarlaCosim(object):
 
         for actor in actors_to_destroy:
             actor.destroy()
+
+        return len(actors_to_destroy)
 
     def close(self):
         """
