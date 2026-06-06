@@ -1,0 +1,119 @@
+environment:
+  class: NADEWithAV
+  module: terasim_nde_nade.envs
+  parameters:
+    AV_cfg:
+      cache_radius: 100
+      control_radius: 50
+      route:
+      - 'edge_394'
+      - 'edge_433'
+      - 'edge_490'
+      - 'edge_491'
+      - 'edge_1205'
+      - 'edge_1186'
+      - 'edge_1085'
+      - 'edge_1109'
+      - 'edge_1099'
+      - 'edge_1100'
+      - 'edge_376'
+      - 'edge_400'
+      - 'edge_386'
+      - 'edge_418'
+      - 'edge_156'
+      - 'edge_38'
+      - 'edge_43'
+      - 'edge_248'
+      - 'edge_11'
+      - 'edge_258'
+      - 'edge_13'
+      - 'edge_14'
+      - 'edge_233'
+      - 'edge_1338'
+      - 'edge_1345'
+      - 'edge_1340'
+      - 'edge_1324'
+      - 'edge_219'
+      - 'edge_331'
+      - 'edge_1336'
+      - 'edge_1329'
+      - 'edge_7'
+      - 'edge_8'
+      - 'edge_269'
+      - 'edge_3249'
+      - 'edge_236'
+      type: NDE_URBAN
+    MOBIL_lc_flag: true
+    adversity_cfg:
+      vehicle:
+        intersection_cutin:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.lanechange_adversity.LanechangeAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_cutin
+          probability: 0
+        intersection_rearend:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.leader_adversity.LeaderAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_rearend
+          probability: 0
+        intersection_tfl:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.trafficrule_adversity.TrafficRuleAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_tfl
+          probability: 0
+      vulnerable_road_user:
+        jaywalking:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vru.jaywalking_adversity.JaywalkingAdversity
+          ego_type: vulnerable_road_user
+          location: crosswalk
+          predicted_collision_type: intersection_jaywalking
+          probability: 0
+    adversity_sampling_probability: 1.0
+    drive_rule: lefthand
+    info_extractor: terasim.logger.infoextractor.InfoExtractor
+    log_flag: true
+    run_time: 600
+    stochastic_acc_flag: false
+    sumo_cfg_file_path: /app/examples/maps/odaiba_osmlike/odaiba_osmlike.sumocfg
+    sumo_net_file_path: /app/examples/maps/odaiba_osmlike/odaiba_osmlike.net.xml
+    vehicle_factory: terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory
+    warmup_time_lb: 1
+    warmup_time_ub: 2
+input:
+  sumo_config_file: /app/examples/maps/odaiba_osmlike/odaiba_osmlike.sumocfg
+  sumo_net_file: /app/examples/maps/odaiba_osmlike/odaiba_osmlike.net.xml
+logging:
+  levels:
+  - TRACE
+  - INFO
+output:
+  aggregated_dir: aggregated
+  dir: /app/outputs
+  name: odaiba_osmlike_test
+  nth: '0_0'
+parameters:
+  num_cars: 8
+  simulation_time: 3600
+seed: 42
+simulation_class: CarSimulation
+simulation_module: my_simulations
+simulation_type: safetest_odaiba_osmlike
+simulator:
+  class: Simulator
+  module: terasim.simulator
+  parameters:
+    gui_flag: false
+    num_tries: 10
+    realtime_flag: false
+    sumo_output_file_types:
+    - fcd_all
+    - collision
+    - tripinfo
+    traffic_scale: 1.0
