@@ -10,6 +10,7 @@ CARLA_HOST=${CARLA_HOST:-localhost}
 TERASIM_PORT=${TERASIM_PORT:-8000}
 CARLA_COSIM_ASYNC_MODE=${CARLA_COSIM_ASYNC_MODE:-0}
 CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.1}
+CARLA_COSIM_CONTROL_AV=${CARLA_COSIM_CONTROL_AV:-0}
 ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
 SUMO_DISPLAY=${SUMO_DISPLAY:-:20}
 SUMO_NOVNC_PORT=${SUMO_NOVNC_PORT:-6093}
@@ -244,6 +245,7 @@ sleep 5
 echo "  Config: ${TERASIM_CONFIG}"
 echo "  CARLA co-sim async mode: ${CARLA_COSIM_ASYNC_MODE}"
 echo "  CARLA co-sim step length: ${CARLA_COSIM_STEP_LENGTH}"
+echo "  CARLA co-sim control AV: ${CARLA_COSIM_CONTROL_AV}"
 if [ -n "${CARLA_COSIM_MOTION_LOG:-}" ]; then
     echo "  CARLA co-sim motion log: ${CARLA_COSIM_MOTION_LOG}"
     echo "  CARLA co-sim diagnostic roles: ${CARLA_COSIM_DIAG_ROLE_NAMES:-AV}"
@@ -267,6 +269,10 @@ CARLA_COSIM_ARGS=(
 
 if [ "${CARLA_COSIM_ASYNC_MODE}" = "1" ]; then
     CARLA_COSIM_ARGS+=(--async_mode)
+fi
+
+if is_enabled "${CARLA_COSIM_CONTROL_AV}"; then
+    CARLA_COSIM_ARGS+=(--control_av)
 fi
 
 CARLA_EXIT=0

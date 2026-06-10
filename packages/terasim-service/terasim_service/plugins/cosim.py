@@ -1358,8 +1358,10 @@ class TeraSimCoSimPlugin(BasePlugin):
                         lon, lat = command.data["lonlat"]
                         x, y = traci.simulation.convertGeo(lon, lat, fromGeo=True)
                     if command.agent_type == "vehicle":
+                        # Snap externally controlled vehicles to the closest lane. keepRoute=2 can
+                        # leave the AV off-road, which makes SUMO report an empty lane id.
                         traci.vehicle.moveToXY(
-                            command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 2
+                            command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
                         )
 
                         if "speed" in command.data:
