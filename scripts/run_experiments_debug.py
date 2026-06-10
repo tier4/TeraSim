@@ -38,7 +38,7 @@ def main(config_path: str) -> None:
         log_dir=base_dir,
         warmup_time_lb=config.environment.parameters.warmup_time_lb,
         warmup_time_ub=config.environment.parameters.warmup_time_ub,
-        run_time=1200,
+        run_time=config.environment.parameters.run_time,
         configuration=config.environment.parameters,
         # av_debug_control=True, # Enable debug control for AV, will use SUMO
     )
