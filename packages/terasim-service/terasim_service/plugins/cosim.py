@@ -743,16 +743,35 @@ class TeraSimCoSimPlugin(BasePlugin):
                         lon, lat = command.data["lonlat"]
                         x, y = traci.simulation.convertGeo(lon, lat, fromGeo=True)
                     if command.agent_type == "vehicle":
-                        # 3-cosim fix: keepRoute=0 (snap to closest lane in the network),
-                        # not 2 (free / off-road). With keepRoute=2 an externally-driven
-                        # vehicle (e.g. the Autoware ego mirrored as SUMO "AV" via control_av)
-                        # lands slightly off the lane centerline -> getLaneID()=="" -> it drops
-                        # out of the AV context subscription -> NADE stops controlling traffic
-                        # around it -> background vehicles no longer yield and rear-end the ego.
-                        # keepRoute=0 keeps the AV on a lane so SUMO traffic avoids it.
+                        # 3-cosim fix for dense maps (e.g. odaiba osmlike). keepRoute=0 keeps the AV
+                        # on the nearest lane (real-lane following = collision avoidance), but on a
+                        # dense network it can map the externally-driven AV onto an off-route edge,
+                        # which collapses the AV's route to that single edge. The AV then sits at
+                        # that edge's end and SUMO retires it as "arrived" -> the AV disappears ->
+                        # NADE stops with finish_reason "AV_left" -> the cosim crashes. Fix: right
+                        # after moveToXY, append one successor edge so the AV's route is never a
+                        # single terminal edge, so SUMO never retires the AV. The AV's position is
+                        # driven entirely by moveToXY (it mirrors the Autoware ego), so this route is
+                        # only a decoy to keep the AV alive -- it is NOT a fixed planned route, which
+                        # is correct because the Autoware ego chooses its path dynamically.
                         traci.vehicle.moveToXY(
                             command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
                         )
+                        if command.agent_id == "AV" and "AV" in traci.vehicle.getIDList():
+                            try:
+                                cur = traci.vehicle.getRoadID("AV")
+                                if cur and not cur.startswith(":"):   # skip junction-internal edges
+                                    nxt = ""
+                                    for lk in traci.lane.getLinks(traci.vehicle.getLaneID("AV")):
+                                        if lk and lk[0]:
+                                            e = traci.lane.getEdgeID(lk[0])
+                                            if e and not e.startswith(":"):
+                                                nxt = e
+                                                break
+                                    if nxt:
+                                        traci.vehicle.setRoute("AV", [cur, nxt])
+                            except Exception:
+                                pass
 
                         if "speed" in command.data:
                             traci.vehicle.setPreviousSpeed(command.agent_id, command.data["speed"])
