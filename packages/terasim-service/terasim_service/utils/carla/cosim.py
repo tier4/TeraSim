@@ -662,12 +662,14 @@ class CarlaCosim(object):
                 sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
                 carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
                 vehicle = self.world.get_actor(carla_id)
-                vehicle.set_transform(carla_trasform)
+                if vehicle is not None:
+                    vehicle.set_transform(carla_trasform)
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             vehicle = self.world.get_actor(carla_id)
-            vehicle.set_transform(carla_trasform)
+            if vehicle is not None:
+                vehicle.set_transform(carla_trasform)
 
     def _process_vru(self, vru_id, vru_info, cosim_id_record):
         """Process a pedestrian actor."""
@@ -696,13 +698,15 @@ class CarlaCosim(object):
                 sumo_offset_correct = self._get_carla_offset(sumo_location, z_off)
                 carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
                 pedestrian = self.world.get_actor(carla_id)
-                pedestrian.set_transform(carla_trasform)
+                if pedestrian is not None:
+                    pedestrian.set_transform(carla_trasform)
         else:
             z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
             sumo_offset = self._get_carla_offset(sumo_location, z_off)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             pedestrian = self.world.get_actor(carla_id)
-            pedestrian.set_transform(carla_trasform)
+            if pedestrian is not None:
+                pedestrian.set_transform(carla_trasform)
 
         if carla_id > 0:
             if "BIKE" not in vru_info["type"]:
