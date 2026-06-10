@@ -85,6 +85,12 @@ class CarlaCosim(object):
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
+        self.use_lane_relative_position = _env_bool(
+            "CARLA_COSIM_USE_LANE_RELATIVE_POSITION",
+            bool(getattr(args, "use_lane_relative_position", False)),
+        )
+        if self.use_lane_relative_position:
+            print("CARLA co-sim lane-relative reconstructed positions enabled.", flush=True)
         self.spawn_failure_backoff_seconds = max(
             0.0,
             _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS", 5.0),
@@ -983,17 +989,39 @@ class CarlaCosim(object):
             flush=True,
         )
 
-    def _resolve_sumo_location(self, actor_type, actor_id, actor_info):
-        raw_location = {
-            "x": actor_info.get("x"),
-            "y": actor_info.get("y"),
-            "z": actor_info.get("z"),
-        }
+    def _resolve_sumo_location(self, actor_type, actor_id, actor_info, prefer_lane_relative=False):
+        use_reconstructed = (
+            prefer_lane_relative
+            and bool(actor_info.get("reconstructed_position_valid", False))
+        )
+        if use_reconstructed:
+            raw_location = {
+                "x": actor_info.get("reconstructed_x"),
+                "y": actor_info.get("reconstructed_y"),
+                "z": actor_info.get("reconstructed_z"),
+            }
+        else:
+            raw_location = {
+                "x": actor_info.get("x"),
+                "y": actor_info.get("y"),
+                "z": actor_info.get("z"),
+            }
         sumo_location = [
             self._as_finite_float(raw_location["x"]),
             self._as_finite_float(raw_location["y"]),
             self._as_finite_float(raw_location["z"]),
         ]
+        if use_reconstructed and any(value is None for value in sumo_location):
+            raw_location = {
+                "x": actor_info.get("x"),
+                "y": actor_info.get("y"),
+                "z": actor_info.get("z"),
+            }
+            sumo_location = [
+                self._as_finite_float(raw_location["x"]),
+                self._as_finite_float(raw_location["y"]),
+                self._as_finite_float(raw_location["z"]),
+            ]
         if any(value is None for value in sumo_location):
             self._warn_invalid_sumo_location_once(actor_type, actor_id, raw_location)
             return None
@@ -1051,7 +1079,12 @@ class CarlaCosim(object):
         """Process a vehicle actor."""
         cosim_id_record.add(veh_id)
 
-        sumo_location = self._resolve_sumo_location("vehicle", veh_id, veh_info)
+        sumo_location = self._resolve_sumo_location(
+            "vehicle",
+            veh_id,
+            veh_info,
+            prefer_lane_relative=self.use_lane_relative_position,
+        )
         if sumo_location is None:
             return
         sumo_angle = self._resolve_sumo_angle("vehicle", veh_id, veh_info, carla_actor)

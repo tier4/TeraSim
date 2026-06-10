@@ -157,6 +157,12 @@ def parse_args():
         type=float,
         help="Allowed relative span mismatch for local bounds alignment (default: 0.10)",
     )
+    argparser.add_argument(
+        "--use_lane_relative_position",
+        action="store_true",
+        default=_env_bool("CARLA_COSIM_USE_LANE_RELATIVE_POSITION", False),
+        help="Use lane-relative reconstructed SUMO positions when available",
+    )
     return argparser.parse_args()
 
 
@@ -400,7 +406,14 @@ class MotionDiagnostics:
         if vehicle is None:
             return
 
-        sumo_location = [veh_info["x"], veh_info["y"], veh_info["z"]]
+        sumo_location = self.carla_cosim._resolve_sumo_location(
+            "vehicle",
+            veh_id,
+            veh_info,
+            prefer_lane_relative=self.carla_cosim.use_lane_relative_position,
+        )
+        if sumo_location is None:
+            return
         sumo_rotation = [0.0, veh_info["sumo_angle"], 0.0]
         shape = [veh_info["length"], veh_info["width"], veh_info["height"]]
         sumo_offset = self.carla_cosim._get_carla_offset(sumo_location, 0.0)

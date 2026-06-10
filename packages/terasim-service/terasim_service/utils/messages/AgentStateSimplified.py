@@ -9,7 +9,16 @@ class AgentStateSimplified(BaseModel):
     y: float = 0.0
     ## elevation of the agent (meters)
     z: float = 0.0
-    
+
+    # Lane-relative reconstructed position
+    lane_id: str = ""
+    lane_position: float = 0.0
+    lateral_offset: float = 0.0
+    reconstructed_x: float = 0.0
+    reconstructed_y: float = 0.0
+    reconstructed_z: float = 0.0
+    reconstructed_position_valid: bool = False
+
     ## longitude of the agent (degrees)
     lon: float = 0.0
     ## latitude of the agent (degrees)
