@@ -118,6 +118,7 @@ def create_environment(config, base_dir):
 
     return env_class(
         av_cfg = env_params.AV_cfg,
+        av_debug_control=env_params.get("av_debug_control", False),
         vehicle_factory=NDEVehicleFactory(env_params),
         vru_factory=NDEVulnerableRoadUserFactory(env_params),
         info_extractor=InfoExtractor,
