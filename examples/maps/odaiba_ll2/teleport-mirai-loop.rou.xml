@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+  <vType id="NDE_URBAN" length="5.00" width="1.85" minGap="3.28" maxSpeed="10.00" carFollowModel="IDM" accel="1.84" decel="1.29" tau="1.17" emergencyDecel="7.06" lcSpeedGain="0" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)" />
+  <vType id="NDE_HIGHWAY" length="5.00" width="1.85" minGap="5.92" maxSpeed="28.31" carFollowModel="IDM" accel="5.95" decel="5.96" tau="1.72" emergencyDecel="7.06" lcSpeedGain="0" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)" />
+  <route id="teleport-mirai-loop" edges="edge_459 edge_357 edge_426 edge_432 edge_427 edge_147 edge_0 edge_3 edge_436 edge_312 edge_310 edge_311 edge_214 edge_28 edge_264 edge_29 edge_31 edge_32 edge_227 edge_36 edge_1517 edge_241 edge_61 edge_62 edge_247 edge_392 edge_334 edge_394 edge_434 edge_490 edge_492 edge_406 edge_338 edge_396 edge_349 edge_398 edge_412 edge_372 edge_400 edge_386 edge_417 edge_157 edge_420 edge_360 edge_426" />
+  <vehicle id="AV" type="NDE_URBAN" route="teleport-mirai-loop" depart="0.00" departLane="best" />
+</routes>

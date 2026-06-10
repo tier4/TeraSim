@@ -1,0 +1,17 @@
+services:
+  terasim_service:
+    build:
+      context: .
+      dockerfile: Dockerfile.cosim
+    image: terasim-service:cosim
+    container_name: terasim_service_odaiba_ll2
+    network_mode: host
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ENVIRONMENT=development
+      - HOME=/tmp
+      - CARLA_PORT=${CARLA_PORT:-2010}
+    volumes:
+      - ./examples:/app/examples
+      - ./outputs:/app/outputs
+    command: ["/bin/bash", "/app/examples/scripts/main_cosim_odaiba_ll2_packaged.sh"]

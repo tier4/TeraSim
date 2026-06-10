@@ -193,3 +193,12 @@ test_docker.sh
 apps/deploy/outputs
 apps/deploy/examples/maps
 
+
+# Odaiba generated/private map artifacts
+examples/maps/odaiba/
+examples/maps/odaiba_ll2/*
+!examples/maps/odaiba_ll2/
+!examples/maps/odaiba_ll2/teleport-mirai-loop.rou.xml
+examples/maps/odaiba_ll2_exp/
+logs/
+reports/

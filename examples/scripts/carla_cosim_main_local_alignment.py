@@ -1,0 +1,1469 @@
+"""CARLA Co-Simulation Client with local-bounds alignment fallback.
+
+This variant keeps the standard CarlaCosim flow, but overrides the
+SUMO->CARLA XY offset when the SUMO net.xml has no projection metadata
+(`projParameter='!'`) and its metric bounds already match the loaded
+CARLA map shape. This is useful for custom packaged maps where both
+SUMO and CARLA share the same local metric frame but differ by a fixed
+translation and axis flip.
+"""
+import argparse
+import csv
+import importlib
+import math
+import os
+import statistics
+import time
+import xml.etree.ElementTree as ET
+
+import carla
+from terasim_service.utils.carla import CarlaCosim
+from terasim_service.utils.carla.tools import (
+    get_actor_id_from_attribute,
+    sumo_to_carla,
+)
+
+carla_cosim_module = importlib.import_module("terasim_service.utils.carla.cosim")
+carla_tools_module = importlib.import_module("terasim_service.utils.carla.tools")
+
+
+def _extract_float_field(data: dict | None, field_name: str) -> float | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get(field_name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_int_field(data: dict | None, field_name: str) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get(field_name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_sumo_time(terasim_states: dict | None) -> float | None:
+    return _extract_float_field(terasim_states, "simulation_time")
+
+
+def _extract_completed_sumo_time(status_response: dict | None) -> float | None:
+    return _extract_float_field(status_response, "completed_sumo_time")
+
+
+def _extract_completed_tick_count(status_response: dict | None) -> int | None:
+    return _extract_int_field(status_response, "completed_tick_count")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
+        return default
+
+
+def parse_args():
+    argparser = argparse.ArgumentParser(
+        description="CARLA Co-Simulation Client for TeraSim with local alignment fallback"
+    )
+    argparser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        dest="debug",
+        help="print debug information",
+    )
+    argparser.add_argument(
+        "--carla_host",
+        metavar="H",
+        default="127.0.0.1",
+        help="IP of the host server for Carla (default: 127.0.0.1)",
+    )
+    argparser.add_argument(
+        "--carla_port",
+        metavar="P",
+        default=2000,
+        type=int,
+        help="TCP port to listen to for Carla (default: 2000)",
+    )
+    argparser.add_argument(
+        "-s",
+        "--step_length",
+        metavar="S",
+        default=0.1,
+        type=float,
+        help="Step length of Carla simulation in seconds (default: 0.1)",
+    )
+    argparser.add_argument(
+        "--control_av",
+        action="store_true",
+        help="Activate AV manual control mode execution",
+    )
+    argparser.add_argument(
+        "--async_mode",
+        action="store_true",
+        help="Activate async mode execution",
+    )
+    argparser.add_argument(
+        "--carla_timeout",
+        default=10.0,
+        type=float,
+        help="Timeout in seconds for CARLA client connection (default: 10.0)",
+    )
+    argparser.add_argument(
+        "--map_name",
+        default="",
+        type=str,
+        help="Map name to load (default: empty string)",
+    )
+    argparser.add_argument(
+        "--terasim_host",
+        default="localhost",
+        help="IP of the host server for TeraSim (default: localhost)",
+    )
+    argparser.add_argument(
+        "--terasim_port",
+        default=8000,
+        type=int,
+        help="TCP port to listen to for TeraSim (default: 8000)",
+    )
+    argparser.add_argument(
+        "--terasim_config",
+        default="examples/simulation_Mcity_carla_config.yaml",
+        help="Configuration file path for TeraSim",
+    )
+    argparser.add_argument(
+        "--local_align_tolerance",
+        default=0.10,
+        type=float,
+        help="Allowed relative span mismatch for local bounds alignment (default: 0.10)",
+    )
+    argparser.add_argument(
+        "--use_lane_relative_position",
+        action="store_true",
+        default=_env_bool("CARLA_COSIM_USE_LANE_RELATIVE_POSITION", False),
+        help="Use lane-relative reconstructed SUMO positions when available",
+    )
+    return argparser.parse_args()
+
+
+def _relative_span_error(a_min, a_max, b_min, b_max):
+    a_span = abs(a_max - a_min)
+    b_span = abs(b_max - b_min)
+    denom = max(a_span, b_span, 1e-6)
+    return abs(a_span - b_span) / denom
+
+
+def _sumo_bounds_from_net(net_file):
+    root = ET.parse(net_file).getroot()
+    loc_elem = root.find(".//location")
+    proj_parameter = None
+    if loc_elem is not None:
+        proj_parameter = loc_elem.get("projParameter")
+        conv_boundary = loc_elem.get("convBoundary")
+        if conv_boundary:
+            x_min, y_min, x_max, y_max = map(float, conv_boundary.split(","))
+            return proj_parameter, (x_min, y_min, x_max, y_max)
+
+    xs = []
+    ys = []
+    for lane in root.iter("lane"):
+        shape = lane.get("shape")
+        if not shape:
+            continue
+        for point in shape.split():
+            values = point.split(",")
+            xs.append(float(values[0]))
+            ys.append(float(values[1]))
+
+    if not xs or not ys:
+        raise RuntimeError(f"Could not derive SUMO bounds from {net_file}")
+    return proj_parameter, (min(xs), min(ys), max(xs), max(ys))
+
+
+def _carla_waypoint_bounds(world):
+    xs = []
+    ys = []
+    for waypoint in world.get_map().generate_waypoints(50.0):
+        loc = waypoint.transform.location
+        xs.append(loc.x)
+        ys.append(loc.y)
+
+    if not xs or not ys:
+        raise RuntimeError("Could not derive CARLA waypoint bounds")
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def maybe_apply_local_bounds_alignment(carla_cosim: CarlaCosim, tolerance: float) -> None:
+    explicit_offset_x = os.environ.get("SUMO_TO_CARLA_OFFSET_X")
+    explicit_offset_y = os.environ.get("SUMO_TO_CARLA_OFFSET_Y")
+    explicit_offset_z = os.environ.get("SUMO_TO_CARLA_OFFSET_Z")
+    if explicit_offset_x is not None and explicit_offset_y is not None:
+        offset_x = float(explicit_offset_x)
+        offset_y = float(explicit_offset_y)
+        offset_z = float(explicit_offset_z or "0.0")
+        carla_cosim._coord_transformer = None
+        carla_cosim.sumo_carla_offset = [offset_x, offset_y]
+        print("Using explicit SUMO -> CARLA local offset from environment")
+        print(
+            f"  overriding offset: dx={offset_x:.2f}, "
+            f"dy={offset_y:.2f}, dz={offset_z:.2f}"
+        )
+        return
+
+    net_file = carla_cosim._get_net_file_from_config(carla_cosim.args.terasim_config)
+    if not net_file:
+        print("Local alignment skipped: no SUMO net file found in config")
+        return
+
+    try:
+        proj_parameter, (sx_min, sy_min, sx_max, sy_max) = _sumo_bounds_from_net(net_file)
+    except Exception as exc:
+        print(f"Local alignment skipped: failed to parse SUMO bounds ({exc})")
+        return
+
+    if proj_parameter != "!":
+        print(f"Local alignment skipped: SUMO projParameter is {proj_parameter!r}, not '!'.")
+        return
+
+    try:
+        cx_min, cy_min, cx_max, cy_max = _carla_waypoint_bounds(carla_cosim.world)
+    except Exception as exc:
+        print(f"Local alignment skipped: failed to derive CARLA waypoint bounds ({exc})")
+        return
+
+    x_span_error = _relative_span_error(sx_min, sx_max, cx_min, cx_max)
+    y_span_error = _relative_span_error(sy_min, sy_max, cy_min, cy_max)
+    if x_span_error > tolerance or y_span_error > tolerance:
+        print(
+            "Local alignment skipped: SUMO/CARLA spans differ too much "
+            f"(x_error={x_span_error:.3f}, y_error={y_span_error:.3f})"
+        )
+        return
+
+    sumo_center_x = (sx_min + sx_max) / 2.0
+    sumo_center_y = (sy_min + sy_max) / 2.0
+    carla_center_x = (cx_min + cx_max) / 2.0
+    carla_center_y = (cy_min + cy_max) / 2.0
+
+    offset_x = carla_center_x - sumo_center_x
+    offset_y = carla_center_y + sumo_center_y
+
+    carla_cosim._coord_transformer = None
+    carla_cosim.sumo_carla_offset = [offset_x, offset_y]
+
+    print("Using local bounds alignment for SUMO -> CARLA")
+    print(
+        "  SUMO bounds: "
+        f"x=[{sx_min:.2f}, {sx_max:.2f}] y=[{sy_min:.2f}, {sy_max:.2f}]"
+    )
+    print(
+        "  CARLA bounds: "
+        f"x=[{cx_min:.2f}, {cx_max:.2f}] y=[{cy_min:.2f}, {cy_max:.2f}]"
+    )
+    print(f"  span errors: x={x_span_error:.4f}, y={y_span_error:.4f}")
+    print(f"  overriding offset: dx={offset_x:.2f}, dy={offset_y:.2f}")
+
+
+class MotionDiagnostics:
+    fieldnames = [
+        "wall_time",
+        "sim_time",
+        "frame",
+        "veh_id",
+        "carla_id",
+        "sumo_x",
+        "sumo_y",
+        "sumo_z",
+        "sumo_angle",
+        "sumo_speed",
+        "target_x",
+        "target_y",
+        "target_z",
+        "target_yaw",
+        "actual_x",
+        "actual_y",
+        "actual_z",
+        "actual_yaw",
+        "target_error",
+        "dx",
+        "dy",
+        "dz",
+        "dt",
+        "step_distance",
+        "signed_forward_delta",
+        "estimated_forward_speed",
+        "backward",
+    ]
+
+    def __init__(
+        self,
+        carla_cosim: CarlaCosim,
+        log_path: str,
+        role_names: set[str] | None,
+        backward_threshold: float,
+        min_movement: float,
+    ) -> None:
+        self.carla_cosim = carla_cosim
+        self.log_path = log_path
+        self.role_names = role_names
+        self.backward_threshold = backward_threshold
+        self.min_movement = min_movement
+        self.last_by_vehicle: dict[str, dict[str, float]] = {}
+        self.stats: dict[str, dict[str, float]] = {}
+
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.file = open(log_path, "w", newline="")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+        self.writer.writeheader()
+        self.file.flush()
+
+    @staticmethod
+    def _parse_role_names(value: str) -> set[str] | None:
+        value = value.strip()
+        if value == "" or value.lower() in {"*", "all"}:
+            return None
+        return {item.strip() for item in value.split(",") if item.strip()}
+
+    @classmethod
+    def from_environment(cls, carla_cosim: CarlaCosim) -> "MotionDiagnostics | None":
+        log_path = os.environ.get("CARLA_COSIM_MOTION_LOG", "").strip()
+        if not log_path:
+            return None
+
+        role_names = cls._parse_role_names(
+            os.environ.get("CARLA_COSIM_DIAG_ROLE_NAMES", "AV")
+        )
+        backward_threshold = float(
+            os.environ.get("CARLA_COSIM_DIAG_BACKWARD_THRESHOLD", "-0.05")
+        )
+        min_movement = float(os.environ.get("CARLA_COSIM_DIAG_MIN_MOVEMENT", "0.01"))
+        diagnostics = cls(carla_cosim, log_path, role_names, backward_threshold, min_movement)
+
+        roles_text = "all vehicles" if role_names is None else ", ".join(sorted(role_names))
+        print("CARLA co-sim motion diagnostics enabled")
+        print(f"  log: {log_path}")
+        print(f"  vehicles: {roles_text}")
+        print(f"  backward threshold: {backward_threshold:.3f} m")
+        return diagnostics
+
+    def install(self) -> None:
+        original_process_vehicle = self.carla_cosim._process_vehicle
+
+        def wrapped_process_vehicle(veh_id, veh_info, cosim_id_record, *args, **kwargs):
+            original_process_vehicle(veh_id, veh_info, cosim_id_record, *args, **kwargs)
+            self.record_vehicle(veh_id, veh_info)
+
+        self.carla_cosim._process_vehicle = wrapped_process_vehicle
+
+    def _should_record(self, veh_id: str) -> bool:
+        return self.role_names is None or veh_id in self.role_names
+
+    def _stats_for(self, veh_id: str) -> dict[str, float]:
+        return self.stats.setdefault(
+            veh_id,
+            {
+                "samples": 0,
+                "moving_samples": 0,
+                "total_distance": 0.0,
+                "total_signed_forward_delta": 0.0,
+                "backward_events": 0,
+                "max_step_distance": 0.0,
+                "min_signed_forward_delta": math.inf,
+            },
+        )
+
+    def record_vehicle(self, veh_id: str, veh_info: dict) -> None:
+        if not self._should_record(veh_id):
+            return
+
+        vehicle_status, carla_id = get_actor_id_from_attribute(self.carla_cosim.world, veh_id)
+        if not vehicle_status:
+            return
+
+        vehicle = self.carla_cosim.world.get_actor(carla_id)
+        if vehicle is None:
+            return
+
+        sumo_location = self.carla_cosim._resolve_sumo_location(
+            "vehicle",
+            veh_id,
+            veh_info,
+            prefer_lane_relative=self.carla_cosim.use_lane_relative_position,
+        )
+        if sumo_location is None:
+            return
+        sumo_rotation = [0.0, veh_info["sumo_angle"], 0.0]
+        shape = [veh_info["length"], veh_info["width"], veh_info["height"]]
+        sumo_offset = self.carla_cosim._get_carla_offset(sumo_location, 0.0)
+        target_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+        actual_transform = vehicle.get_transform()
+        target_location = target_transform.location
+        actual_location = actual_transform.location
+
+        snapshot = self.carla_cosim.world.get_snapshot()
+        wall_time = time.time()
+        sim_time = snapshot.timestamp.elapsed_seconds
+        frame = snapshot.frame
+        previous = self.last_by_vehicle.get(veh_id)
+
+        dx = dy = dz = dt = step_distance = signed_forward_delta = estimated_speed = ""
+        backward = 0
+        if previous is not None:
+            dx_value = actual_location.x - previous["x"]
+            dy_value = actual_location.y - previous["y"]
+            dz_value = actual_location.z - previous["z"]
+            dt_value = sim_time - previous["sim_time"]
+            if dt_value <= 0:
+                dt_value = wall_time - previous["wall_time"]
+
+            distance_value = math.sqrt(
+                dx_value * dx_value + dy_value * dy_value + dz_value * dz_value
+            )
+            previous_yaw_rad = math.radians(previous["yaw"])
+            signed_value = dx_value * math.cos(previous_yaw_rad) + dy_value * math.sin(
+                previous_yaw_rad
+            )
+            estimated_value = signed_value / dt_value if dt_value > 0 else 0.0
+            if distance_value > self.min_movement and signed_value < self.backward_threshold:
+                backward = 1
+
+            dx = dx_value
+            dy = dy_value
+            dz = dz_value
+            dt = dt_value
+            step_distance = distance_value
+            signed_forward_delta = signed_value
+            estimated_speed = estimated_value
+
+            stats = self._stats_for(veh_id)
+            stats["moving_samples"] += int(distance_value > self.min_movement)
+            stats["total_distance"] += distance_value
+            stats["total_signed_forward_delta"] += signed_value
+            stats["backward_events"] += backward
+            stats["max_step_distance"] = max(stats["max_step_distance"], distance_value)
+            stats["min_signed_forward_delta"] = min(
+                stats["min_signed_forward_delta"], signed_value
+            )
+
+        target_error = math.sqrt(
+            (actual_location.x - target_location.x) ** 2
+            + (actual_location.y - target_location.y) ** 2
+            + (actual_location.z - target_location.z) ** 2
+        )
+
+        self._stats_for(veh_id)["samples"] += 1
+        self.writer.writerow(
+            {
+                "wall_time": wall_time,
+                "sim_time": sim_time,
+                "frame": frame,
+                "veh_id": veh_id,
+                "carla_id": carla_id,
+                "sumo_x": veh_info["x"],
+                "sumo_y": veh_info["y"],
+                "sumo_z": veh_info["z"],
+                "sumo_angle": veh_info["sumo_angle"],
+                "sumo_speed": veh_info.get("speed", ""),
+                "target_x": target_location.x,
+                "target_y": target_location.y,
+                "target_z": target_location.z,
+                "target_yaw": target_transform.rotation.yaw,
+                "actual_x": actual_location.x,
+                "actual_y": actual_location.y,
+                "actual_z": actual_location.z,
+                "actual_yaw": actual_transform.rotation.yaw,
+                "target_error": target_error,
+                "dx": dx,
+                "dy": dy,
+                "dz": dz,
+                "dt": dt,
+                "step_distance": step_distance,
+                "signed_forward_delta": signed_forward_delta,
+                "estimated_forward_speed": estimated_speed,
+                "backward": backward,
+            }
+        )
+        self.file.flush()
+
+        self.last_by_vehicle[veh_id] = {
+            "wall_time": wall_time,
+            "sim_time": sim_time,
+            "x": actual_location.x,
+            "y": actual_location.y,
+            "z": actual_location.z,
+            "yaw": actual_transform.rotation.yaw,
+        }
+
+    def close(self) -> None:
+        if self.file.closed:
+            return
+
+        print("CARLA co-sim motion diagnostics summary")
+        total_backward = 0
+        for veh_id, stats in sorted(self.stats.items()):
+            total_backward += int(stats["backward_events"])
+            min_signed = stats["min_signed_forward_delta"]
+            min_signed_text = "n/a" if min_signed == math.inf else f"{min_signed:.4f}m"
+            print(
+                f"  {veh_id}: samples={int(stats['samples'])} "
+                f"moving={int(stats['moving_samples'])} "
+                f"distance={stats['total_distance']:.2f}m "
+                f"signed={stats['total_signed_forward_delta']:.2f}m "
+                f"backward_events={int(stats['backward_events'])} "
+                f"min_signed={min_signed_text} "
+                f"max_step={stats['max_step_distance']:.2f}m"
+            )
+        if total_backward == 0:
+            print("  verdict: no backward set_transform steps were recorded.")
+        else:
+            print(
+                "  verdict: backward set_transform steps were recorded; "
+                "inspect backward=1 rows."
+            )
+        print(f"  csv: {self.log_path}")
+        self.file.close()
+
+
+class ActorSyncProfiler:
+    fieldnames = [
+        "wall_time",
+        "frame",
+        "sim_time",
+        "state_get",
+        "validate",
+        "actor_index_build",
+        "world_actor_count",
+        "world_vehicle_actor_count",
+        "world_pedestrian_actor_count",
+        "vehicle_count",
+        "vru_count",
+        "vehicle_loop",
+        "vehicle_process_calls",
+        "vehicle_process_max",
+        "vru_loop",
+        "vru_process_calls",
+        "vru_process_max",
+        "cleanup_vehicle",
+        "cleanup_vehicle_count",
+        "cleanup_pedestrian",
+        "cleanup_pedestrian_count",
+        "lookup_calls",
+        "lookup_total",
+        "lookup_max",
+        "sumo_to_carla_calls",
+        "sumo_to_carla_total",
+        "sumo_to_carla_max",
+        "spawn_calls",
+        "spawn_total",
+        "spawn_max",
+        "spawn_success",
+        "spawn_failed",
+        "spawn_batch_size",
+        "spawn_batch_flush_time",
+        "apply_batch_sync_time",
+        "apply_batch_sync_max",
+        "apply_batch_sync_success_time",
+        "apply_batch_sync_failed_time",
+        "transform_batch_size",
+        "transform_batch_apply_time",
+        "transform_batch_response_count",
+        "transform_batch_success",
+        "transform_batch_failed",
+        "profiled_time",
+        "unprofiled_time",
+        "total",
+        "result",
+    ]
+
+    def __init__(self, carla_cosim: CarlaCosim, log_path: str, print_every: int) -> None:
+        self.carla_cosim = carla_cosim
+        self.log_path = log_path
+        self.print_every = max(print_every, 0)
+        self.rows_written = 0
+        self.active_row: dict | None = None
+        self.stage_values: dict[str, list[float]] = {
+            key: []
+            for key in [
+                "state_get",
+                "actor_index_build",
+                "vehicle_loop",
+                "vru_loop",
+                "cleanup_vehicle",
+                "cleanup_pedestrian",
+                "lookup_total",
+                "sumo_to_carla_total",
+                "spawn_total",
+                "spawn_batch_flush_time",
+                "apply_batch_sync_time",
+                "transform_batch_apply_time",
+                "apply_batch_sync_success_time",
+                "apply_batch_sync_failed_time",
+                "unprofiled_time",
+                "total",
+            ]
+        }
+
+        self.original_sync_actor = carla_cosim.sync_cosim_actor_to_carla
+        self.original_lookup = carla_cosim_module.get_actor_id_from_attribute
+        self.original_sumo_to_carla = carla_cosim_module.sumo_to_carla
+        self.original_spawn_actor = carla_cosim_module.spawn_actor
+        self.original_spawn_actor_profile_hook = carla_tools_module.get_spawn_actor_profile_hook()
+
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.file = open(log_path, "w", newline="")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+        self.writer.writeheader()
+        self.file.flush()
+
+    @classmethod
+    def from_environment(cls, carla_cosim: CarlaCosim) -> "ActorSyncProfiler | None":
+        log_path = os.environ.get("CARLA_COSIM_ACTOR_PROFILE_LOG", "").strip()
+        if not log_path:
+            return None
+        print_every = int(os.environ.get("CARLA_COSIM_ACTOR_PROFILE_PRINT_EVERY", "20"))
+        profiler = cls(carla_cosim, log_path, print_every)
+        print("CARLA co-sim actor sync profiler enabled")
+        print(f"  log: {log_path}")
+        print(f"  print every: {print_every} actor syncs")
+        return profiler
+
+    @staticmethod
+    def _elapsed(start: float) -> float:
+        return time.perf_counter() - start
+
+    def install(self) -> None:
+        def timed_lookup(world, attribute):
+            start = time.perf_counter()
+            try:
+                return self.original_lookup(world, attribute)
+            finally:
+                elapsed = self._elapsed(start)
+                row = self.active_row
+                if row is not None:
+                    row["lookup_calls"] += 1
+                    row["lookup_total"] += elapsed
+                    row["lookup_max"] = max(row["lookup_max"], elapsed)
+
+        def timed_sumo_to_carla(sumo_location, sumo_rotation, shape, offset):
+            start = time.perf_counter()
+            try:
+                return self.original_sumo_to_carla(sumo_location, sumo_rotation, shape, offset)
+            finally:
+                elapsed = self._elapsed(start)
+                row = self.active_row
+                if row is not None:
+                    row["sumo_to_carla_calls"] += 1
+                    row["sumo_to_carla_total"] += elapsed
+                    row["sumo_to_carla_max"] = max(row["sumo_to_carla_max"], elapsed)
+
+        def timed_spawn_actor(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return self.original_spawn_actor(*args, **kwargs)
+            finally:
+                elapsed = self._elapsed(start)
+                row = self.active_row
+                if row is not None:
+                    row["spawn_calls"] += 1
+                    row["spawn_total"] += elapsed
+                    row["spawn_max"] = max(row["spawn_max"], elapsed)
+
+        def record_spawn_apply_batch(elapsed, success, error):
+            row = self.active_row
+            if row is None:
+                return
+            row["apply_batch_sync_time"] += elapsed
+            row["apply_batch_sync_max"] = max(row["apply_batch_sync_max"], elapsed)
+            if success:
+                row["spawn_success"] += 1
+                row["apply_batch_sync_success_time"] += elapsed
+            else:
+                row["spawn_failed"] += 1
+                row["apply_batch_sync_failed_time"] += elapsed
+
+        carla_cosim_module.get_actor_id_from_attribute = timed_lookup
+        carla_cosim_module.sumo_to_carla = timed_sumo_to_carla
+        carla_cosim_module.spawn_actor = timed_spawn_actor
+        carla_tools_module.set_spawn_actor_profile_hook(record_spawn_apply_batch)
+        self.carla_cosim.sync_cosim_actor_to_carla = self.profiled_sync_actor
+
+    def _new_row(self) -> dict:
+        snapshot = self.carla_cosim.world.get_snapshot()
+        return {
+            "wall_time": time.time(),
+            "frame": snapshot.frame,
+            "sim_time": snapshot.timestamp.elapsed_seconds,
+            "state_get": 0.0,
+            "validate": 0.0,
+            "actor_index_build": 0.0,
+            "world_actor_count": 0,
+            "world_vehicle_actor_count": 0,
+            "world_pedestrian_actor_count": 0,
+            "vehicle_count": 0,
+            "vru_count": 0,
+            "vehicle_loop": 0.0,
+            "vehicle_process_calls": 0,
+            "vehicle_process_max": 0.0,
+            "vru_loop": 0.0,
+            "vru_process_calls": 0,
+            "vru_process_max": 0.0,
+            "cleanup_vehicle": 0.0,
+            "cleanup_vehicle_count": 0,
+            "cleanup_pedestrian": 0.0,
+            "cleanup_pedestrian_count": 0,
+            "lookup_calls": 0,
+            "lookup_total": 0.0,
+            "lookup_max": 0.0,
+            "sumo_to_carla_calls": 0,
+            "sumo_to_carla_total": 0.0,
+            "sumo_to_carla_max": 0.0,
+            "spawn_calls": 0,
+            "spawn_total": 0.0,
+            "spawn_max": 0.0,
+            "spawn_success": 0,
+            "spawn_failed": 0,
+            "spawn_batch_size": 0,
+            "spawn_batch_flush_time": 0.0,
+            "apply_batch_sync_time": 0.0,
+            "apply_batch_sync_max": 0.0,
+            "apply_batch_sync_success_time": 0.0,
+            "apply_batch_sync_failed_time": 0.0,
+            "transform_batch_size": 0,
+            "transform_batch_apply_time": 0.0,
+            "transform_batch_response_count": 0,
+            "transform_batch_success": 0,
+            "transform_batch_failed": 0,
+            "profiled_time": 0.0,
+            "unprofiled_time": 0.0,
+            "total": 0.0,
+            "result": "ok",
+        }
+
+    def _record(self, row: dict) -> None:
+        self.rows_written += 1
+        for key, values in self.stage_values.items():
+            value = row.get(key)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        self.writer.writerow(row)
+        self.file.flush()
+
+        if self.print_every and self.rows_written % self.print_every == 0:
+            print(
+                "actor sync profile: "
+                f"rows={self.rows_written} "
+                f"total={row['total']:.3f}s "
+                f"state_get={row['state_get']:.3f}s "
+                f"index={row['actor_index_build']:.3f}s "
+                f"vehicle_loop={row['vehicle_loop']:.3f}s "
+                f"cleanup={row['cleanup_vehicle'] + row['cleanup_pedestrian']:.3f}s "
+                f"world_actors={row['world_actor_count']} "
+                f"spawn_success={row['spawn_success']} "
+                f"spawn_failed={row['spawn_failed']} "
+                f"spawn_batch={row['spawn_batch_size']} "
+                f"transform_batch={row['transform_batch_size']} "
+                f"transform_apply={row['transform_batch_apply_time']:.3f}s "
+                f"unprofiled={row['unprofiled_time']:.3f}s "
+                f"lookup={row['lookup_total']:.3f}s/{row['lookup_calls']}calls"
+            )
+
+    @staticmethod
+    def _merge_spawn_batch_stats(row: dict, stats: dict) -> None:
+        row["spawn_calls"] += stats.get("spawn_calls", 0)
+        row["spawn_total"] += stats.get("spawn_total", 0.0)
+        row["spawn_max"] = max(row["spawn_max"], stats.get("spawn_max", 0.0))
+        row["spawn_success"] += stats.get("spawn_success", 0)
+        row["spawn_failed"] += stats.get("spawn_failed", 0)
+        row["apply_batch_sync_time"] += stats.get("apply_batch_sync_time", 0.0)
+        row["apply_batch_sync_max"] = max(
+            row["apply_batch_sync_max"], stats.get("apply_batch_sync_max", 0.0)
+        )
+        row["apply_batch_sync_success_time"] += stats.get(
+            "apply_batch_sync_success_time", 0.0
+        )
+        row["apply_batch_sync_failed_time"] += stats.get(
+            "apply_batch_sync_failed_time", 0.0
+        )
+
+    def profiled_sync_actor(self):
+        cosim = self.carla_cosim
+        row = self._new_row()
+        total_start = time.perf_counter()
+        self.active_row = row
+        try:
+            stage_start = time.perf_counter()
+            terasim_states = carla_cosim_module.get_terasim_states(
+                cosim.args.terasim_host,
+                cosim.args.terasim_port,
+                cosim.terasim["simulation_id"],
+            )
+            row["state_get"] = self._elapsed(stage_start)
+
+            validate_start = time.perf_counter()
+            if not terasim_states:
+                print("terasim_states not available.")
+                row["result"] = "no_states"
+                return
+            if "agent_details" not in terasim_states:
+                print("No agent details available.")
+                row["result"] = "no_agent_details"
+                return
+            if "vehicle" not in terasim_states["agent_details"]:
+                print("No vehicle details available.")
+                row["result"] = "no_vehicle_details"
+                return
+            if "vru" not in terasim_states["agent_details"]:
+                print("No VRU details available.")
+                row["result"] = "no_vru_details"
+                return
+            row["validate"] = self._elapsed(validate_start)
+
+            vehicles = terasim_states["agent_details"]["vehicle"]
+            vrus = terasim_states["agent_details"]["vru"]
+            vehicles, vrus = cosim._filter_actor_details_by_radius(vehicles, vrus)
+            row["vehicle_count"] = len(vehicles)
+            row["vru_count"] = len(vrus)
+
+            cosim_id_record = set()
+            current_frame = cosim.world.get_snapshot().frame
+            transform_batch = []
+            spawn_requests = []
+
+            stage_start = time.perf_counter()
+            vehicle_actor_index, pedestrian_actor_index = cosim._build_actor_role_indexes()
+            row["actor_index_build"] = self._elapsed(stage_start)
+            row["world_actor_count"] = getattr(
+                cosim, "_last_actor_index_world_actor_count", 0
+            )
+            row["world_vehicle_actor_count"] = getattr(
+                cosim, "_last_actor_index_vehicle_actor_count", len(vehicle_actor_index)
+            )
+            row["world_pedestrian_actor_count"] = getattr(
+                cosim, "_last_actor_index_pedestrian_actor_count", len(pedestrian_actor_index)
+            )
+
+            stage_start = time.perf_counter()
+            for veh_id, veh_info in vehicles.items():
+                if cosim.control_av and veh_id == carla_cosim_module.AV_SUMO_ID:
+                    if cosim.initialize_av:
+                        continue
+                    cosim.initialize_av = True
+                    cosim.av_shape = [
+                        veh_info["length"],
+                        veh_info["width"],
+                        veh_info["height"],
+                    ]
+                    print("AV is initialized based on SUMO state.")
+                    print(veh_info)
+
+                process_start = time.perf_counter()
+                cosim._process_vehicle(
+                    veh_id,
+                    veh_info,
+                    cosim_id_record,
+                    carla_actor=vehicle_actor_index.get(veh_id),
+                    actor_index=vehicle_actor_index,
+                    current_frame=current_frame,
+                    transform_batch=transform_batch,
+                    spawn_requests=spawn_requests,
+                )
+                elapsed = self._elapsed(process_start)
+                row["vehicle_process_calls"] += 1
+                row["vehicle_process_max"] = max(row["vehicle_process_max"], elapsed)
+            row["vehicle_loop"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            for vru_id, vru_info in vrus.items():
+                vru_actor_index = (
+                    vehicle_actor_index
+                    if cosim._vru_uses_vehicle_blueprint(vru_info)
+                    else pedestrian_actor_index
+                )
+                process_start = time.perf_counter()
+                cosim._process_vru(
+                    vru_id,
+                    vru_info,
+                    cosim_id_record,
+                    carla_actor=vru_actor_index.get(vru_id),
+                    actor_index=vru_actor_index,
+                    current_frame=current_frame,
+                    transform_batch=transform_batch,
+                    spawn_requests=spawn_requests,
+                )
+                elapsed = self._elapsed(process_start)
+                row["vru_process_calls"] += 1
+                row["vru_process_max"] = max(row["vru_process_max"], elapsed)
+            row["vru_loop"] = self._elapsed(stage_start)
+
+            row["spawn_batch_size"] = len(spawn_requests)
+            stage_start = time.perf_counter()
+            spawn_stats = cosim._flush_actor_spawn_batch(spawn_requests, transform_batch)
+            row["spawn_batch_flush_time"] = self._elapsed(stage_start)
+            self._merge_spawn_batch_stats(row, spawn_stats)
+
+            row["transform_batch_size"] = len(transform_batch)
+            stage_start = time.perf_counter()
+            transform_responses = cosim._flush_actor_transform_batch(transform_batch) or []
+            row["transform_batch_apply_time"] = self._elapsed(stage_start)
+            row["transform_batch_response_count"] = len(transform_responses)
+            transform_failed = sum(
+                1 for response in transform_responses if getattr(response, "error", None)
+            )
+            row["transform_batch_failed"] = transform_failed
+            row["transform_batch_success"] = len(transform_responses) - transform_failed
+
+            stage_start = time.perf_counter()
+            cleanup_count = cosim._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
+            row["cleanup_vehicle"] = self._elapsed(stage_start)
+            row["cleanup_vehicle_count"] = int(cleanup_count or 0)
+
+            stage_start = time.perf_counter()
+            cleanup_count = cosim._cleanup_actors(
+                "pedestrian", "walker.pedestrian.*", cosim_id_record
+            )
+            row["cleanup_pedestrian"] = self._elapsed(stage_start)
+            row["cleanup_pedestrian_count"] = int(cleanup_count or 0)
+
+            cosim._prune_spawn_failures(vehicles.keys(), vrus.keys())
+        finally:
+            row["total"] = self._elapsed(total_start)
+            row["profiled_time"] = sum(
+                row[key]
+                for key in [
+                    "state_get",
+                    "validate",
+                    "actor_index_build",
+                    "vehicle_loop",
+                    "vru_loop",
+                    "spawn_batch_flush_time",
+                    "transform_batch_apply_time",
+                    "cleanup_vehicle",
+                    "cleanup_pedestrian",
+                ]
+            )
+            row["unprofiled_time"] = max(0.0, row["total"] - row["profiled_time"])
+            self.active_row = None
+            self._record(row)
+
+    def close(self) -> None:
+        carla_cosim_module.get_actor_id_from_attribute = self.original_lookup
+        carla_cosim_module.sumo_to_carla = self.original_sumo_to_carla
+        carla_cosim_module.spawn_actor = self.original_spawn_actor
+        carla_tools_module.set_spawn_actor_profile_hook(self.original_spawn_actor_profile_hook)
+        self.carla_cosim.sync_cosim_actor_to_carla = self.original_sync_actor
+
+        if self.file.closed:
+            return
+
+        print("CARLA co-sim actor sync profiler summary")
+        for key, values in self.stage_values.items():
+            if not values:
+                continue
+            print(
+                f"  {key}: "
+                f"median={statistics.median(values):.3f}s "
+                f"mean={statistics.mean(values):.3f}s "
+                f"max={max(values):.3f}s"
+            )
+        print(f"  csv: {self.log_path}")
+        self.file.close()
+
+
+class TickProfiler:
+    fieldnames = [
+        "wall_time",
+        "frame_before",
+        "frame_after",
+        "sim_time_before",
+        "sim_time_after",
+        "sumo_time",
+        "completed_tick_count",
+        "sumo_time_wait",
+        "sumo_time_polls",
+        "sumo_time_wait_result",
+        "status_wait",
+        "status_polls",
+        "sync_av",
+        "sync_actor",
+        "sync_tls",
+        "tick_terasim",
+        "world_tick",
+        "async_sleep",
+        "total",
+        "result",
+    ]
+
+    def __init__(
+        self,
+        carla_cosim: CarlaCosim,
+        log_path: str,
+        print_every: int,
+        wait_sumo_time: bool,
+        wait_sumo_time_timeout: float,
+        wait_sumo_time_poll_interval: float,
+    ) -> None:
+        self.carla_cosim = carla_cosim
+        self.log_path = log_path
+        self.print_every = max(print_every, 0)
+        self.wait_sumo_time = wait_sumo_time
+        self.wait_sumo_time_timeout = max(wait_sumo_time_timeout, 0.0)
+        self.wait_sumo_time_poll_interval = max(wait_sumo_time_poll_interval, 0.001)
+        self.reuse_tick_state = _env_bool("CARLA_COSIM_REUSE_TICK_STATE", False)
+        self.rows_written = 0
+        self.original_get_terasim_states = carla_cosim_module.get_terasim_states
+        self.current_tick_sumo_time: float | None = None
+        self.previous_sumo_time: float | None = None
+        self.previous_completed_tick_count: int | None = None
+        self.cached_terasim_states: dict | None = None
+        self.stage_values: dict[str, list[float]] = {
+            key: []
+            for key in [
+                "sumo_time_wait",
+                "status_wait",
+                "sync_av",
+                "sync_actor",
+                "sync_tls",
+                "tick_terasim",
+                "world_tick",
+                "async_sleep",
+                "total",
+            ]
+        }
+
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.file = open(log_path, "w", newline="") if log_path else None
+        self.writer = (
+            csv.DictWriter(self.file, fieldnames=self.fieldnames) if self.file else None
+        )
+        if self.writer is not None and self.file is not None:
+            self.writer.writeheader()
+            self.file.flush()
+
+    @classmethod
+    def from_environment(cls, carla_cosim: CarlaCosim) -> "TickProfiler | None":
+        log_path = os.environ.get("CARLA_COSIM_PROFILE_LOG", "").strip()
+        wait_sumo_time = _env_bool("CARLA_COSIM_WAIT_SUMO_TIME", False)
+        if not log_path and not wait_sumo_time:
+            return None
+        print_every_default = "20" if log_path else "0"
+        print_every = int(os.environ.get("CARLA_COSIM_PROFILE_PRINT_EVERY", print_every_default))
+        wait_timeout = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_TIMEOUT", 10.0)
+        wait_poll_interval = _env_float("CARLA_COSIM_WAIT_SUMO_TIME_POLL_INTERVAL", 0.001)
+        profiler = cls(
+            carla_cosim,
+            log_path,
+            print_every,
+            wait_sumo_time,
+            wait_timeout,
+            wait_poll_interval,
+        )
+        if log_path:
+            print("CARLA co-sim tick profiler enabled")
+            print(f"  log: {log_path}")
+            print(f"  print every: {print_every} ticks")
+        if wait_sumo_time:
+            print("CARLA co-sim completed tick wait enabled")
+            print(f"  timeout: {wait_timeout:.3f}s")
+            print(f"  poll interval: {wait_poll_interval:.3f}s")
+        if profiler.reuse_tick_state:
+            print("CARLA co-sim per-tick TeraSim state reuse enabled")
+        return profiler
+
+    @staticmethod
+    def _elapsed(start: float) -> float:
+        return time.perf_counter() - start
+
+    def install(self) -> None:
+        def recording_get_terasim_states(host, port, simulation_id):
+            if self.reuse_tick_state and self.cached_terasim_states is not None:
+                terasim_states = self.cached_terasim_states
+            else:
+                terasim_states = self.original_get_terasim_states(host, port, simulation_id)
+                if self.reuse_tick_state and terasim_states is not None:
+                    self.cached_terasim_states = terasim_states
+
+            sumo_time = _extract_sumo_time(terasim_states)
+            if sumo_time is not None:
+                self.current_tick_sumo_time = sumo_time
+            return terasim_states
+
+        carla_cosim_module.get_terasim_states = recording_get_terasim_states
+        self.carla_cosim.tick = self.tick
+
+    def _sumo_time_value(self):
+        if self.current_tick_sumo_time is None:
+            return ""
+        return self.current_tick_sumo_time
+
+    def _apply_completed_status(self, status_response: dict | None, row: dict) -> None:
+        sumo_time = _extract_completed_sumo_time(status_response)
+        if sumo_time is not None:
+            self.current_tick_sumo_time = sumo_time
+        completed_tick_count = _extract_completed_tick_count(status_response)
+        if completed_tick_count is not None:
+            row["completed_tick_count"] = completed_tick_count
+
+    def _wait_for_initial_terasim_ready(self, row: dict) -> bool:
+        start = time.perf_counter()
+        deadline = start + self.wait_sumo_time_timeout
+        while True:
+            status_response = carla_cosim_module.get_terasim_status(
+                self.carla_cosim.args.terasim_host,
+                self.carla_cosim.args.terasim_port,
+                self.carla_cosim.terasim["simulation_id"],
+            )
+            row["status_polls"] += 1
+            terasim_status = status_response.get("status", None)
+            self._apply_completed_status(status_response, row)
+
+            if terasim_status in {"ticked", "wait_for_tick"}:
+                completed_tick_count = _extract_completed_tick_count(status_response)
+                self.previous_completed_tick_count = (
+                    completed_tick_count if completed_tick_count is not None else 0
+                )
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "no_previous_tick"
+                return True
+
+            if terasim_status is None:
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "terasim_status_none"
+                return False
+
+            if time.perf_counter() >= deadline:
+                row["status_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "initial_status_timeout"
+                return False
+
+            time.sleep(self.wait_sumo_time_poll_interval)
+
+    def _wait_for_completed_tick_progress(self, row: dict) -> bool:
+        if self.previous_completed_tick_count is None:
+            return self._wait_for_initial_terasim_ready(row)
+
+        start = time.perf_counter()
+        deadline = start + self.wait_sumo_time_timeout
+        target_tick_count = self.previous_completed_tick_count
+        while True:
+            status_response = carla_cosim_module.get_terasim_status(
+                self.carla_cosim.args.terasim_host,
+                self.carla_cosim.args.terasim_port,
+                self.carla_cosim.terasim["simulation_id"],
+            )
+            row["sumo_time_polls"] += 1
+            terasim_status = status_response.get("status", None)
+            self._apply_completed_status(status_response, row)
+            completed_tick_count = _extract_completed_tick_count(status_response)
+
+            if completed_tick_count is not None and completed_tick_count > target_tick_count:
+                self.previous_completed_tick_count = completed_tick_count
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "completed_tick_advanced"
+                return True
+
+            # Compatibility fallback for older services that do not expose completed_tick_count.
+            if completed_tick_count is None:
+                sumo_time = _extract_completed_sumo_time(status_response)
+                if (
+                    self.previous_sumo_time is not None
+                    and sumo_time is not None
+                    and sumo_time > self.previous_sumo_time
+                ):
+                    row["sumo_time_wait"] = self._elapsed(start)
+                    row["sumo_time_wait_result"] = "sumo_time_advanced_fallback"
+                    return True
+
+            if terasim_status is None:
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "terasim_status_none"
+                return False
+
+            if time.perf_counter() >= deadline:
+                row["sumo_time_wait"] = self._elapsed(start)
+                row["sumo_time_wait_result"] = "completed_tick_timeout"
+                return False
+
+            time.sleep(self.wait_sumo_time_poll_interval)
+
+    def _snapshot_values(self) -> tuple[int, float]:
+        snapshot = self.carla_cosim.world.get_snapshot()
+        return snapshot.frame, snapshot.timestamp.elapsed_seconds
+
+    def _record(self, row: dict) -> None:
+        self.rows_written += 1
+        for key, values in self.stage_values.items():
+            value = row.get(key)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        if self.writer is not None and self.file is not None:
+            self.writer.writerow(row)
+            self.file.flush()
+
+        if self.print_every and self.rows_written % self.print_every == 0:
+            total_values = self.stage_values["total"]
+            latest_total = total_values[-1] if total_values else 0.0
+            print(
+                "tick profile: "
+                f"ticks={self.rows_written} "
+                f"latest_total={latest_total:.3f}s "
+                f"sumo_time={row.get('sumo_time', '')} "
+                f"sumo_wait={row.get('sumo_time_wait', 0.0):.3f}s "
+                f"status_wait={row.get('status_wait', 0.0):.3f}s "
+                f"sync_actor={row.get('sync_actor', 0.0):.3f}s "
+                f"tick_terasim={row.get('tick_terasim', 0.0):.3f}s "
+                f"world_tick={row.get('world_tick', 0.0):.3f}s"
+            )
+
+    def tick(self) -> bool:
+        cosim = self.carla_cosim
+        total_start = time.perf_counter()
+        self.current_tick_sumo_time = None
+        self.cached_terasim_states = None
+        frame_before, sim_time_before = self._snapshot_values()
+        row = {
+            "wall_time": time.time(),
+            "frame_before": frame_before,
+            "sim_time_before": sim_time_before,
+            "sumo_time": "",
+            "completed_tick_count": "",
+            "sumo_time_wait": 0.0,
+            "sumo_time_polls": 0,
+            "sumo_time_wait_result": "",
+            "status_wait": 0.0,
+            "status_polls": 0,
+            "sync_av": 0.0,
+            "sync_actor": 0.0,
+            "sync_tls": 0.0,
+            "tick_terasim": 0.0,
+            "world_tick": 0.0,
+            "async_sleep": 0.0,
+            "result": "ok",
+        }
+
+        if cosim.async_mode:
+            loop_start = time.perf_counter()
+            if cosim.control_av:
+                stage_start = time.perf_counter()
+                cosim.sync_carla_av_to_cosim()
+                row["sync_av"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.sync_cosim_actor_to_carla()
+            row["sync_actor"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.sync_cosim_tls_to_carla()
+            row["sync_tls"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.world.tick()
+            row["world_tick"] = self._elapsed(stage_start)
+
+            elapsed = time.perf_counter() - loop_start
+            if elapsed < cosim.step_length:
+                sleep_time = cosim.step_length - elapsed
+                time.sleep(sleep_time)
+                row["async_sleep"] = sleep_time
+        else:
+            if self.wait_sumo_time:
+                wait_ok = self._wait_for_completed_tick_progress(row)
+                if not wait_ok:
+                    if row.get("sumo_time_wait_result") == "terasim_status_none":
+                        print("TeraSim status is None. Exiting...")
+                        row["result"] = "terasim_status_none"
+                    else:
+                        row["result"] = "completed_tick_wait_timeout"
+                    frame_after, sim_time_after = self._snapshot_values()
+                    row["frame_after"] = frame_after
+                    row["sim_time_after"] = sim_time_after
+                    row["total"] = self._elapsed(total_start)
+                    row["sumo_time"] = self._sumo_time_value()
+                    self._record(row)
+                    return False
+            else:
+                stage_start = time.perf_counter()
+                while True:
+                    status_response = carla_cosim_module.get_terasim_status(
+                        cosim.args.terasim_host,
+                        cosim.args.terasim_port,
+                        cosim.terasim["simulation_id"],
+                    )
+                    row["status_polls"] += 1
+                    terasim_status = status_response.get("status", None)
+                    self._apply_completed_status(status_response, row)
+                    if terasim_status in {"ticked", "wait_for_tick"}:
+                        break
+                    if terasim_status is None:
+                        print("TeraSim status is None. Exiting...")
+                        row["status_wait"] = self._elapsed(stage_start)
+                        row["result"] = "terasim_status_none"
+                        row["total"] = self._elapsed(total_start)
+                        frame_after, sim_time_after = self._snapshot_values()
+                        row["frame_after"] = frame_after
+                        row["sim_time_after"] = sim_time_after
+                        self._record(row)
+                        return False
+                    time.sleep(0.05)
+                row["status_wait"] = self._elapsed(stage_start)
+
+            if cosim.control_av:
+                stage_start = time.perf_counter()
+                cosim.sync_carla_av_to_cosim()
+                row["sync_av"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.sync_cosim_actor_to_carla()
+            row["sync_actor"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.sync_cosim_tls_to_carla()
+            row["sync_tls"] = self._elapsed(stage_start)
+
+            self.cached_terasim_states = None
+            stage_start = time.perf_counter()
+            carla_cosim_module.tick_terasim(
+                cosim.args.terasim_host,
+                cosim.args.terasim_port,
+                cosim.terasim["simulation_id"],
+            )
+            row["tick_terasim"] = self._elapsed(stage_start)
+
+            stage_start = time.perf_counter()
+            cosim.world.tick()
+            row["world_tick"] = self._elapsed(stage_start)
+
+        frame_after, sim_time_after = self._snapshot_values()
+        row["frame_after"] = frame_after
+        row["sim_time_after"] = sim_time_after
+        row["total"] = self._elapsed(total_start)
+        row["sumo_time"] = self._sumo_time_value()
+        if isinstance(row["sumo_time"], (int, float)):
+            self.previous_sumo_time = float(row["sumo_time"])
+        self._record(row)
+        return True
+
+    def close(self) -> None:
+        carla_cosim_module.get_terasim_states = self.original_get_terasim_states
+
+        print("CARLA co-sim tick profiler summary")
+        for key, values in self.stage_values.items():
+            if not values:
+                continue
+            print(
+                f"  {key}: "
+                f"median={statistics.median(values):.3f}s "
+                f"mean={statistics.mean(values):.3f}s "
+                f"max={max(values):.3f}s"
+            )
+        if self.file is not None:
+            print(f"  csv: {self.log_path}")
+            if not self.file.closed:
+                self.file.close()
+
+
+def main():
+    args = parse_args()
+    carla_cosim = CarlaCosim(args)
+    maybe_apply_local_bounds_alignment(carla_cosim, args.local_align_tolerance)
+    motion_diagnostics = MotionDiagnostics.from_environment(carla_cosim)
+    if motion_diagnostics is not None:
+        motion_diagnostics.install()
+    actor_sync_profiler = ActorSyncProfiler.from_environment(carla_cosim)
+    if actor_sync_profiler is not None:
+        actor_sync_profiler.install()
+    tick_profiler = TickProfiler.from_environment(carla_cosim)
+    if tick_profiler is not None:
+        tick_profiler.install()
+
+    no_rendering_mode = _env_bool("CARLA_COSIM_NO_RENDERING_MODE", False)
+    if no_rendering_mode:
+        print("CARLA no_rendering_mode enabled")
+
+    if not args.async_mode:
+        for attempt in range(5):
+            settings = carla_cosim.world.get_settings()
+            settings.fixed_delta_seconds = args.step_length
+            settings.synchronous_mode = True
+            settings.no_rendering_mode = no_rendering_mode
+            carla_cosim.world.apply_settings(settings)
+            time.sleep(1.0)
+            current = carla_cosim.world.get_settings()
+            if current.synchronous_mode:
+                print(f"Synchronous mode enabled (attempt {attempt + 1})")
+                break
+            print(f"Settings not applied yet, retrying... (attempt {attempt + 1})")
+            try:
+                carla_cosim.world.tick()
+            except Exception:
+                pass
+            time.sleep(2.0)
+    else:
+        settings = carla_cosim.world.get_settings()
+        if settings.synchronous_mode:
+            try:
+                carla_cosim.world.tick()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            settings.no_rendering_mode = no_rendering_mode
+            carla_cosim.world.apply_settings(settings)
+            time.sleep(1.0)
+        print("Running in async mode")
+
+    carla_cosim.world.set_weather(carla.WeatherParameters.WetSunset)
+
+    try:
+        tick_flag = True
+        while tick_flag:
+            tick_flag = carla_cosim.tick()
+    except KeyboardInterrupt:
+        print("Cancelled by user.")
+    finally:
+        if tick_profiler is not None:
+            tick_profiler.close()
+        if actor_sync_profiler is not None:
+            actor_sync_profiler.close()
+        if motion_diagnostics is not None:
+            motion_diagnostics.close()
+        if no_rendering_mode:
+            try:
+                settings = carla_cosim.world.get_settings()
+                settings.no_rendering_mode = False
+                carla_cosim.world.apply_settings(settings)
+                print("CARLA no_rendering_mode disabled")
+            except Exception as exc:
+                print(f"Warning: failed to disable no_rendering_mode: {exc}")
+        print("Cleaning synchronization")
+        carla_cosim.close()
+
+
+if __name__ == "__main__":
+    main()
