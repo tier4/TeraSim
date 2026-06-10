@@ -1,0 +1,32 @@
+# docker compose -f docker-compose.cosim-odaiba-3cosim.yml up -d
+# =============================================================================
+# お台場 3者 cosim (Autoware psim + CARLA + TeraSim) の TeraSim 側(背景車両注入)。
+# =============================================================================
+# 前提: 第1段階 start_3cosim_odaiba_psim.sh で CARLA :2013(odaibatest5) + psim + bridge 稼働済み。
+# passive client(carla_cosim_3cosim.py)で world.tick せず psim の CARLA に追従 → 壊さない。
+# active 版(docker-compose.cosim-odaiba.yml, carla_cosim_main.py)は2者用。3者はこちら。
+#
+# bind mount は commit 6d48579 の修正を image に反映させるため必須:
+#   - utils/carla/cosim.py   : passive 対応(wait_for_tick)
+#   - plugins/cosim.py       : (D) route 動的継ぎ足し(AV_left 解消)
+#   - envs/nade_with_av.py   : AV insertion fix
+# =============================================================================
+services:
+  terasim-3cosim:
+    image: terasim-service:cosim
+    container_name: terasim-3cosim
+    network_mode: host
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+      - CARLA_PORT=2013
+      - TERASIM_PORT=8100
+      - SCENARIO=/app/examples/scenarios/cosim_odaiba_osmlike.yaml
+    volumes:
+      - ./examples:/app/examples
+      - ./packages/terasim-service/terasim_service/utils/carla/cosim.py:/app/packages/terasim-service/terasim_service/utils/carla/cosim.py:ro
+      - ./packages/terasim-service/terasim_service/plugins/cosim.py:/app/packages/terasim-service/terasim_service/plugins/cosim.py:ro
+      - ./packages/terasim-nde-nade/terasim_nde_nade/envs/nade_with_av.py:/app/packages/terasim-nde-nade/terasim_nde_nade/envs/nade_with_av.py:ro
+    command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba.sh"]
+    restart: "no"
