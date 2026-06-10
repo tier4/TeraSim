@@ -310,7 +310,84 @@ CARLA_HOST=localhost CARLA_PORT=2010 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
 - この workflow では sync mode を使ってください
 - `CARLA_COSIM_ASYNC_MODE=1` を付けると、現状の `auto_run=false` 経路では co-sim が停止することがあります
 
-## 8. noVNC で AV を追尾する
+## 8. co-sim を安全に止める
+
+通常は、co-sim を起動した terminal で Ctrl-C を押すと Python client が
+`CarlaCosim.close()` を実行します。この正常終了では次が行われます。
+
+- CARLA の synchronous mode を解除
+- `fixed_delta_seconds` を解除
+- co-sim が作った CARLA actor を削除
+- TeraSim service に stop command を送信
+
+Ctrl-C で止まらない場合は、すぐに `docker rm -f` せず、別 terminal から
+TeraSim service に stop command を送ります。
+
+まず co-sim container と TeraSim port を取得します。
+
+```bash
+C=$(docker ps --filter ancestor=terasim-service:cosim --format '{{.Names}}' | head -1)
+PORT=$(docker exec "$C" bash -lc 'echo ${TERASIM_PORT:-8000}')
+echo "container=$C port=$PORT"
+```
+
+`simulation_id` は Redis から取得できます。
+
+```bash
+SIM_ID=$(docker exec "$C" python3 - <<'PY'
+import redis
+
+r = redis.Redis()
+simulation_ids = []
+for key in r.scan_iter("simulation:*:status"):
+    parts = key.decode().split(":")
+    if len(parts) >= 3:
+        simulation_ids.append(parts[1])
+
+print(simulation_ids[-1] if simulation_ids else "")
+PY
+)
+echo "simulation_id=$SIM_ID"
+```
+
+stop command を送ります。
+
+```bash
+curl -s -X POST "http://127.0.0.1:${PORT}/simulation_control/${SIM_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"stop"}'
+```
+
+この後、元の co-sim terminal が `Cleaning synchronization` や
+`Simulation complete` まで進めば成功です。
+
+それでも止まらない場合は、次善策として timeout 付きで container に SIGTERM を送ります。
+
+```bash
+docker stop -t 30 "$C"
+```
+
+最後の手段だけ `docker rm -f` を使います。
+
+```bash
+docker rm -f "$C"
+```
+
+強制停止後に CARLA 側の actor や sync 設定が残っているように見える場合は、
+CARLA noVNC container を再起動します。
+
+```bash
+docker compose -f docker-compose.carla-novnc.yml restart -t 30 carla_novnc
+```
+
+推奨順は次です。
+
+1. 元 terminal で Ctrl-C
+2. 別 terminal から TeraSim stop API
+3. `docker stop -t 30`
+4. 最後の手段として `docker rm -f`
+
+## 9. noVNC で AV を追尾する
 
 co-sim が動いたら、spectator を AV に追従させると確認しやすいです。
 
@@ -368,7 +445,7 @@ docker exec carla-novnc-test bash -lc "pkill -TERM -f 'python3.10 -' || true"
 docker exec carla-novnc-test bash -lc "pgrep -af 'python3.10 -' || true"
 ```
 
-## 9. CARLA 車両のかくつきを切り分ける
+## 10. CARLA 車両のかくつきを切り分ける
 
 CARLA の noVNC 画面で車両が前後に揺れて見える場合は、まず画面ではなく
 CARLA API 上の actor transform を記録します。co-sim は SUMO の各 tick の位置を
@@ -425,7 +502,7 @@ SUMO 側の軌跡、座標変換、または yaw の不連続を優先して見�
 `BACKWARD_THRESHOLD=-0.10` または `CARLA_COSIM_DIAG_BACKWARD_THRESHOLD=-0.10` のように
 閾値を下げてください。
 
-## 10. 終了理由を確認する
+## 11. 終了理由を確認する
 
 各 run の出力は次に入ります。
 
@@ -463,7 +540,7 @@ tail -n 20 "$BASE/run.log"
 curl -s http://127.0.0.1:<TERASIM_PORT>/simulation_result/<simulation_id> | python3 -m json.tool
 ```
 
-## 11. よくある詰まりどころ
+## 12. よくある詰まりどころ
 
 ### `Map '...' not found`
 
@@ -505,7 +582,7 @@ SUMO_TO_CARLA_OFFSET_Y=45335.1
 SUMO_TO_CARLA_OFFSET_Z=0.0
 ```
 
-## 12. まとめ
+## 13. まとめ
 
 今回の Odaiba packaged co-sim の最短ルートは次です。
 
