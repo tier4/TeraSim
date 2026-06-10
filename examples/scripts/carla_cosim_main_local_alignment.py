@@ -1388,11 +1388,16 @@ def main():
     if tick_profiler is not None:
         tick_profiler.install()
 
+    no_rendering_mode = _env_bool("CARLA_COSIM_NO_RENDERING_MODE", False)
+    if no_rendering_mode:
+        print("CARLA no_rendering_mode enabled")
+
     if not args.async_mode:
         for attempt in range(5):
             settings = carla_cosim.world.get_settings()
             settings.fixed_delta_seconds = args.step_length
             settings.synchronous_mode = True
+            settings.no_rendering_mode = no_rendering_mode
             carla_cosim.world.apply_settings(settings)
             time.sleep(1.0)
             current = carla_cosim.world.get_settings()
@@ -1415,6 +1420,7 @@ def main():
             time.sleep(0.5)
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
+            settings.no_rendering_mode = no_rendering_mode
             carla_cosim.world.apply_settings(settings)
             time.sleep(1.0)
         print("Running in async mode")
@@ -1434,6 +1440,14 @@ def main():
             actor_sync_profiler.close()
         if motion_diagnostics is not None:
             motion_diagnostics.close()
+        if no_rendering_mode:
+            try:
+                settings = carla_cosim.world.get_settings()
+                settings.no_rendering_mode = False
+                carla_cosim.world.apply_settings(settings)
+                print("CARLA no_rendering_mode disabled")
+            except Exception as exc:
+                print(f"Warning: failed to disable no_rendering_mode: {exc}")
         print("Cleaning synchronization")
         carla_cosim.close()
 
