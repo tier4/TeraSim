@@ -1,0 +1,109 @@
+# 可視化検証用(別枠タスク): SUMO GUI を TurboVNC :2 に出せるかの確認。
+# standalone_odaiba_nade.yaml ベース。変更点のみ:
+#   - net/cfg を実在する odaiba_osmlike に差し替え(maps/odaiba/ は欠損のため)
+#   - gui_flag: true      (sumo-gui を起動)
+#   - realtime_flag: true (GUI で交通流を実時間観察できるように)
+#   - warmup を短縮(検証で早く車を出すため)
+# 実行: USE_LIBSUMO=0 の環境で python3 /app/scripts/run_experiments_debug.py --config <this>
+simulation_module: "my_simulations"
+simulation_class: "CarSimulation"
+parameters:
+  num_cars: 100
+  simulation_time: 3600
+seed: 42
+
+simulation_type: "safetest_odaiba_standalone_gui"
+
+output:
+  dir: "/app/outputs"
+  name: "odaiba_osmlike_gui"
+  nth: "0_0"
+  aggregated_dir: "aggregated"
+
+environment:
+  module: "terasim_nde_nade.envs"
+  class: "NADE"
+  parameters:
+    vehicle_factory: "terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory"
+    info_extractor: "terasim.logger.infoextractor.InfoExtractor"
+    log_flag: true
+    warmup_time_lb: 10
+    warmup_time_ub: 12
+    run_time: 600
+
+    MOBIL_lc_flag: true
+    stochastic_acc_flag: false
+    sumo_net_file_path: "/app/examples/maps/odaiba_osmlike/odaiba_osmlike.net.xml"
+    sumo_cfg_file_path: "/app/examples/maps/odaiba_osmlike/odaiba_osmlike.sumocfg"
+    drive_rule: "righthand"
+
+    adversity_sampling_probability: 1.0
+    adversity_cfg:
+      vehicle:
+        intersection_cutin:
+          _target_: terasim_nde_nade.adversity.vehicles.lanechange_adversity.LanechangeAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_cutin"
+
+        intersection_rearend_leader:
+          _target_: terasim_nde_nade.adversity.vehicles.leader_adversity.LeaderAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_rearend"
+
+        intersection_rearend_follower:
+          _target_: terasim_nde_nade.adversity.vehicles.follower_adversity.FollowerAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_rearend_follower"
+
+        intersection_tfl:
+          _target_: terasim_nde_nade.adversity.vehicles.trafficrule_adversity.TrafficRuleAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_tfl"
+
+        intersection_headon:
+          _target_: terasim_nde_nade.adversity.vehicles.headon_adversity.HeadonAdversity
+          _convert_: 'all'
+          location: 'intersection'
+          ego_type: 'vehicle'
+          probability: 0.01
+          predicted_collision_type: "intersection_headon"
+
+      vulnerable_road_user:
+        jaywalking:
+          _target_: terasim_nde_nade.adversity.vru.jaywalking_adversity.JaywalkingAdversity
+          _convert_: 'all'
+          location: 'crosswalk'
+          ego_type: 'vulnerable_road_user'
+          probability: 0.01
+          predicted_collision_type: "intersection_jaywalking"
+
+simulator:
+  module: "terasim.simulator"
+  class: "Simulator"
+  parameters:
+    num_tries: 10
+    gui_flag: true
+    realtime_flag: true
+    sumo_output_file_types:
+      - "fcd_all"
+    traffic_scale: 1.0
+
+input:
+  sumo_net_file: "/app/examples/maps/odaiba_osmlike/odaiba_osmlike.net.xml"
+  sumo_config_file: "/app/examples/maps/odaiba_osmlike/odaiba_osmlike.sumocfg"
+
+logging:
+  levels:
+    - "INFO"
