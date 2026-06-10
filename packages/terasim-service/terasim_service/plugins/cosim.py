@@ -17,6 +17,7 @@ from terasim_nde_nade.adversity import ConstructionAdversity
 from .base import BasePlugin, DEFAULT_REDIS_CONFIG
 
 from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
+from ..utils.sumo_lane_geometry import reconstruct_position_from_lane_geometry
 
 
 def interpolate_by_distance(points, step):
@@ -186,6 +187,15 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "TeraSim co-sim state filter enabled: center=%s radius=%s",
                 self.state_filter_center_id,
                 self.state_filter_radius,
+            )
+
+        self.lane_relative_position_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_LANE_RELATIVE_POSITION", False
+        )
+        if self.lane_relative_position_enabled:
+            self.logger.info(
+                "TeraSim co-sim lane-relative reconstructed positions enabled "
+                "for filtered state vehicles"
             )
 
     @staticmethod
@@ -616,6 +626,35 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self.state_filter_error_logged = True
             return vehicle_ids, {}
 
+    def _populate_lane_relative_position(self, vehicle_id, vehicle_state):
+        if not self.lane_relative_position_enabled:
+            return
+
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        if not lane_id:
+            return
+        lane_position = traci.vehicle.getLanePosition(vehicle_id)
+        lateral_offset = traci.vehicle.getLateralLanePosition(vehicle_id)
+        lane_shape = traci.lane.getShape(lane_id)
+        reconstructed = reconstruct_position_from_lane_geometry(
+            lane_shape,
+            lane_position,
+            lateral_offset,
+            vehicle_state.z,
+        )
+
+        vehicle_state.lane_id = lane_id
+        vehicle_state.lane_position = lane_position
+        vehicle_state.lateral_offset = lateral_offset
+        if reconstructed is None:
+            return
+        (
+            vehicle_state.reconstructed_x,
+            vehicle_state.reconstructed_y,
+            vehicle_state.reconstructed_z,
+        ) = reconstructed
+        vehicle_state.reconstructed_position_valid = True
+
     def _write_simulation_state(self, simulator):
         """Write the current simulation state to Redis.
 
@@ -647,6 +686,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                 if position is None:
                     position = traci.vehicle.getPosition3D(vid)
                 vehicle_state.x, vehicle_state.y, vehicle_state.z = position
+                self._populate_lane_relative_position(vid, vehicle_state)
                 vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
                 vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
                 vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
