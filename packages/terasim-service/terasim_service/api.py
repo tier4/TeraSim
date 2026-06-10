@@ -329,12 +329,23 @@ async def get_simulation_status(
         if redis_status:
             running_simulations[simulation_id]["status"] = redis_status.decode("utf-8")
         
-        # Return a SimulationStatus compatible response
-        return {
+        # Return a SimulationStatus compatible response with optional co-sim tick metadata.
+        response = {
             "id": simulation_id,
             "status": running_simulations[simulation_id]["status"],
-            "progress": 0.0
+            "progress": 0.0,
         }
+        completed_sumo_time = redis_client.get(
+            f"simulation:{simulation_id}:completed_sumo_time"
+        )
+        if completed_sumo_time is not None:
+            response["completed_sumo_time"] = float(completed_sumo_time.decode("utf-8"))
+        completed_tick_count = redis_client.get(
+            f"simulation:{simulation_id}:completed_tick_count"
+        )
+        if completed_tick_count is not None:
+            response["completed_tick_count"] = int(completed_tick_count.decode("utf-8"))
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
