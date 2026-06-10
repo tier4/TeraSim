@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 import numpy as np
 import redis
@@ -164,6 +165,55 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.error_count = 0
         self.last_successful_operation = time.time()
 
+        self.idle_state_write_interval = self._parse_float_env(
+            "TERASIM_COSIM_IDLE_STATE_WRITE_INTERVAL", 0.5
+        )
+        self._last_idle_state_write_wall_time = 0.0
+
+        self.state_filter_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_STATE_FILTER", False
+        )
+        self.state_filter_center_id = os.getenv(
+            "TERASIM_COSIM_STATE_FILTER_CENTER_ID", "AV"
+        )
+        self.state_filter_radius = self._parse_optional_float(
+            os.getenv("TERASIM_COSIM_STATE_FILTER_RADIUS", "")
+        )
+        self.state_filter_missing_center_logged = False
+        self.state_filter_error_logged = False
+        if self.state_filter_enabled:
+            self.logger.info(
+                "TeraSim co-sim state filter enabled: center=%s radius=%s",
+                self.state_filter_center_id,
+                self.state_filter_radius,
+            )
+
+    @staticmethod
+    def _parse_float_env(name, default):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _parse_bool_env(name, default=False):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _parse_optional_float(value):
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _setup_logger(self, base_dir: str) -> logging.Logger:
         """Setup logger for the plugin.
 
@@ -309,10 +359,21 @@ class TeraSimCoSimPlugin(BasePlugin):
             self.controlled_agents_each_step.clear()
             self._handle_pending_agent_commands()
 
-            # Write current simulation state
-            state_write_success = self._write_simulation_state(simulator)
-            if not state_write_success:
-                return False
+            now = time.time()
+            should_write_idle_state = (
+                self.auto_run
+                or self._last_idle_state_write_wall_time <= 0.0
+                or (
+                    self.idle_state_write_interval > 0.0
+                    and now - self._last_idle_state_write_wall_time
+                    >= self.idle_state_write_interval
+                )
+            )
+            if should_write_idle_state:
+                state_write_success = self._write_simulation_state(simulator)
+                if not state_write_success:
+                    return False
+                self._last_idle_state_write_wall_time = now
 
             if self._is_simulation_paused():
                 time.sleep(0.1)  # Wait while paused
@@ -340,10 +401,31 @@ class TeraSimCoSimPlugin(BasePlugin):
         Returns:
             bool: True if the simulation step was successful, False otherwise.
         """
+        state_write_success = self._write_simulation_state(simulator)
+        if not state_write_success:
+            return False
+
+        completed_sumo_time = traci.simulation.getTime()
+        self.redis_client.set(
+            f"simulation:{self.simulation_uuid}:completed_sumo_time",
+            completed_sumo_time,
+            ex=self.key_expiry,
+        )
+        completed_tick_count = self.redis_client.incr(
+            f"simulation:{self.simulation_uuid}:completed_tick_count"
+        )
+        self.redis_client.expire(
+            f"simulation:{self.simulation_uuid}:completed_tick_count", self.key_expiry
+        )
         self.redis_client.set(
             f"simulation:{self.simulation_uuid}:status", "ticked", ex=self.key_expiry
         )
-        self.logger.info("Simulation step finished!")
+        self._last_idle_state_write_wall_time = time.time()
+        self.logger.info(
+            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s",
+            completed_sumo_time,
+            completed_tick_count,
+        )
         return True
 
     def function_before_env_stop(self, simulator: Simulator, ctx):
@@ -492,6 +574,48 @@ class TeraSimCoSimPlugin(BasePlugin):
         vehicle_ids = [id for id in all_ids if id not in vru_ids and id not in construction_ids]
         return vehicle_ids, vru_ids, construction_ids
 
+    def _filter_vehicle_ids_for_state(self, vehicle_ids):
+        if (
+            not self.state_filter_enabled
+            or self.state_filter_radius is None
+            or self.state_filter_radius <= 0
+        ):
+            return vehicle_ids, {}
+
+        try:
+            if self.state_filter_center_id not in vehicle_ids:
+                if not self.state_filter_missing_center_logged:
+                    self.logger.warning(
+                        "State filter center vehicle %s is missing; writing all vehicles",
+                        self.state_filter_center_id,
+                    )
+                    self.state_filter_missing_center_logged = True
+                return vehicle_ids, {}
+
+            center_position = traci.vehicle.getPosition3D(self.state_filter_center_id)
+            position_cache = {self.state_filter_center_id: center_position}
+            radius_sq = self.state_filter_radius * self.state_filter_radius
+            filtered_vehicle_ids = []
+            for vid in vehicle_ids:
+                if vid in position_cache:
+                    position = position_cache[vid]
+                else:
+                    position = traci.vehicle.getPosition3D(vid)
+                    position_cache[vid] = position
+                dx = position[0] - center_position[0]
+                dy = position[1] - center_position[1]
+                if vid == self.state_filter_center_id or dx * dx + dy * dy <= radius_sq:
+                    filtered_vehicle_ids.append(vid)
+
+            self.state_filter_missing_center_logged = False
+            self.state_filter_error_logged = False
+            return filtered_vehicle_ids, position_cache
+        except Exception as e:
+            if not self.state_filter_error_logged:
+                self.logger.warning("State filter failed; writing all vehicles: %s", e)
+                self.state_filter_error_logged = True
+            return vehicle_ids, {}
+
     def _write_simulation_state(self, simulator):
         """Write the current simulation state to Redis.
 
@@ -506,6 +630,9 @@ class TeraSimCoSimPlugin(BasePlugin):
 
             # Get all interested agent IDs
             vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
+            vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
+                vehicle_ids
+            )
             simulation_state.agent_count = {
                 "vehicle": len(vehicle_ids),
                 "vru": len(vru_ids),
@@ -516,7 +643,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             vehicles = {}
             for vid in vehicle_ids:
                 vehicle_state = AgentStateSimplified()
-                vehicle_state.x,vehicle_state.y,vehicle_state.z = traci.vehicle.getPosition3D(vid)
+                position = vehicle_position_cache.get(vid)
+                if position is None:
+                    position = traci.vehicle.getPosition3D(vid)
+                vehicle_state.x, vehicle_state.y, vehicle_state.z = position
                 vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
                 vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
                 vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
