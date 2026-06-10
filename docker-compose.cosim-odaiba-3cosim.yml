@@ -1,0 +1,39 @@
+# docker compose -f docker-compose.cosim-odaiba-3cosim.yml up -d
+# =============================================================================
+# TeraSim side of the Odaiba 3-way co-simulation
+# (Autoware planning simulator + CARLA + TeraSim): inject SUMO background
+# traffic into a CARLA server that is owned and ticked by an external client
+# (e.g. an Autoware bridge running in synchronous mode).
+# =============================================================================
+# Prerequisites: a CARLA server on :2013 with the Odaiba OpenDRIVE map loaded
+# and the external tick master attached, plus a host redis on localhost:6379.
+# This stack uses the passive client (carla_cosim_3cosim.py): it never calls
+# world.tick() and never reloads the world, so it does not disturb the CARLA
+# owner. Do not use the active 2-way compose (docker-compose.cosim-odaiba.yml)
+# in this setup -- it reloads the CARLA world.
+#
+# The bind mounts below let the container run the sources from this checkout
+# without rebuilding the image:
+#   - utils/carla/cosim.py : passive sync (follow ticks instead of driving them)
+#   - plugins/cosim.py     : AV route keep-alive on dense maps
+#   - envs/nade_with_av.py : AV insertion transient guard
+# =============================================================================
+services:
+  terasim-3cosim:
+    image: terasim-service:cosim
+    container_name: terasim-3cosim
+    network_mode: host
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+      - CARLA_PORT=2013
+      - TERASIM_PORT=8100
+      - SCENARIO=/app/examples/scenarios/cosim_odaiba_osmlike.yaml
+    volumes:
+      - ./examples:/app/examples
+      - ./packages/terasim-service/terasim_service/utils/carla/cosim.py:/app/packages/terasim-service/terasim_service/utils/carla/cosim.py:ro
+      - ./packages/terasim-service/terasim_service/plugins/cosim.py:/app/packages/terasim-service/terasim_service/plugins/cosim.py:ro
+      - ./packages/terasim-nde-nade/terasim_nde_nade/envs/nade_with_av.py:/app/packages/terasim-nde-nade/terasim_nde_nade/envs/nade_with_av.py:ro
+    command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba.sh"]
+    restart: "no"
