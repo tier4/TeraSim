@@ -599,8 +599,9 @@ class NADEWithAV(NADE):
             env_command_information (dict): Command information from the environment.
             env_observation (dict): Observation from the environment.
         """
-        if AV_ID in traci.vehicle.getIDList() and AV_ID in env_command_information[AgentType.VEHICLE]:
-            AV_control_command_cache = env_command_information[AgentType.VEHICLE][AV_ID]["command_cache"]
+        vehicle_command_information = env_command_information.get(AgentType.VEHICLE, {})
+        if AV_ID in traci.vehicle.getIDList() and AV_ID in vehicle_command_information:
+            AV_control_command_cache = vehicle_command_information[AV_ID]["command_cache"]
             (
                 nade_control_commands,
                 env_command_information,
@@ -632,12 +633,10 @@ class NADEWithAV(NADE):
             self.execute_control_commands(nade_control_commands)
             self.record_step_data(env_command_information)
         elif AV_ID in traci.vehicle.getIDList():
-            # 3-cosim guard: AV exists in SUMO but its command info is not ready this
-            # step (the AV context subscription only returns results the step after it
-            # is set up at insertion). Skip NADE decision/control for this step instead
-            # of crashing with KeyError('AV'); background traffic keeps flowing on SUMO
-            # car-following. Resolves the transient at AV insertion in cosim mode.
-            logger.warning("AV in traci but not yet in env_command_information; skipping NADE step this tick (transient at AV insertion)")
+            logger.warning(
+                "AV is in TraCI but not yet in env_command_information; "
+                "skipping NADE step this tick."
+            )
 
     def calculate_total_distance(self):
         """Calculate the total distance traveled by the AV.
