@@ -447,7 +447,7 @@ def carla_to_sumo(carla_location, carla_rotation, shape, offset):
     sumo_yaw = -1 * carla_rotation.yaw
     sumo_location = [
         carla_location.x + math.cos(math.radians(sumo_yaw)) * shape[0] / 2.0 - offset[0],
-        -carla_location.y + math.sin(math.radians(sumo_yaw)) * shape[0] / 2.0 - offset[1],
+        -carla_location.y + math.sin(math.radians(sumo_yaw)) * shape[0] / 2.0 + offset[1],
         carla_location.z - offset[2],
     ]
     sumo_rotation = [
