@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libgl1 \
     libglib2.0-0 \
+    # fonts needed by sumo-gui (without fontconfig it dies at startup with
+    # "Fontconfig error: Cannot load default config file")
+    fontconfig \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
