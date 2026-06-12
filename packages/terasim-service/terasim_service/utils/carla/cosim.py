@@ -129,6 +129,38 @@ class CarlaCosim(object):
                 f"radius={self.actor_filter_radius:.1f}m.",
                 flush=True,
             )
+        # Time pegging (passive mode): compare the CARLA and SUMO clocks every loop
+        # and run 0..N steps so both advance at the same rate. Without it the loop
+        # runs exactly one step per loop, so SUMO time falls behind whenever a loop
+        # spans more than one CARLA tick (and would run ahead in the opposite case).
+        self.time_pegging_enabled = _env_bool("CARLA_COSIM_TIME_PEGGING", False)
+        self.pegging_max_steps = max(
+            1, int(_env_float("CARLA_COSIM_PEGGING_MAX_STEPS", 2))
+        )
+        # Status polling: the plain loop sleeps 50ms between checks, which alone
+        # caps the loop at ~10-15Hz. Pegging defaults to 5ms; standalone override
+        # via CARLA_COSIM_STATUS_POLL_INTERVAL.
+        self.status_poll_interval = _env_float(
+            "CARLA_COSIM_STATUS_POLL_INTERVAL",
+            0.005 if self.time_pegging_enabled else 0.05,
+        )
+        self._peg_last_carla_time = None
+        self._peg_carla_t0 = None
+        self._peg_sumo_t0 = None
+        self._peg_loops = 0
+        self._peg_step_hist = {}
+        self._peg_lag_extremes = [0.0, 0.0]
+        if self.time_pegging_enabled:
+            fixed_delta = self.world.get_settings().fixed_delta_seconds
+            # fixed_delta is owned by the external tick owner (sync mode); fall back
+            # to step_length when unset (async server), where pegging is moot anyway.
+            self.pegging_tick_delta = fixed_delta if fixed_delta else self.step_length
+            print(
+                "CARLA co-sim time pegging enabled: "
+                f"step_length={self.step_length}s carla_tick={self.pegging_tick_delta}s "
+                f"max_steps={self.pegging_max_steps} poll={self.status_poll_interval * 1000:.0f}ms.",
+                flush=True,
+            )
 
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
@@ -371,16 +403,9 @@ class CarlaCosim(object):
             if elapsed < self.step_length:
                 time.sleep(self.step_length - elapsed)
         else:
-            while True:
-                terasim_status_http_response = get_terasim_status(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
-                terasim_status = terasim_status_http_response.get("status", None)
-                if terasim_status == "ticked" or terasim_status == "wait_for_tick":
-                    break
-                elif terasim_status is None:
-                    print("TeraSim status is None. Exiting...")
-                    return False
-                else:
-                    time.sleep(0.05)
+            status_response = self._wait_terasim_ready()
+            if status_response is None:
+                return False
 
             if self.control_av:
                 self.sync_carla_av_to_cosim()
@@ -389,15 +414,103 @@ class CarlaCosim(object):
             if not getattr(self.args, "skip_tls", False):
                 self.sync_cosim_tls_to_carla()
 
-            tick_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+            passive = getattr(self.args, "passive_tick", False)
+            if passive and self.time_pegging_enabled:
+                if not self._run_pegged_steps(status_response):
+                    return False
+            else:
+                self._request_step()
 
             # 3-cosim passive mode: the psim bridge (autoware_carla_interface) is the sole
             # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
             # psim tick so the two clients stay synchronized on one CARLA server.
-            if getattr(self.args, "passive_tick", False):
-                self.world.wait_for_tick()
+            if passive:
+                snapshot = self.world.wait_for_tick()
+                # Snapshot of the tick we just synchronized on: this is the CARLA clock
+                # reading used by time pegging (no extra RPC; get_snapshot() right after
+                # connect can return an empty frame, the wait_for_tick result cannot).
+                self._peg_last_carla_time = snapshot.timestamp.elapsed_seconds
             else:
                 self.world.tick()
+        return True
+
+    def _wait_terasim_ready(self):
+        """Poll the service until the previous step has finished.
+
+        Returns the /simulation_status JSON (carries completed_sumo_time once the
+        first step finished), or None when the simulation is gone (run_time reached
+        or service stopped) so the caller can exit the loop.
+        """
+        while True:
+            response = get_terasim_status(
+                self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"]
+            )
+            status = response.get("status", None)
+            if status == "ticked" or status == "wait_for_tick":
+                return response
+            if status is None:
+                print("TeraSim status is None. Exiting...")
+                return None
+            time.sleep(self.status_poll_interval)
+
+    def _request_step(self):
+        """Ask the service to run one simulation step (asynchronous, returns at once)."""
+        tick_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+
+    def _run_pegged_steps(self, status_response):
+        """Time pegging: run 0..max_steps TeraSim steps to keep the SUMO clock on CARLA's.
+
+        lag = how far SUMO time is behind CARLA time (both relative to the anchor taken
+        on the first fully-observed loop). Request the step count that lands SUMO next
+        to the *upcoming* tick boundary: n = round((lag + tick_delta) / step_length),
+        clamped to [0, max_steps]. n == 0 skips stepping (SUMO ahead, e.g. step_length >
+        tick_delta); n >= 2 catches up after a loop that spanned several ticks.
+
+        Intermediate steps must wait for completion before the next request: the service
+        consumes the redis "control" key one command at a time, so a second request
+        while one is pending would overwrite (silently drop) it. Only the last request
+        is left running concurrently with wait_for_tick(), same as the plain loop.
+
+        Returns False when the simulation disappeared mid-catch-up.
+        """
+        sumo_time = status_response.get("completed_sumo_time")
+        carla_time = self._peg_last_carla_time
+        if sumo_time is None or carla_time is None:
+            # Not observable yet: no step has completed (status "wait_for_tick") or no
+            # wait_for_tick() snapshot taken. Behave like the plain loop: one step.
+            self._request_step()
+            return True
+        if self._peg_carla_t0 is None:
+            # Anchor both clocks on the first loop where both are observable; from
+            # here on they should advance by the same amount of simulated seconds.
+            self._peg_carla_t0 = carla_time
+            self._peg_sumo_t0 = sumo_time
+        lag = (carla_time - self._peg_carla_t0) - (sumo_time - self._peg_sumo_t0)
+        n = int(math.floor((lag + self.pegging_tick_delta) / self.step_length + 0.5 + 1e-9))
+        n = max(0, min(n, self.pegging_max_steps))
+
+        for i in range(n):
+            if i > 0 and self._wait_terasim_ready() is None:
+                return False
+            self._request_step()
+
+        # Lightweight observability: histogram of steps-per-loop + lag extremes,
+        # one line every 200 loops. A monotonically growing lag means the step
+        # computation cannot keep up (pegging cannot fix that; reduce load).
+        self._peg_step_hist[n] = self._peg_step_hist.get(n, 0) + 1
+        self._peg_lag_extremes[0] = min(self._peg_lag_extremes[0], lag)
+        self._peg_lag_extremes[1] = max(self._peg_lag_extremes[1], lag)
+        self._peg_loops += 1
+        if self._peg_loops % 200 == 0:
+            hist = " ".join(f"{k}x{v}" for k, v in sorted(self._peg_step_hist.items()))
+            print(
+                f"time pegging: loops={self._peg_loops} steps/loop {{{hist}}} "
+                f"lag now={lag:+.3f}s min={self._peg_lag_extremes[0]:+.3f}s "
+                f"max={self._peg_lag_extremes[1]:+.3f}s",
+                flush=True,
+            )
+            self._peg_step_hist = {}
+            self._peg_lag_extremes = [lag, lag]
         return True
 
     def sync_carla_av_to_cosim(self):
