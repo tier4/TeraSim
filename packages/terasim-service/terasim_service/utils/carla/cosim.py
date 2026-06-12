@@ -150,6 +150,9 @@ class CarlaCosim(object):
         self._peg_loops = 0
         self._peg_step_hist = {}
         self._peg_lag_extremes = [0.0, 0.0]
+        self._av_actor_id = None
+        self._av_lookup_fallbacks = 0
+        self._requested_steps = 0
         if self.time_pegging_enabled:
             fixed_delta = self.world.get_settings().fixed_delta_seconds
             # fixed_delta is owned by the external tick owner (sync mode); fall back
@@ -403,7 +406,12 @@ class CarlaCosim(object):
             if elapsed < self.step_length:
                 time.sleep(self.step_length - elapsed)
         else:
-            status_response = self._wait_terasim_ready()
+            # With pegging, wait on the exact step count (see _wait_requested_steps_done
+            # for why the status-only check is not safe at 5ms polling).
+            if self.time_pegging_enabled and getattr(self.args, "passive_tick", False):
+                status_response = self._wait_requested_steps_done()
+            else:
+                status_response = self._wait_terasim_ready()
             if status_response is None:
                 return False
 
@@ -456,6 +464,37 @@ class CarlaCosim(object):
     def _request_step(self):
         """Ask the service to run one simulation step (asynchronous, returns at once)."""
         tick_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+        self._requested_steps += 1
+
+    def _wait_requested_steps_done(self):
+        """Wait until completed_tick_count catches up with every step we requested.
+
+        The plain status check ("ticked") cannot tell WHICH step finished: polling
+        right after a request can read the previous step's "ticked" and pass early.
+        The plain loop never hits this (it polls 50ms after the request, and the
+        service flips to "running" within 5ms), but the pegging loop polls within
+        a few ms. An early pass desynchronizes the AV-command/step pairing, so one
+        step eventually runs without a fresh moveToXY; SUMO then moves the AV with
+        its own car-following model for that step, and an AV parked (via keepRoute=0)
+        near the end of an off-route edge crosses arrivalPos -> silently removed ->
+        env stops with "AV_left" (observed on odaiba within 2 sim-s of insertion).
+        Counting completed steps against requested steps is exact and also prevents
+        a second tick request from overwriting an unconsumed one in redis.
+        """
+        while True:
+            response = get_terasim_status(
+                self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"]
+            )
+            status = response.get("status", None)
+            if status is None:
+                print("TeraSim status is None. Exiting...")
+                return None
+            if (
+                response.get("completed_tick_count", 0) >= self._requested_steps
+                and status in ("ticked", "wait_for_tick")
+            ):
+                return response
+            time.sleep(self.status_poll_interval)
 
     def _run_pegged_steps(self, status_response):
         """Time pegging: run 0..max_steps TeraSim steps to keep the SUMO clock on CARLA's.
@@ -490,8 +529,17 @@ class CarlaCosim(object):
         n = max(0, min(n, self.pegging_max_steps))
 
         for i in range(n):
-            if i > 0 and self._wait_terasim_ready() is None:
-                return False
+            if i > 0:
+                if self._wait_requested_steps_done() is None:
+                    return False
+                # Keep the plain loop's per-step invariant: every step is preceded
+                # by a fresh AV pose command. When the catch-up step skipped it, the
+                # SUMO AV fell back to its own car-following motion for that step and
+                # could exit the route (env stops with "AV_left"; observed on odaiba
+                # within 0.2 sim-s of AV insertion). CARLA actor mirroring stays
+                # once-per-loop: only the SUMO-side invariant matters here.
+                if self.control_av:
+                    self.sync_carla_av_to_cosim()
             self._request_step()
 
         # Lightweight observability: histogram of steps-per-loop + lag extremes,
@@ -521,8 +569,22 @@ class CarlaCosim(object):
         vehicle_status, carla_id = get_actor_id_from_attribute(self.world, av_role)
 
         if not vehicle_status:
-            print(f"AV source actor (role={av_role}) not found in Carla simulation.")
-            return
+            # CARLA get_actors() transiently returns an empty list under load (known
+            # 0.9.16 sync-mode quirk). Skipping the command would leave the SUMO AV
+            # uncontrolled for one step; with moveToXY keepRoute=0 having mapped it
+            # onto an off-route edge, SUMO then runs its normal arrival check and
+            # removes the AV ("AV_left" env stop). Fall back to the last known id.
+            if self._av_actor_id is None:
+                print(f"AV source actor (role={av_role}) not found in Carla simulation.")
+                return
+            carla_id = self._av_actor_id
+            self._av_lookup_fallbacks += 1
+            if self._av_lookup_fallbacks in (1, 100, 1000):
+                print(
+                    f"AV actor lookup empty; reusing cached id {carla_id} "
+                    f"(fallback #{self._av_lookup_fallbacks}).",
+                    flush=True,
+                )
 
         if not self.av_shape:
             # av_shape is filled by initialize_av in sync_cosim_actor_to_carla, which runs later in
@@ -530,6 +592,10 @@ class CarlaCosim(object):
             return
 
         AV = self.world.get_actor(carla_id)
+        if AV is None:
+            print(f"AV actor {carla_id} not resolvable this loop; command skipped.", flush=True)
+            return
+        self._av_actor_id = carla_id
         transform = AV.get_transform()
         draw_text(self.world, transform.location + carla.Location(z=2.5), AV_SUMO_ID)
         # draw_point(
