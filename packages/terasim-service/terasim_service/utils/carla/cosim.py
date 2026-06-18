@@ -35,6 +35,8 @@ from ..service import (
 
 AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
+OPENDRIVE_TLS_LINK_PREFIX = "od:"
+ODAIBA_OPENDRIVE_SIGNAL_ID_OFFSET = 2_000_000
 
 
 def _env_float(name, default):
@@ -76,6 +78,9 @@ class CarlaCosim(object):
         for traffic_light in self.traffic_lights:
             traffic_light.set_state(carla.TrafficLightState.Off)
             traffic_light.freeze(True)
+        self.opendrive_traffic_lights = self._build_opendrive_traffic_light_map(
+            self.traffic_lights
+        )
 
         self.control_av = args.control_av
         self.initialize_av = False
@@ -180,6 +185,67 @@ class CarlaCosim(object):
         except Exception as e:
             print(f"Warning: Could not read config for net file path: {e}")
             return None
+
+    @staticmethod
+    def _opendrive_traffic_light_id_aliases(opendrive_id):
+        opendrive_id = str(opendrive_id).strip()
+        if not opendrive_id:
+            return []
+
+        aliases = [opendrive_id]
+        if opendrive_id.isdigit():
+            numeric_id = int(opendrive_id)
+            if numeric_id >= ODAIBA_OPENDRIVE_SIGNAL_ID_OFFSET:
+                aliases.append(str(numeric_id - ODAIBA_OPENDRIVE_SIGNAL_ID_OFFSET))
+        return aliases
+
+    @staticmethod
+    def _build_opendrive_traffic_light_map(traffic_lights):
+        opendrive_traffic_lights = {}
+        for traffic_light in traffic_lights:
+            get_opendrive_id = getattr(traffic_light, "get_opendrive_id", None)
+            if not callable(get_opendrive_id):
+                continue
+
+            try:
+                opendrive_id = get_opendrive_id()
+            except Exception as e:
+                print(
+                    f"Warning: Could not read OpenDRIVE id for CARLA traffic light "
+                    f"{getattr(traffic_light, 'id', '<unknown>')}: {e}",
+                    flush=True,
+                )
+                continue
+
+            if opendrive_id is None or str(opendrive_id) == "":
+                continue
+            for opendrive_id_alias in CarlaCosim._opendrive_traffic_light_id_aliases(
+                opendrive_id
+            ):
+                opendrive_traffic_lights[opendrive_id_alias] = traffic_light
+        return opendrive_traffic_lights
+
+    def _resolve_traffic_light_actor(self, link_signal_id):
+        link_signal_id = str(link_signal_id).strip()
+        if not link_signal_id:
+            return None, "empty linkSignalID"
+
+        if link_signal_id.startswith(OPENDRIVE_TLS_LINK_PREFIX):
+            opendrive_id = link_signal_id[len(OPENDRIVE_TLS_LINK_PREFIX) :].strip()
+            light_actor = self.opendrive_traffic_lights.get(opendrive_id)
+            return light_actor, f"OpenDRIVE signal id {opendrive_id}"
+
+        try:
+            actor_id = int(link_signal_id)
+        except ValueError:
+            return None, f"invalid linkSignalID {link_signal_id!r}"
+
+        light_actor = self.world.get_actor(actor_id)
+        if light_actor:
+            return light_actor, f"CARLA actor id {actor_id}"
+
+        light_actor = self.opendrive_traffic_lights.get(str(actor_id))
+        return light_actor, f"OpenDRIVE signal id {actor_id}"
 
     @staticmethod
     def _parse_xodr_origin(xodr_proj):
@@ -489,13 +555,18 @@ class CarlaCosim(object):
                     continue
                 carla_landmark_ids = carla_landmark_ids.split(" ")
                 for landmark_id in carla_landmark_ids:
-                    light_id = int(landmark_id)
-                    light_actor = self.world.get_actor(light_id)
+                    light_actor, light_description = self._resolve_traffic_light_actor(
+                        landmark_id
+                    )
                     if not light_actor:
-                        print(f"Traffic light with ID {light_id} not found in CARLA.")
+                        print(f"Traffic light with {light_description} not found in CARLA.")
                         continue
                     if not hasattr(light_actor, 'set_state'):
-                        print(f"Actor {light_id} is not a traffic light ({light_actor.type_id}), skipping.")
+                        print(
+                            f"Actor {getattr(light_actor, 'id', '<unknown>')} is not a "
+                            f"traffic light ({getattr(light_actor, 'type_id', '<unknown>')}), "
+                            "skipping."
+                        )
                         continue
 
                     light_state = sumo_tls[i]

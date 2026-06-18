@@ -9,7 +9,7 @@
 
 ```text
 examples/maps/odaiba_ll2/
-  export_odaibatest5_294096eb1-dirty.tar.gz
+  tlmappings/odaiba_tl_mapping_294096eb1-dirty.tar.gz
   network.net.xml
 ```
 
@@ -19,11 +19,21 @@ SUMO net を別ファイル名で試す場合も同じディレクトリに置�
 この packaged-map 方式では、`.xodr` は co-sim 実行に必須ではありません。
 CARLA 側は package を import して `load_world()` で地図を開きます。
 
+今回の信号同期では、同じ `tlmappings/` にある次の mapping も使います。
+
+- `tlmappings/signal_id_mapping.json`
+- `tlmappings/odaiba_tl_mapping_294096eb1-dirty.mapping.json`
+
+TeraSim 起動時には、これらから `linkSignalID:{linkIndex}` を注入した SUMO net を
+`/tmp/terasim-odaiba-tls/` に生成します。`tlmappings/network.net.xml` は mapping 作成元の
+actual SUMO net ですが、現時点の runtime 同期生成では `odaiba_osmlike_network3.net.xml` を
+target net として使います。
+
 詳しい noVNC のみの説明は [private_carla_novnc.md](private_carla_novnc.md) を参照してください。
 
 ## 1. 事前に分かっていること
 
-- CARLA 側の map 名は `odaibatest5`
+- CARLA 側の map 名は `odaiba_tl_mapping`
 - SUMO 側の既定は `examples/maps/odaiba_ll2/network.net.xml`
 - 別の SUMO net を使う場合は `SUMO_NET_FILE=examples/maps/odaiba_ll2/<file>.net.xml` で切り替える
 - Odaiba の OpenDRIVE 変換では次の offset を使っている
@@ -119,7 +129,7 @@ package を CARLA container の `Import` ディレクトリへ入れて import �
 ```bash
 cd /home/h-kawai/TeraSim
 
-PKG=examples/maps/odaiba_ll2/export_odaibatest5_294096eb1-dirty.tar.gz
+PKG=examples/maps/odaiba_ll2/tlmappings/odaiba_tl_mapping_294096eb1-dirty.tar.gz
 C=carla-novnc-test
 
 docker exec -u root $C bash -lc 'mkdir -p /workspace/Import && chown -R carla:carla /workspace/Import'
@@ -143,7 +153,7 @@ PY
 '
 ```
 
-`odaibatest5` が見えたら OK です。
+`odaiba_tl_mapping` が見えたら OK です。
 
 必要なら明示的に load して確認します。
 
@@ -154,7 +164,7 @@ python3.10 - <<PY
 import carla
 client = carla.Client("127.0.0.1", 2000)
 client.set_timeout(60.0)
-world = client.load_world("odaibatest5")
+world = client.load_world("odaiba_tl_mapping")
 print("loaded:", world.get_map().name)
 PY
 '
@@ -224,7 +234,7 @@ co-sim 起動時にまとめて指定することもできます。
 cd /home/h-kawai/TeraSim
 PERIOD=0.5 \
 AV_ROUTE_FILE=examples/maps/odaiba_ll2/teleport-mirai-loop.rou.xml \
-CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -246,7 +256,7 @@ CARLA_PACKAGE_MAP_NAME=odaibatest5 \
 
 ```bash
 cd /home/h-kawai/TeraSim
-CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -264,7 +274,7 @@ SUMO の寄り具合を変えたい場合は `SUMO_GUI_TRACK_ZOOM` を調整し�
 
 ```bash
 cd /home/h-kawai/TeraSim
-SUMO_GUI_TRACK_ZOOM=650 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+SUMO_GUI_TRACK_ZOOM=650 CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -274,7 +284,7 @@ SUMO GUI が不要な場合だけ、次のように無効化します。
 
 ```bash
 cd /home/h-kawai/TeraSim
-ENABLE_SUMO_GUI=0 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+ENABLE_SUMO_GUI=0 CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -282,7 +292,7 @@ port が衝突する場合は `SUMO_NOVNC_PORT` と `SUMO_VNC_PORT` を変更し
 
 ```bash
 cd /home/h-kawai/TeraSim
-SUMO_NOVNC_PORT=6094 SUMO_VNC_PORT=5914 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+SUMO_NOVNC_PORT=6094 SUMO_VNC_PORT=5914 CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -300,7 +310,7 @@ host 側の公開 port `2010` を明示的に使いたい場合だけ、こち�
 
 ```bash
 cd /home/h-kawai/TeraSim
-CARLA_HOST=localhost CARLA_PORT=2010 CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+CARLA_HOST=localhost CARLA_PORT=2010 CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -484,7 +494,7 @@ actual transform を同時に記録したい場合は、co-sim 起動時に内�
 cd /home/h-kawai/TeraSim
 CARLA_COSIM_MOTION_LOG=/app/outputs/odaiba_carla_set_transform_motion.csv \
 CARLA_COSIM_DIAG_ROLE_NAMES=AV \
-CARLA_PACKAGE_MAP_NAME=odaibatest5 \
+CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping \
 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh
 ```
 
@@ -591,5 +601,5 @@ SUMO_TO_CARLA_OFFSET_Z=0.0
 3. `docker compose -f docker-compose.carla-novnc.yml up -d`
 4. package を `ImportAssets.sh` で import
 5. `SUMO_NET_FILE=examples/maps/odaiba_ll2/network_0505.net.xml ./scripts/prepare_odaiba_ll2_sumo_artifacts.sh`
-6. `CARLA_PACKAGE_MAP_NAME=odaibatest5 ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh`
+6. `CARLA_PACKAGE_MAP_NAME=odaiba_tl_mapping ./scripts/run_cosim_odaiba_ll2_packaged_generated.sh`
 7. `./scripts/follow_carla_actor_novnc.sh`

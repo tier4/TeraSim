@@ -1,9 +1,22 @@
 #!/bin/bash
 set -e
 
-CARLA_PORT=${CARLA_PORT:-2010}
-CARLA_HOST=${CARLA_HOST:-localhost}
-CARLA_PACKAGE_MAP_NAME=${CARLA_PACKAGE_MAP_NAME:-odaibatest5}
+CARLA_CONTAINER_NAME=${CARLA_CONTAINER_NAME:-carla-novnc-test}
+if [ -z "${CARLA_HOST:-}" ]; then
+    CARLA_HOST="${CARLA_CONTAINER_NAME}"
+fi
+if [ -z "${CARLA_PORT:-}" ]; then
+    if [ "${CARLA_HOST}" = "${CARLA_CONTAINER_NAME}" ]; then
+        CARLA_PORT=2000
+    else
+        CARLA_PORT=2010
+    fi
+fi
+if [ -z "${CARLA_DOCKER_NETWORK:-}" ]; then
+    CARLA_DOCKER_NETWORK=$(docker inspect -f '{{range $name, $net := .NetworkSettings.Networks}}{{$name}}{{end}}' "${CARLA_CONTAINER_NAME}" 2>/dev/null || true)
+fi
+CARLA_DOCKER_NETWORK=${CARLA_DOCKER_NETWORK:-terasim_default}
+CARLA_PACKAGE_MAP_NAME=${CARLA_PACKAGE_MAP_NAME:-odaiba_tl_mapping}
 TERASIM_CONFIG=${TERASIM_CONFIG:-/app/examples/scenarios/cosim_odaiba_ll2.yaml}
 TERASIM_PORT=${TERASIM_PORT:-8000}
 ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
@@ -45,7 +58,17 @@ CARLA_COSIM_ACTOR_PROFILE_PRINT_EVERY=${CARLA_COSIM_ACTOR_PROFILE_PRINT_EVERY:-2
 CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS=${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS:-5.0}
 CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS=${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS:-30.0}
 CARLA_COSIM_SPAWN_Z_CLEARANCE=${CARLA_COSIM_SPAWN_Z_CLEARANCE:-5.0}
+ENABLE_ODAIBA_TLS_SYNC=${ENABLE_ODAIBA_TLS_SYNC:-1}
+ODAIBA_TLS_MIN_COVERAGE=${ODAIBA_TLS_MIN_COVERAGE:-0.90}
+ODAIBA_TLS_OUTPUT_DIR=${ODAIBA_TLS_OUTPUT_DIR:-/tmp/terasim-odaiba-tls}
+ODAIBA_TLS_MAPPING_DIR=${ODAIBA_TLS_MAPPING_DIR:-/app/examples/maps/odaiba_ll2/tlmappings}
+ODAIBA_TLS_TARGET_NET=${ODAIBA_TLS_TARGET_NET:-/app/examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml}
+ODAIBA_TLS_SOURCE_SUMOCFG=${ODAIBA_TLS_SOURCE_SUMOCFG:-/app/examples/maps/odaiba_ll2/simulation.sumocfg}
+ODAIBA_TLS_SIGNAL_ID_MAPPING=${ODAIBA_TLS_SIGNAL_ID_MAPPING:-${ODAIBA_TLS_MAPPING_DIR}/signal_id_mapping.json}
+ODAIBA_TLS_OPENDRIVE_MAPPING=${ODAIBA_TLS_OPENDRIVE_MAPPING:-}
 
+echo "Using CARLA container: ${CARLA_CONTAINER_NAME}"
+echo "Using CARLA Docker network: ${CARLA_DOCKER_NETWORK}"
 echo "Using CARLA host: ${CARLA_HOST}"
 echo "Using CARLA port: ${CARLA_PORT}"
 echo "Using packaged CARLA map: ${CARLA_PACKAGE_MAP_NAME}"
@@ -90,6 +113,8 @@ fi
 echo "Using CARLA co-sim spawn failure backoff: ${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS}s"
 echo "Using CARLA co-sim spawn failure max backoff: ${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS}s"
 echo "Using CARLA co-sim spawn Z clearance: ${CARLA_COSIM_SPAWN_Z_CLEARANCE}m"
+echo "Using Odaiba TLS sync: ${ENABLE_ODAIBA_TLS_SYNC}"
+echo "Using Odaiba TLS min coverage: ${ODAIBA_TLS_MIN_COVERAGE}"
 if [ "${CARLA_COSIM_ACTOR_FILTER}" != "0" ]; then
     echo "Using CARLA co-sim actor filter: center=${CARLA_COSIM_ACTOR_FILTER_CENTER_ID} radius=${CARLA_COSIM_ACTOR_FILTER_RADIUS}m"
 fi
@@ -98,7 +123,12 @@ if [ "${CARLA_COSIM_USE_LANE_RELATIVE_POSITION}" != "0" ]; then
     echo "Using TeraSim co-sim lane-relative state generation: ${TERASIM_COSIM_LANE_RELATIVE_POSITION}"
 fi
 
-exec docker compose -f docker-compose.cosim-odaiba-ll2.yml run --rm \
+export TERASIM_PORT
+export SUMO_NOVNC_PORT
+export SUMO_VNC_PORT
+export CARLA_DOCKER_NETWORK
+
+exec docker compose -f docker-compose.cosim-odaiba-ll2.yml run --rm --service-ports \
     -e CARLA_HOST="${CARLA_HOST}" \
     -e CARLA_PORT="${CARLA_PORT}" \
     -e CARLA_PACKAGE_MAP_NAME="${CARLA_PACKAGE_MAP_NAME}" \
@@ -145,5 +175,13 @@ exec docker compose -f docker-compose.cosim-odaiba-ll2.yml run --rm \
     -e CARLA_COSIM_SPAWN_Z_CLEARANCE="${CARLA_COSIM_SPAWN_Z_CLEARANCE}" \
     -e CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS="${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS}" \
     -e CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS="${CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS}" \
+    -e ENABLE_ODAIBA_TLS_SYNC="${ENABLE_ODAIBA_TLS_SYNC}" \
+    -e ODAIBA_TLS_MIN_COVERAGE="${ODAIBA_TLS_MIN_COVERAGE}" \
+    -e ODAIBA_TLS_OUTPUT_DIR="${ODAIBA_TLS_OUTPUT_DIR}" \
+    -e ODAIBA_TLS_MAPPING_DIR="${ODAIBA_TLS_MAPPING_DIR}" \
+    -e ODAIBA_TLS_TARGET_NET="${ODAIBA_TLS_TARGET_NET}" \
+    -e ODAIBA_TLS_SOURCE_SUMOCFG="${ODAIBA_TLS_SOURCE_SUMOCFG}" \
+    -e ODAIBA_TLS_SIGNAL_ID_MAPPING="${ODAIBA_TLS_SIGNAL_ID_MAPPING}" \
+    -e ODAIBA_TLS_OPENDRIVE_MAPPING="${ODAIBA_TLS_OPENDRIVE_MAPPING}" \
     terasim_service \
     /bin/bash /app/examples/scripts/main_cosim_odaiba_ll2_packaged.sh

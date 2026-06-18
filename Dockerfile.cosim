@@ -64,6 +64,7 @@ RUN cd packages/terasim-nde-nade && \
     python setup.py build_ext --inplace
 
 COPY scripts/start_sumo_novnc.sh /usr/local/bin/start_sumo_novnc.sh
+COPY scripts/generate_tls_linksignal_params.py scripts/generate_tls_linksignal_params.py
 RUN chmod +x /usr/local/bin/start_sumo_novnc.sh
 
 # Set SUMO_HOME to eclipse-sumo pip package location

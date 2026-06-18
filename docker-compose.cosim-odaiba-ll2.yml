@@ -7,7 +7,12 @@ services:
       dockerfile: Dockerfile.cosim
     image: terasim-service:cosim
     container_name: terasim_service_odaiba_ll2
-    network_mode: host
+    networks:
+      - carla_network
+    ports:
+      - "${TERASIM_PORT:-8000}:${TERASIM_PORT:-8000}"
+      - "${SUMO_NOVNC_PORT:-6093}:${SUMO_NOVNC_PORT:-6093}"
+      - "${SUMO_VNC_PORT:-5913}:${SUMO_VNC_PORT:-5913}"
     environment:
       - PYTHONUNBUFFERED=1
       - ENVIRONMENT=development
@@ -17,3 +22,8 @@ services:
       - ./examples:/app/examples
       - ./outputs:/app/outputs
     command: ["/bin/bash", "/app/examples/scripts/main_cosim_odaiba_ll2.sh"]
+
+networks:
+  carla_network:
+    external: true
+    name: ${CARLA_DOCKER_NETWORK:-terasim_default}

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.carla-novnc
-    image: carla-novnc:0.9.16
+    image: ${CARLA_NOVNC_IMAGE:-carla-novnc:0.9.16}
     container_name: carla-novnc-test
     runtime: nvidia
     privileged: true

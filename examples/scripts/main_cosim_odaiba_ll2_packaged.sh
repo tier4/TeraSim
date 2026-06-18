@@ -3,7 +3,7 @@ set -e
 umask 000
 
 MAX_SIM_TIME=${MAX_SIM_TIME:-300}
-CARLA_PACKAGE_MAP_NAME=${CARLA_PACKAGE_MAP_NAME:-odaibatest5}
+CARLA_PACKAGE_MAP_NAME=${CARLA_PACKAGE_MAP_NAME:-odaiba_tl_mapping}
 TERASIM_CONFIG=${TERASIM_CONFIG:-/app/examples/scenarios/cosim_odaiba_ll2.yaml}
 CARLA_MAP_LOAD_TIMEOUT=${CARLA_MAP_LOAD_TIMEOUT:-600}
 CARLA_HOST=${CARLA_HOST:-localhost}
@@ -19,6 +19,15 @@ VNC_PASSWORD=${VNC_PASSWORD:-headless}
 SUMO_GUI_TRACK_VEHICLE=${SUMO_GUI_TRACK_VEHICLE:-AV}
 SUMO_GUI_TRACK_ZOOM=${SUMO_GUI_TRACK_ZOOM:-3000}
 TERASIM_UVICORN_ACCESS_LOG=${TERASIM_UVICORN_ACCESS_LOG:-1}
+TERASIM_REPO_ROOT=${TERASIM_REPO_ROOT:-/app}
+ENABLE_ODAIBA_TLS_SYNC=${ENABLE_ODAIBA_TLS_SYNC:-1}
+ODAIBA_TLS_MIN_COVERAGE=${ODAIBA_TLS_MIN_COVERAGE:-0.90}
+ODAIBA_TLS_OUTPUT_DIR=${ODAIBA_TLS_OUTPUT_DIR:-/tmp/terasim-odaiba-tls}
+ODAIBA_TLS_MAPPING_DIR=${ODAIBA_TLS_MAPPING_DIR:-/app/examples/maps/odaiba_ll2/tlmappings}
+ODAIBA_TLS_TARGET_NET=${ODAIBA_TLS_TARGET_NET:-/app/examples/maps/odaiba_ll2/odaiba_osmlike_network3.net.xml}
+ODAIBA_TLS_SOURCE_SUMOCFG=${ODAIBA_TLS_SOURCE_SUMOCFG:-/app/examples/maps/odaiba_ll2/simulation.sumocfg}
+ODAIBA_TLS_SIGNAL_ID_MAPPING=${ODAIBA_TLS_SIGNAL_ID_MAPPING:-${ODAIBA_TLS_MAPPING_DIR}/signal_id_mapping.json}
+ODAIBA_TLS_OPENDRIVE_MAPPING=${ODAIBA_TLS_OPENDRIVE_MAPPING:-}
 
 ORIGINAL_TERASIM_CONFIG=${TERASIM_CONFIG}
 RUNTIME_TERASIM_CONFIG=""
@@ -60,10 +69,11 @@ echo "  TeraSim port: ${TERASIM_PORT}"
 echo "  SUMO GUI/noVNC: ${ENABLE_SUMO_GUI}"
 echo "  SUMO GUI track vehicle: ${SUMO_GUI_TRACK_VEHICLE}"
 echo "  SUMO GUI track zoom: ${SUMO_GUI_TRACK_ZOOM}"
+echo "  Odaiba TLS sync: ${ENABLE_ODAIBA_TLS_SYNC}"
 echo "=========================================="
 
 if is_enabled "${ENABLE_SUMO_GUI}"; then
-    echo "[1/6] Starting SUMO noVNC desktop..."
+    echo "[1/7] Starting SUMO noVNC desktop..."
     export SUMO_DISPLAY
     export SUMO_NOVNC_PORT
     export SUMO_VNC_PORT
@@ -109,10 +119,79 @@ PY
     echo "  Runtime TeraSim config: ${TERASIM_CONFIG}"
     echo "  Source TeraSim config: ${ORIGINAL_TERASIM_CONFIG}"
 else
-    echo "[1/6] SUMO GUI/noVNC disabled."
+    echo "[1/7] SUMO GUI/noVNC disabled."
 fi
 
-echo "[2/6] Starting Redis server..."
+if is_enabled "${ENABLE_ODAIBA_TLS_SYNC}"; then
+    echo "[2/7] Generating Odaiba TLS linkSignalID mapping..."
+    mkdir -p "${ODAIBA_TLS_OUTPUT_DIR}"
+
+    if [ -z "${ODAIBA_TLS_OPENDRIVE_MAPPING}" ]; then
+        shopt -s nullglob
+        ODAIBA_TLS_MAPPING_CANDIDATES=("${ODAIBA_TLS_MAPPING_DIR}"/odaiba_tl_mapping_*.mapping.json)
+        shopt -u nullglob
+        if [ "${#ODAIBA_TLS_MAPPING_CANDIDATES[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one odaiba_tl_mapping_*.mapping.json in ${ODAIBA_TLS_MAPPING_DIR}."
+            printf '  - %s\n' "${ODAIBA_TLS_MAPPING_CANDIDATES[@]}"
+            exit 1
+        fi
+        ODAIBA_TLS_OPENDRIVE_MAPPING="${ODAIBA_TLS_MAPPING_CANDIDATES[0]}"
+    fi
+
+    ODAIBA_TLS_OUTPUT_NET="${ODAIBA_TLS_OUTPUT_DIR}/odaiba_osmlike_network3_tls_synced.net.xml"
+    ODAIBA_TLS_OUTPUT_SUMOCFG="${ODAIBA_TLS_OUTPUT_DIR}/simulation_tls_synced.sumocfg"
+    ODAIBA_TLS_REPORT="${ODAIBA_TLS_OUTPUT_DIR}/tls_linksignal_report.json"
+
+    python3 "${TERASIM_REPO_ROOT}/scripts/generate_tls_linksignal_params.py" \
+        --sumo-net "${ODAIBA_TLS_TARGET_NET}" \
+        --signal-id-mapping "${ODAIBA_TLS_SIGNAL_ID_MAPPING}" \
+        --opendrive-lanelet-mapping "${ODAIBA_TLS_OPENDRIVE_MAPPING}" \
+        --sumocfg "${ODAIBA_TLS_SOURCE_SUMOCFG}" \
+        --output-net "${ODAIBA_TLS_OUTPUT_NET}" \
+        --output-sumocfg "${ODAIBA_TLS_OUTPUT_SUMOCFG}" \
+        --report "${ODAIBA_TLS_REPORT}" \
+        --min-coverage "${ODAIBA_TLS_MIN_COVERAGE}"
+
+    RUNTIME_TERASIM_CONFIG="/tmp/$(basename "${TERASIM_CONFIG}" .yaml)_tls_sync_$$.yaml"
+    TERASIM_CONFIG_SOURCE="${TERASIM_CONFIG}" \
+    TERASIM_RUNTIME_CONFIG="${RUNTIME_TERASIM_CONFIG}" \
+    RUNTIME_SUMO_NET_FILE="${ODAIBA_TLS_OUTPUT_NET}" \
+    RUNTIME_SUMO_CONFIG_FILE="${ODAIBA_TLS_OUTPUT_SUMOCFG}" \
+    python3 - <<'PY'
+import os
+import yaml
+
+source_path = os.environ["TERASIM_CONFIG_SOURCE"]
+runtime_path = os.environ["TERASIM_RUNTIME_CONFIG"]
+sumo_net_file = os.environ["RUNTIME_SUMO_NET_FILE"]
+sumo_config_file = os.environ["RUNTIME_SUMO_CONFIG_FILE"]
+
+with open(source_path, "r") as file:
+    config = yaml.safe_load(file)
+
+environment = config.setdefault("environment", {})
+env_parameters = environment.setdefault("parameters", {})
+env_parameters["sumo_net_file_path"] = sumo_net_file
+env_parameters["sumo_cfg_file_path"] = sumo_config_file
+
+input_config = config.setdefault("input", {})
+input_config["sumo_net_file"] = sumo_net_file
+input_config["sumo_config_file"] = sumo_config_file
+
+with open(runtime_path, "w") as file:
+    yaml.safe_dump(config, file, sort_keys=False)
+PY
+    TERASIM_CONFIG="${RUNTIME_TERASIM_CONFIG}"
+
+    echo "  TLS synced SUMO net: ${ODAIBA_TLS_OUTPUT_NET}"
+    echo "  TLS synced SUMO config: ${ODAIBA_TLS_OUTPUT_SUMOCFG}"
+    echo "  TLS coverage report: ${ODAIBA_TLS_REPORT}"
+    echo "  Runtime TeraSim config: ${TERASIM_CONFIG}"
+else
+    echo "[2/7] Odaiba TLS linkSignalID generation disabled."
+fi
+
+echo "[3/7] Starting Redis server..."
 if python3 -c "
 import socket
 s = socket.socket()
@@ -126,7 +205,7 @@ else
     redis-server &
 fi
 
-echo "[3/6] Starting TeraSim server..."
+echo "[4/7] Starting TeraSim server..."
 UVICORN_ARGS=(terasim_service.api:app --host 0.0.0.0 --port "${TERASIM_PORT}")
 if ! is_enabled "${TERASIM_UVICORN_ACCESS_LOG}"; then
     UVICORN_ARGS+=(--no-access-log)
@@ -134,10 +213,10 @@ fi
 uvicorn "${UVICORN_ARGS[@]}" &
 TERASIM_PID=$!
 
-echo "[4/6] Waiting 30s for TeraSim server to be ready..."
+echo "[5/7] Waiting 30s for TeraSim server to be ready..."
 sleep 30
 
-echo "[5/6] Checking CARLA server..."
+echo "[6/7] Checking CARLA server..."
 echo "------------------------------------------"
 
 python3 -u -c "
@@ -150,7 +229,7 @@ print(f'CARLA server version: {version}')
 
 echo "  CARLA is available."
 
-echo "[6/6] Loading packaged CARLA map and starting co-simulation..."
+echo "[7/7] Loading packaged CARLA map and starting co-simulation..."
 echo "------------------------------------------"
 
 python3 -u -c "
@@ -161,7 +240,7 @@ import time
 
 carla_host = os.environ.get('CARLA_HOST', '${CARLA_HOST:-localhost}')
 carla_port = int(os.environ.get('CARLA_PORT', '${CARLA_PORT:-2010}'))
-requested_map = os.environ.get('CARLA_PACKAGE_MAP_NAME', 'odaibatest5')
+requested_map = os.environ.get('CARLA_PACKAGE_MAP_NAME', 'odaiba_tl_mapping')
 load_timeout = float(os.environ.get('CARLA_MAP_LOAD_TIMEOUT', '${CARLA_MAP_LOAD_TIMEOUT:-600}'))
 
 def map_matches(loaded_name, requested_name):
