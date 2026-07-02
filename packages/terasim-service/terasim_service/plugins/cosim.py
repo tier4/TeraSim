@@ -655,6 +655,182 @@ class TeraSimCoSimPlugin(BasePlugin):
         ) = reconstructed
         vehicle_state.reconstructed_position_valid = True
 
+    def _build_simulation_state(self, simulator):
+        """Collect the current simulation state from SUMO into a SimulationState.
+
+        Pure state construction (no Redis/network I/O); raises on TraCI errors.
+        Shared by the Redis-backed `_write_simulation_state` and the direct
+        (gRPC) plugin, which returns the result over its Tick/GetState RPC
+        instead of writing to Redis.
+        """
+        simulation_state = SimulationState()
+        simulation_state.simulation_time = traci.simulation.getTime()
+
+        # Get all interested agent IDs
+        vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
+        vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
+            vehicle_ids
+        )
+        simulation_state.agent_count = {
+            "vehicle": len(vehicle_ids),
+            "vru": len(vru_ids),
+            "construction": len(construction_ids),
+        }
+
+        # Add vehicle states
+        vehicles = {}
+        for vid in vehicle_ids:
+            vehicle_state = AgentStateSimplified()
+            position = vehicle_position_cache.get(vid)
+            if position is None:
+                position = traci.vehicle.getPosition3D(vid)
+            vehicle_state.x, vehicle_state.y, vehicle_state.z = position
+            self._populate_lane_relative_position(vid, vehicle_state)
+            vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
+            vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
+            vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
+            vehicle_state.speed = traci.vehicle.getSpeed(vid)
+            vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
+            vehicle_state.length = traci.vehicle.getLength(vid)
+            vehicle_state.width = traci.vehicle.getWidth(vid)
+            vehicle_state.height = traci.vehicle.getHeight(vid)
+            vehicle_state.type = traci.vehicle.getTypeID(vid)
+            vehicle_state.angular_velocity = 0.0  # rad/s
+            now_time = simulation_state.simulation_time
+            now_orientation = vehicle_state.orientation
+            last_orientation, last_time = self.last_orientations.get(vid, (now_orientation, now_time))
+            dt = now_time - last_time
+            if dt > 0:
+                dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
+                vehicle_state.angular_velocity = dtheta / dt
+            else:
+                vehicle_state.angular_velocity = 0.0
+            self.last_orientations[vid] = (now_orientation, now_time)
+            vehicles[vid] = vehicle_state
+
+        simulation_state.agent_details["vehicle"] = vehicles
+
+        # Add VRU states
+        # Get current vehicle and person lists to determine actual object type
+        current_vehicle_list = traci.vehicle.getIDList()
+        current_person_list = traci.person.getIDList()
+
+        vrus = {}
+        for vru_id in vru_ids:
+            vru_state = AgentStateSimplified()
+
+            # Determine if this VRU is actually a vehicle or person
+            if vru_id in current_vehicle_list:
+                # VRU is actually a vehicle (disguised as pedestrian)
+                vru_state.x, vru_state.y, vru_state.z = traci.vehicle.getPosition3D(vru_id)
+                vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
+                vru_state.sumo_angle = traci.vehicle.getAngle(vru_id)
+                vru_state.speed = traci.vehicle.getSpeed(vru_id)
+                vru_state.acceleration = traci.vehicle.getAcceleration(vru_id)
+                vru_state.length = traci.vehicle.getLength(vru_id)
+                vru_state.width = traci.vehicle.getWidth(vru_id)
+                vru_state.height = traci.vehicle.getHeight(vru_id)
+                vru_state.type = traci.vehicle.getTypeID(vru_id)
+                vru_state.angular_velocity = 0.0  # rad/s
+                now_time = simulation_state.simulation_time
+                now_orientation = np.radians((90 - vru_state.sumo_angle) % 360)
+                last_orientation, last_time = self.last_orientations.get(vru_id, (now_orientation, now_time))
+                dt = now_time - last_time
+                if dt > 0:
+                    dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
+                    vru_state.angular_velocity = dtheta / dt
+                else:
+                    vru_state.angular_velocity = 0.0
+                self.last_orientations[vru_id] = (now_orientation, now_time)
+                vru_state.orientation = now_orientation
+            elif vru_id in current_person_list:
+                # VRU is actually a person
+                vru_state.x, vru_state.y, vru_state.z = traci.person.getPosition3D(vru_id)
+                vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
+                vru_state.sumo_angle = traci.person.getAngle(vru_id)
+                vru_state.speed = traci.person.getSpeed(vru_id)
+                vru_state.acceleration = traci.person.getAcceleration(vru_id) if hasattr(traci.person, 'getAcceleration') else 0.0
+                vru_state.length = traci.person.getLength(vru_id)
+                vru_state.width = traci.person.getWidth(vru_id)
+                vru_state.height = traci.person.getHeight(vru_id)
+                vru_state.type = traci.person.getTypeID(vru_id)
+                vru_state.angular_velocity = 0.0  # rad/s
+                vru_state.orientation = np.radians((90 - vru_state.sumo_angle) % 360)
+            else:
+                # VRU ID not found in either list, log warning and skip
+                self.logger.warning(f"VRU ID {vru_id} not found in vehicle or person lists, skipping")
+                continue
+
+            vrus[vru_id] = vru_state
+
+        simulation_state.agent_details["vru"] = vrus
+
+        # Add construction objects
+        construction_objects = {}
+        for cid in construction_ids:
+            construction_state = AgentStateSimplified()
+            construction_state.x, construction_state.y, construction_state.z = traci.vehicle.getPosition3D(cid)
+            construction_state.lon, construction_state.lat = traci.simulation.convertGeo(construction_state.x, construction_state.y)
+            construction_state.sumo_angle = traci.vehicle.getAngle(cid)
+            construction_state.orientation = np.radians((90 - construction_state.sumo_angle) % 360)
+            construction_state.speed = traci.vehicle.getSpeed(cid)
+            construction_state.acceleration = traci.vehicle.getAcceleration(cid)
+            construction_state.length = traci.vehicle.getLength(cid)
+            construction_state.width = traci.vehicle.getWidth(cid)
+            construction_state.height = traci.vehicle.getHeight(cid)
+            construction_state.type = traci.vehicle.getTypeID(cid)
+            construction_state.angular_velocity = 0.0
+            construction_objects[cid] = construction_state
+
+        simulation_state.construction_objects = construction_objects
+
+        # Add traffic light states
+        traffic_lights = {}
+        for tl_id in traci.trafficlight.getIDList():
+            sumo_signal = SUMOSignal()
+            sumo_signal.x, sumo_signal.y = 0,0
+            sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
+            tls_information = {
+                "programs": {}
+            }
+            tls = self.simulator.sumo_net.getTLS(tl_id)
+            programs = tls.getPrograms()
+            for program_id, program in programs.items():
+                # Get the program parameters
+                program_parameters = program.getParams()
+                tls_information["programs"][program_id] = {
+                    "parameters": program_parameters
+                }
+            sumo_signal.information = json.dumps(tls_information)
+            traffic_lights[tl_id] = sumo_signal
+
+        simulation_state.traffic_light_details = traffic_lights
+
+        # Add construction zone shapes
+        if self.construction_zone_shapes is None and simulator.env.static_adversity is not None and simulator.env.static_adversity.adversities is not None:
+            self.construction_zone_shapes = {}
+            for adversity in simulator.env.static_adversity.adversities:
+                if isinstance(adversity, ConstructionAdversity):
+                    lane_shape = traci.lane.getShape(adversity._lane_id)
+                    if lane_shape: # convert to list of lists
+                        lane_shape = interpolate_by_distance(lane_shape, 2.0)
+                        lane_index = int(adversity._lane_id.split("_")[-1])
+                        edge_id = traci.lane.getEdgeID(adversity._lane_id)
+                        if lane_index == 0:
+                            # From right to left
+                            direction = 1
+                        elif lane_index == traci.edge.getLaneNumber(edge_id) - 1:
+                            # From left to right
+                            direction = -1
+                        else:
+                            # Middle lane, no construction zone
+                            continue
+                        construction_zone_shape = generate_construction_zone_shape(lane_shape, traci.lane.getWidth(adversity._lane_id), direction)
+                        self.construction_zone_shapes[adversity._lane_id] = construction_zone_shape
+
+        simulation_state.construction_zone_details = self.construction_zone_shapes
+        return simulation_state
+
     def _write_simulation_state(self, simulator):
         """Write the current simulation state to Redis.
 
@@ -664,172 +840,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         if not self._check_simulation_status():
             return False
         try:
-            simulation_state = SimulationState()
-            simulation_state.simulation_time = traci.simulation.getTime()
-
-            # Get all interested agent IDs
-            vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
-            vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
-                vehicle_ids
-            )
-            simulation_state.agent_count = {
-                "vehicle": len(vehicle_ids),
-                "vru": len(vru_ids),
-                "construction": len(construction_ids),
-            }
-
-            # Add vehicle states
-            vehicles = {}
-            for vid in vehicle_ids:
-                vehicle_state = AgentStateSimplified()
-                position = vehicle_position_cache.get(vid)
-                if position is None:
-                    position = traci.vehicle.getPosition3D(vid)
-                vehicle_state.x, vehicle_state.y, vehicle_state.z = position
-                self._populate_lane_relative_position(vid, vehicle_state)
-                vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
-                vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
-                vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
-                vehicle_state.speed = traci.vehicle.getSpeed(vid)
-                vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
-                vehicle_state.length = traci.vehicle.getLength(vid)
-                vehicle_state.width = traci.vehicle.getWidth(vid)
-                vehicle_state.height = traci.vehicle.getHeight(vid)
-                vehicle_state.type = traci.vehicle.getTypeID(vid)
-                vehicle_state.angular_velocity = 0.0  # rad/s
-                now_time = simulation_state.simulation_time
-                now_orientation = vehicle_state.orientation
-                last_orientation, last_time = self.last_orientations.get(vid, (now_orientation, now_time))
-                dt = now_time - last_time
-                if dt > 0:
-                    dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
-                    vehicle_state.angular_velocity = dtheta / dt
-                else:
-                    vehicle_state.angular_velocity = 0.0
-                self.last_orientations[vid] = (now_orientation, now_time)
-                vehicles[vid] = vehicle_state
-
-            simulation_state.agent_details["vehicle"] = vehicles
-
-            # Add VRU states
-            # Get current vehicle and person lists to determine actual object type
-            current_vehicle_list = traci.vehicle.getIDList()
-            current_person_list = traci.person.getIDList()
-            
-            vrus = {}
-            for vru_id in vru_ids:
-                vru_state = AgentStateSimplified()
-                
-                # Determine if this VRU is actually a vehicle or person
-                if vru_id in current_vehicle_list:
-                    # VRU is actually a vehicle (disguised as pedestrian)
-                    vru_state.x, vru_state.y, vru_state.z = traci.vehicle.getPosition3D(vru_id)
-                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
-                    vru_state.sumo_angle = traci.vehicle.getAngle(vru_id)
-                    vru_state.speed = traci.vehicle.getSpeed(vru_id)
-                    vru_state.acceleration = traci.vehicle.getAcceleration(vru_id)
-                    vru_state.length = traci.vehicle.getLength(vru_id)
-                    vru_state.width = traci.vehicle.getWidth(vru_id)
-                    vru_state.height = traci.vehicle.getHeight(vru_id)
-                    vru_state.type = traci.vehicle.getTypeID(vru_id)
-                    vru_state.angular_velocity = 0.0  # rad/s
-                    now_time = simulation_state.simulation_time
-                    now_orientation = np.radians((90 - vru_state.sumo_angle) % 360)
-                    last_orientation, last_time = self.last_orientations.get(vru_id, (now_orientation, now_time))
-                    dt = now_time - last_time
-                    if dt > 0:
-                        dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
-                        vru_state.angular_velocity = dtheta / dt
-                    else:
-                        vru_state.angular_velocity = 0.0
-                    self.last_orientations[vru_id] = (now_orientation, now_time)
-                    vru_state.orientation = now_orientation
-                elif vru_id in current_person_list:
-                    # VRU is actually a person
-                    vru_state.x, vru_state.y, vru_state.z = traci.person.getPosition3D(vru_id)
-                    vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
-                    vru_state.sumo_angle = traci.person.getAngle(vru_id)
-                    vru_state.speed = traci.person.getSpeed(vru_id)
-                    vru_state.acceleration = traci.person.getAcceleration(vru_id) if hasattr(traci.person, 'getAcceleration') else 0.0
-                    vru_state.length = traci.person.getLength(vru_id)
-                    vru_state.width = traci.person.getWidth(vru_id)
-                    vru_state.height = traci.person.getHeight(vru_id)
-                    vru_state.type = traci.person.getTypeID(vru_id)
-                    vru_state.angular_velocity = 0.0  # rad/s
-                    vru_state.orientation = np.radians((90 - vru_state.sumo_angle) % 360)
-                else:
-                    # VRU ID not found in either list, log warning and skip
-                    self.logger.warning(f"VRU ID {vru_id} not found in vehicle or person lists, skipping")
-                    continue
-                    
-                vrus[vru_id] = vru_state
-
-            simulation_state.agent_details["vru"] = vrus
-
-            # Add construction objects
-            construction_objects = {}
-            for cid in construction_ids:
-                construction_state = AgentStateSimplified()
-                construction_state.x, construction_state.y, construction_state.z = traci.vehicle.getPosition3D(cid)
-                construction_state.lon, construction_state.lat = traci.simulation.convertGeo(construction_state.x, construction_state.y)
-                construction_state.sumo_angle = traci.vehicle.getAngle(cid)
-                construction_state.orientation = np.radians((90 - construction_state.sumo_angle) % 360)
-                construction_state.speed = traci.vehicle.getSpeed(cid)
-                construction_state.acceleration = traci.vehicle.getAcceleration(cid)
-                construction_state.length = traci.vehicle.getLength(cid)
-                construction_state.width = traci.vehicle.getWidth(cid)
-                construction_state.height = traci.vehicle.getHeight(cid)
-                construction_state.type = traci.vehicle.getTypeID(cid)
-                construction_state.angular_velocity = 0.0
-                construction_objects[cid] = construction_state
-                
-            simulation_state.construction_objects = construction_objects
-
-            # Add traffic light states
-            traffic_lights = {}
-            for tl_id in traci.trafficlight.getIDList():
-                sumo_signal = SUMOSignal()
-                sumo_signal.x, sumo_signal.y = 0,0
-                sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
-                tls_information = {
-                    "programs": {}
-                }
-                tls = self.simulator.sumo_net.getTLS(tl_id)
-                programs = tls.getPrograms()
-                for program_id, program in programs.items():
-                    # Get the program parameters
-                    program_parameters = program.getParams()
-                    tls_information["programs"][program_id] = {
-                        "parameters": program_parameters
-                    }
-                sumo_signal.information = json.dumps(tls_information)
-                traffic_lights[tl_id] = sumo_signal
-
-            simulation_state.traffic_light_details = traffic_lights
-
-            # Add construction zone shapes
-            if self.construction_zone_shapes is None and simulator.env.static_adversity is not None and simulator.env.static_adversity.adversities is not None:
-                self.construction_zone_shapes = {}
-                for adversity in simulator.env.static_adversity.adversities:
-                    if isinstance(adversity, ConstructionAdversity):
-                        lane_shape = traci.lane.getShape(adversity._lane_id)
-                        if lane_shape: # convert to list of lists
-                            lane_shape = interpolate_by_distance(lane_shape, 2.0)
-                            lane_index = int(adversity._lane_id.split("_")[-1])
-                            edge_id = traci.lane.getEdgeID(adversity._lane_id)
-                            if lane_index == 0:
-                                # From right to left
-                                direction = 1
-                            elif lane_index == traci.edge.getLaneNumber(edge_id) - 1:
-                                # From left to right
-                                direction = -1
-                            else:
-                                # Middle lane, no construction zone
-                                continue
-                            construction_zone_shape = generate_construction_zone_shape(lane_shape, traci.lane.getWidth(adversity._lane_id), direction)
-                            self.construction_zone_shapes[adversity._lane_id] = construction_zone_shape
-
-            simulation_state.construction_zone_details = self.construction_zone_shapes
+            simulation_state = self._build_simulation_state(simulator)
             
             # Write to Redis with expiration
             self.redis_client.set(

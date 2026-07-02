@@ -38,6 +38,9 @@ def main():
                    help='leave empty: psim already loaded the world; do NOT reload')
     p.add_argument('--terasim_host', default='localhost')
     p.add_argument('--terasim_port', default=8000, type=int)
+    p.add_argument('--direct_addr', default=None,
+                   help='host:port of a terasim_service.run_direct gRPC server. When set, talk '
+                        'to TeraSim directly (no Redis/FastAPI); terasim_host/port are unused')
     p.add_argument('--terasim_config', required=True,
                    help='TeraSim scenario yaml (e.g. examples/scenarios/cosim_town01.yaml)')
     p.add_argument('--control_av', action='store_true',
