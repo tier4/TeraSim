@@ -924,6 +924,31 @@ class TeraSimCoSimPlugin(BasePlugin):
                             command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
                         )
 
+                        # 3-cosim fix (dense maps, e.g. Odaiba): right after moveToXY, append one
+                        # successor edge so the externally-driven AV's route is never a single
+                        # terminal edge. With keepRoute=0 a dense network can map the AV onto an
+                        # off-route edge, collapsing its route to that one edge; the AV then reaches
+                        # that edge's end, SUMO retires it as "arrived", NADE stops with
+                        # finish_reason "AV_left", and the cosim crashes. The AV's pose is driven
+                        # entirely by moveToXY (it mirrors the Autoware ego), so this 2-edge route is
+                        # only a decoy to keep it alive -- NOT a fixed plan, which is correct because
+                        # the Autoware ego chooses its path dynamically.
+                        if command.agent_id == "AV" and "AV" in traci.vehicle.getIDList():
+                            try:
+                                cur = traci.vehicle.getRoadID("AV")
+                                if cur and not cur.startswith(":"):  # skip junction-internal edges
+                                    nxt = ""
+                                    for lk in traci.lane.getLinks(traci.vehicle.getLaneID("AV")):
+                                        if lk and lk[0]:
+                                            e = traci.lane.getEdgeID(lk[0])
+                                            if e and not e.startswith(":"):
+                                                nxt = e
+                                                break
+                                    if nxt:
+                                        traci.vehicle.setRoute("AV", [cur, nxt])
+                            except Exception:
+                                pass
+
                         if "speed" in command.data:
                             traci.vehicle.setPreviousSpeed(command.agent_id, command.data["speed"])
                     else:  # VRU type
