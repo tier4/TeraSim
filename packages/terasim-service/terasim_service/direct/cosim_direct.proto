@@ -1,0 +1,55 @@
+// Direct (Redis/HTTP-free) synchronization between TeraSimCoSimDirectPlugin
+// (gRPC server, running inside the TeraSim process) and CarlaCosim (client).
+//
+// Replaces the Redis + FastAPI relay of the original co-sim stack:
+//   one Tick RPC = deliver this step's agent commands, run exactly one SUMO
+//   step, and return the post-step simulation state. No polling anywhere.
+//
+// Payloads (state_json / data_json) reuse the existing pydantic JSON schemas
+// (SimulationState / AgentCommand) unchanged, so both transports stay
+// byte-compatible while the relay is being removed. Structuring them into
+// protobuf messages is a possible later refinement.
+syntax = "proto3";
+
+package terasim.cosim.direct;
+
+service CosimDirect {
+  // Run exactly one SUMO step with the given agent commands applied before
+  // the step. Blocks until the step completes; returns the post-step state.
+  rpc Tick(TickRequest) returns (TickResponse);
+  // Return the latest state without advancing the simulation
+  // (used for startup readiness checks and measurements).
+  rpc GetState(GetStateRequest) returns (TickResponse);
+  // Ask the simulation to stop after the current loop iteration.
+  rpc Stop(StopRequest) returns (StopResponse);
+}
+
+message AgentCommand {
+  string agent_id = 1;
+  string agent_type = 2;    // "vehicle" | "vru"
+  string command_type = 3;  // e.g. "set_state"
+  string data_json = 4;     // command payload, same JSON schema as the Redis-era AgentCommand.data
+}
+
+message TickRequest {
+  repeated AgentCommand commands = 1;
+}
+
+message GetStateRequest {}
+
+message StopRequest {}
+
+message StopResponse {
+  bool ok = 1;
+}
+
+message TickResponse {
+  // initializing | wait_for_tick | running | ticked | finished | error
+  string status = 1;
+  // SimulationState.model_dump_json(); empty until the first state is built.
+  string state_json = 2;
+  // Measurement counters (same meaning as the Redis keys completed_sumo_time /
+  // completed_tick_count used by the baseline measurement protocol).
+  double completed_sumo_time = 3;
+  int64 completed_tick_count = 4;
+}

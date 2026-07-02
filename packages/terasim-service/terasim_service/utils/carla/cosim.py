@@ -139,17 +139,35 @@ class CarlaCosim(object):
 
         # self.sync_cosim_construction_zone_to_carla()
 
-        # start TeraSim
-        terasim_init_command = {
-            "config_file": args.terasim_config,
-            "auto_run": False,
-        }
-        self.terasim = start_terasim(args.terasim_host, args.terasim_port, terasim_init_command)
-        while True:
-            terasim_status = get_terasim_status(args.terasim_host, args.terasim_port, self.terasim["simulation_id"])
-            if terasim_status.get("status", None) == "wait_for_tick":
-                break
-            time.sleep(0.1)
+        # start / connect to TeraSim
+        self.direct_link = None
+        self._direct_tick_future = None
+        self._direct_prev_state = None
+        direct_addr = getattr(args, "direct_addr", None)
+        if direct_addr:
+            # Direct (gRPC) mode: no Redis/FastAPI. The TeraSim runner
+            # (terasim_service.run_direct) already owns the simulation; connect
+            # and wait until it reaches wait_for_tick.
+            from .direct_link import DirectLink, parse_state_json
+
+            self.direct_link = DirectLink(direct_addr)
+            # Seed the render pipeline with the initial (post-warmup) state so
+            # the first tick behaves like the polling path (AV shape init etc.).
+            self._direct_prev_state = parse_state_json(
+                self.direct_link.get_state().state_json
+            )
+            self.terasim = {"simulation_id": "direct"}
+        else:
+            terasim_init_command = {
+                "config_file": args.terasim_config,
+                "auto_run": False,
+            }
+            self.terasim = start_terasim(args.terasim_host, args.terasim_port, terasim_init_command)
+            while True:
+                terasim_status = get_terasim_status(args.terasim_host, args.terasim_port, self.terasim["simulation_id"])
+                if terasim_status.get("status", None) == "wait_for_tick":
+                    break
+                time.sleep(0.1)
 
         # Auto-calibrate SUMO-CARLA coordinate transformation
         self.sumo_carla_offset = [0.0, 0.0]
@@ -357,6 +375,8 @@ class CarlaCosim(object):
         return [offset_x, offset_y]
 
     def tick(self):
+        if self.direct_link is not None:
+            return self._tick_direct()
         if self.async_mode:
             time_start = time.time()
             if self.control_av:
@@ -400,23 +420,87 @@ class CarlaCosim(object):
                 self.world.tick()
         return True
 
+    def _tick_direct(self):
+        """One co-sim step over the direct gRPC link (no Redis/HTTP/polling).
+
+        Pipeline parity with the polling path: the state rendered into CARLA is
+        the previous step's state, and the SUMO step requested this tick
+        computes in the background while this client waits for the CARLA tick.
+        """
+        import grpc as _grpc
+
+        from .direct_link import parse_state_json
+
+        # Resolve the step requested on the previous tick.
+        if self._direct_tick_future is not None:
+            try:
+                resp = self._direct_tick_future.result(timeout=300.0)
+            except _grpc.RpcError as e:
+                print(f"TeraSim direct tick failed: {e}. Exiting...")
+                return False
+            if resp.status in ("finished", "error"):
+                print(f"TeraSim ended (status={resp.status}). Exiting...")
+                return False
+            state = parse_state_json(resp.state_json)
+            if state is not None:
+                self._direct_prev_state = state
+
+        commands = []
+        if self.control_av:
+            av_command = self._build_av_command()
+            if av_command is not None:
+                commands.append(av_command)
+
+        # Request the next SUMO step; it runs while CARLA ticks below.
+        self._direct_tick_future = self.direct_link.tick_async(commands)
+
+        # Render the previous step's state (same one-step latency as the
+        # polling path, which renders the state before requesting its tick).
+        if self._direct_prev_state is not None:
+            self.sync_cosim_actor_to_carla(self._direct_prev_state)
+            if not getattr(self.args, "skip_tls", False):
+                self.sync_cosim_tls_to_carla(self._direct_prev_state)
+
+        if getattr(self.args, "passive_tick", False):
+            self.world.wait_for_tick()
+        else:
+            self.world.tick()
+        return True
+
     def sync_carla_av_to_cosim(self):
+        """Build the AV set_state command and send it over the HTTP service link."""
+        av_command = self._build_av_command()
+        if av_command is None:
+            return
+        control_agent(
+            self.args.terasim_host,
+            self.args.terasim_port,
+            self.terasim["simulation_id"],
+            av_command,
+        )
+
+    def _build_av_command(self):
         # 3-cosim: the ego that drives in CARLA is the Autoware ego (role "ego_vehicle"), not the
-        # SUMO-spawned "AV". Read that actor's pose and push it to the SUMO AV so background traffic
-        # avoids it. av_carla_role defaults to AV_SUMO_ID for the original single-AV behavior.
+        # SUMO-spawned "AV". Read that actor's pose and build a set_state command for the SUMO AV
+        # so background traffic avoids it. Returns None when the command cannot be built yet
+        # (actor missing / av_shape not initialized). Sending is up to the caller: the polling
+        # path POSTs it (sync_carla_av_to_cosim), the direct path attaches it to the Tick RPC.
         av_role = getattr(self.args, "av_carla_role", AV_SUMO_ID)
         vehicle_status, carla_id = get_actor_id_from_attribute(self.world, av_role)
 
         if not vehicle_status:
             print(f"AV source actor (role={av_role}) not found in Carla simulation.")
-            return
+            return None
 
         if not self.av_shape:
             # av_shape is filled by initialize_av in sync_cosim_actor_to_carla, which runs later in
             # the same tick. Skip until then to avoid indexing an empty shape on the first tick.
-            return
+            return None
 
         AV = self.world.get_actor(carla_id)
+        if AV is None:
+            print(f"AV actor {carla_id} not resolvable this loop; command skipped.", flush=True)
+            return None
         transform = AV.get_transform()
         draw_text(self.world, transform.location + carla.Location(z=2.5), AV_SUMO_ID)
         # draw_point(
@@ -463,15 +547,11 @@ class CarlaCosim(object):
             }
         }
 
-        control_agent(
-            self.args.terasim_host,
-            self.args.terasim_port,
-            self.terasim["simulation_id"],
-            av_command,
-        )
+        return av_command
         
-    def sync_cosim_tls_to_carla(self):
-        terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+    def sync_cosim_tls_to_carla(self, terasim_states=None):
+        if terasim_states is None:
+            terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
 
         if not terasim_states:
             print("terasim_states not available.")
@@ -570,10 +650,14 @@ class CarlaCosim(object):
 
         return filtered_vehicles, vrus
 
-    def sync_cosim_actor_to_carla(self):
+    def sync_cosim_actor_to_carla(self, terasim_states=None):
         """Update all actors in cosim to CARLA.
+
+        terasim_states: pass the state dict directly (direct/gRPC mode); None
+        fetches it from the service over HTTP (Redis-era path).
         """
-        terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+        if terasim_states is None:
+            terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
 
         if not terasim_states:
             print("terasim_states not available.")
@@ -1288,4 +1372,8 @@ class CarlaCosim(object):
             destroy_all_actors(self.world)
 
         # stop TeraSim
-        stop_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+        if self.direct_link is not None:
+            self.direct_link.stop()
+            self.direct_link.close()
+        else:
+            stop_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
