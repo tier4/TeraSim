@@ -931,7 +931,13 @@ class CarlaCosim(object):
 
         total_start = time.perf_counter()
         apply_start = time.perf_counter()
-        responses = self.client.apply_batch_sync(commands, True)
+        # due_tick_cue=False: with True, in synchronous mode this call blocks until the
+        # next world tick. Spawns happen every time a vehicle enters the sync radius, so
+        # the blocking variant locks the whole co-sim loop to 2 CARLA ticks per step
+        # (measured: client wait p50 ~70ms vs the 51ms tick period). The responses
+        # (actor ids) are still returned without the tick; an actor that is not yet
+        # resolvable falls into the existing spawn-failure retry path.
+        responses = self.client.apply_batch_sync(commands, False)
         apply_elapsed = time.perf_counter() - apply_start
 
         stats["spawn_calls"] = len(spawn_requests)
