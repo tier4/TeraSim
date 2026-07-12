@@ -235,11 +235,16 @@ class TeraSimCoSimInProcessPlugin(TeraSimCoSimPlugin):
         self._step_done.set()
         # One line per step on purpose: with the RPC observation endpoint
         # gone, this log line (console handler prints asctime) is the external
-        # interface for step-rate / clock-ratio measurement.
+        # interface for step-rate / clock-ratio / vehicle-count measurement.
+        try:
+            vehicle_count = state.agent_count.get("vehicle", -1)
+        except Exception:
+            vehicle_count = -1
         self.logger.info(
-            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s",
+            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s vehicles=%s",
             completed_sumo_time,
             completed_tick_count,
+            vehicle_count,
         )
         return True
 
