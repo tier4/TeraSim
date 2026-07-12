@@ -140,11 +140,23 @@ class CarlaCosim(object):
         # self.sync_cosim_construction_zone_to_carla()
 
         # start / connect to TeraSim
+        self.inprocess_plugin = getattr(args, "inprocess_plugin", None)
+        self._inproc_tick_handle = None
+        self._inproc_prev_state = None
         self.direct_link = None
         self._direct_tick_future = None
         self._direct_prev_state = None
         direct_addr = getattr(args, "direct_addr", None)
-        if direct_addr:
+        if self.inprocess_plugin is not None:
+            # Single-process mode (terasim_service.run_cosim): the TeraSim
+            # simulation loop runs on another thread of THIS process; commands
+            # and states are exchanged as Python objects (no Redis/HTTP/gRPC,
+            # no JSON). The runner already waited for wait_for_tick.
+            # Seed the render pipeline with the initial (post-warmup) state so
+            # the first tick behaves like the other paths (AV shape init etc.).
+            self._inproc_prev_state = self.inprocess_plugin.get_result().state
+            self.terasim = {"simulation_id": "inprocess"}
+        elif direct_addr:
             # Direct (gRPC) mode: no Redis/FastAPI. The TeraSim runner
             # (terasim_service.run_direct) already owns the simulation; connect
             # and wait until it reaches wait_for_tick.
@@ -375,6 +387,8 @@ class CarlaCosim(object):
         return [offset_x, offset_y]
 
     def tick(self):
+        if self.inprocess_plugin is not None:
+            return self._tick_inprocess()
         if self.direct_link is not None:
             return self._tick_direct()
         if self.async_mode:
@@ -418,6 +432,50 @@ class CarlaCosim(object):
                 self.world.wait_for_tick()
             else:
                 self.world.tick()
+        return True
+
+    def _tick_inprocess(self):
+        """One co-sim step over the in-process link (single process, no RPC).
+
+        Pipeline parity with the two-process paths: the state rendered into
+        CARLA is the previous step's state, and the SUMO step requested this
+        tick computes on the sim thread while this thread renders into CARLA
+        and waits for the CARLA tick.
+        """
+        # Resolve the step requested on the previous tick.
+        if self._inproc_tick_handle is not None:
+            try:
+                result = self._inproc_tick_handle.result(timeout=300.0)
+            except TimeoutError as e:
+                print(f"TeraSim in-process tick failed: {e}. Exiting...")
+                return False
+            if result.status in ("finished", "error"):
+                print(f"TeraSim ended (status={result.status}). Exiting...")
+                return False
+            if result.state is not None:
+                self._inproc_prev_state = result.state
+
+        commands = []
+        if self.control_av:
+            av_command = self._build_av_command()
+            if av_command is not None:
+                commands.append(av_command)
+
+        # Request the next SUMO step; it runs on the sim thread while this
+        # thread renders below and waits for the CARLA tick.
+        self._inproc_tick_handle = self.inprocess_plugin.tick_async(commands)
+
+        # Render the previous step's state (same one-step latency as the
+        # other paths, which render the state before requesting its tick).
+        if self._inproc_prev_state is not None:
+            self.sync_cosim_actor_to_carla(self._inproc_prev_state)
+            if not getattr(self.args, "skip_tls", False):
+                self.sync_cosim_tls_to_carla(self._inproc_prev_state)
+
+        if getattr(self.args, "passive_tick", False):
+            self.world.wait_for_tick()
+        else:
+            self.world.tick()
         return True
 
     def _tick_direct(self):
@@ -1378,7 +1436,9 @@ class CarlaCosim(object):
             destroy_all_actors(self.world)
 
         # stop TeraSim
-        if self.direct_link is not None:
+        if self.inprocess_plugin is not None:
+            self.inprocess_plugin.request_stop()
+        elif self.direct_link is not None:
             self.direct_link.stop()
             self.direct_link.close()
         else:
