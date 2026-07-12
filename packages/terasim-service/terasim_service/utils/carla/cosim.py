@@ -143,32 +143,15 @@ class CarlaCosim(object):
         self.inprocess_plugin = getattr(args, "inprocess_plugin", None)
         self._inproc_tick_handle = None
         self._inproc_prev_state = None
-        self.direct_link = None
-        self._direct_tick_future = None
-        self._direct_prev_state = None
-        direct_addr = getattr(args, "direct_addr", None)
         if self.inprocess_plugin is not None:
             # Single-process mode (terasim_service.run_cosim): the TeraSim
             # simulation loop runs on another thread of THIS process; commands
             # and states are exchanged as Python objects (no Redis/HTTP/gRPC,
             # no JSON). The runner already waited for wait_for_tick.
             # Seed the render pipeline with the initial (post-warmup) state so
-            # the first tick behaves like the other paths (AV shape init etc.).
+            # the first tick behaves like the polling path (AV shape init etc.).
             self._inproc_prev_state = self.inprocess_plugin.get_result().state
             self.terasim = {"simulation_id": "inprocess"}
-        elif direct_addr:
-            # Direct (gRPC) mode: no Redis/FastAPI. The TeraSim runner
-            # (terasim_service.run_direct) already owns the simulation; connect
-            # and wait until it reaches wait_for_tick.
-            from .direct_link import DirectLink, parse_state_json
-
-            self.direct_link = DirectLink(direct_addr)
-            # Seed the render pipeline with the initial (post-warmup) state so
-            # the first tick behaves like the polling path (AV shape init etc.).
-            self._direct_prev_state = parse_state_json(
-                self.direct_link.get_state().state_json
-            )
-            self.terasim = {"simulation_id": "direct"}
         else:
             terasim_init_command = {
                 "config_file": args.terasim_config,
@@ -389,8 +372,6 @@ class CarlaCosim(object):
     def tick(self):
         if self.inprocess_plugin is not None:
             return self._tick_inprocess()
-        if self.direct_link is not None:
-            return self._tick_direct()
         if self.async_mode:
             time_start = time.time()
             if self.control_av:
@@ -471,53 +452,6 @@ class CarlaCosim(object):
             self.sync_cosim_actor_to_carla(self._inproc_prev_state)
             if not getattr(self.args, "skip_tls", False):
                 self.sync_cosim_tls_to_carla(self._inproc_prev_state)
-
-        if getattr(self.args, "passive_tick", False):
-            self.world.wait_for_tick()
-        else:
-            self.world.tick()
-        return True
-
-    def _tick_direct(self):
-        """One co-sim step over the direct gRPC link (no Redis/HTTP/polling).
-
-        Pipeline parity with the polling path: the state rendered into CARLA is
-        the previous step's state, and the SUMO step requested this tick
-        computes in the background while this client waits for the CARLA tick.
-        """
-        import grpc as _grpc
-
-        from .direct_link import parse_state_json
-
-        # Resolve the step requested on the previous tick.
-        if self._direct_tick_future is not None:
-            try:
-                resp = self._direct_tick_future.result(timeout=300.0)
-            except _grpc.RpcError as e:
-                print(f"TeraSim direct tick failed: {e}. Exiting...")
-                return False
-            if resp.status in ("finished", "error"):
-                print(f"TeraSim ended (status={resp.status}). Exiting...")
-                return False
-            state = parse_state_json(resp.state_json)
-            if state is not None:
-                self._direct_prev_state = state
-
-        commands = []
-        if self.control_av:
-            av_command = self._build_av_command()
-            if av_command is not None:
-                commands.append(av_command)
-
-        # Request the next SUMO step; it runs while CARLA ticks below.
-        self._direct_tick_future = self.direct_link.tick_async(commands)
-
-        # Render the previous step's state (same one-step latency as the
-        # polling path, which renders the state before requesting its tick).
-        if self._direct_prev_state is not None:
-            self.sync_cosim_actor_to_carla(self._direct_prev_state)
-            if not getattr(self.args, "skip_tls", False):
-                self.sync_cosim_tls_to_carla(self._direct_prev_state)
 
         if getattr(self.args, "passive_tick", False):
             self.world.wait_for_tick()
@@ -1438,8 +1372,5 @@ class CarlaCosim(object):
         # stop TeraSim
         if self.inprocess_plugin is not None:
             self.inprocess_plugin.request_stop()
-        elif self.direct_link is not None:
-            self.direct_link.stop()
-            self.direct_link.close()
         else:
             stop_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])

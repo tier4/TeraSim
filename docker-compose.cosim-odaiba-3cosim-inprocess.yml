@@ -1,16 +1,17 @@
-# docker compose -f docker-compose.cosim-odaiba-3cosim-direct.yml up -d
+# docker compose -f docker-compose.cosim-odaiba-3cosim-inprocess.yml up -d
 # =============================================================================
-# お台場 3者 cosim の TeraSim 側(背景車両注入)— direct 版(Redis/FastAPI なし)。
+# お台場 3者 cosim の TeraSim 側(背景車両注入)— 単一プロセス版(Redis/gRPC なし)。
 # =============================================================================
 # 前提: 第1段階 start_3cosim_odaiba_psim.sh で CARLA :2013(odaibatest5) + psim + bridge 稼働済み。
-# redis 版 docker-compose.cosim-odaiba-3cosim.yml との違い:
-#   - コンテナ内は run_direct(gRPC サーバ内蔵 TeraSim)+ passive client の 2 プロセスのみ
-#   - ホストの redis(6379)を使わない(共有 redis への依存・衝突リスクが消える)
-# image は TERASIM_IMAGE で差し替え可(既定 = integration ブランチの build)。
+# direct(gRPC 2 プロセス)版からの変更(= 第2段階の同一プロセス化):
+#   - コンテナ内は terasim_service.run_cosim の 1 プロセスのみ
+#     (TeraSim ループと CARLA クライアントループが同一プロセスの別スレッド)
+#   - gRPC ポート・runner/client の起動順序管理が不要
+# image は TERASIM_IMAGE で差し替え可(既定 = このブランチの build)。
 # =============================================================================
 services:
   terasim-3cosim:
-    image: ${TERASIM_IMAGE:-terasim-service:integration}
+    image: ${TERASIM_IMAGE:-terasim-service:inprocess}
     container_name: terasim-3cosim
     network_mode: host
     working_dir: /app
@@ -18,7 +19,6 @@ services:
       - PYTHONUNBUFFERED=1
       - HOME=/tmp
       - CARLA_PORT=2013
-      - GRPC_PORT=8200
       - SCENARIO=/app/examples/scenarios/cosim_odaiba_osmlike.yaml
       # CARLA への変換適用・spawn を1リクエストに束ねる(既定 OFF の opt-in 高速化。
       # 背景車両数百台では per-actor RPC が支配的なので常時 ON にする)
@@ -28,5 +28,5 @@ services:
       - CARLA_COSIM_ACTOR_FILTER=${CARLA_COSIM_ACTOR_FILTER:-0}
     volumes:
       - ./examples:/app/examples
-    command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba_direct.sh"]
+    command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba_inprocess.sh"]
     restart: "no"
