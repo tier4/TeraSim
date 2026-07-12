@@ -896,13 +896,27 @@ class TeraSimCoSimPlugin(BasePlugin):
             return True
 
     def _handle_agent_command(self, command_data):
-        """Handle agent control commands.
-        
+        """Handle agent control commands delivered as JSON bytes.
+
         Args:
-            command_data (str): The agent command data.
+            command_data (bytes): The agent command data (JSON wire format,
+                as stored in the Redis agent_commands list).
         """
         try:
             command = AgentCommand.model_validate_json(command_data.decode("utf-8"))
+        except Exception as e:
+            self.logger.error(f"Error handling agent command: {e}")
+            return False
+        return self._apply_agent_command(command)
+
+    def _apply_agent_command(self, command):
+        """Apply a parsed AgentCommand to the running simulation.
+
+        Extracted from _handle_agent_command so callers that already hold an
+        AgentCommand object (e.g. an in-process co-sim client) can skip the
+        JSON round-trip; every transport shares this implementation.
+        """
+        try:
             if command.agent_id != '':
                 if command.agent_type not in ["vehicle", "vru"]:
                     self.logger.error(f"Invalid agent type: {command.agent_type}")
@@ -986,7 +1000,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                             return False
             
 
-                self.logger.info(f"Agent command executed: {command_data}")
+                self.logger.info(f"Agent command executed: {command.model_dump_json()}")
                 return True
 
         except Exception as e:
