@@ -130,6 +130,24 @@ class CarlaCosim(object):
                 flush=True,
             )
 
+        # Per-tick CARLA round-trips replaced by caches. Every RPC on this
+        # thread runs while holding the GIL, so beyond its own latency it
+        # stalls the sim thread's Python phases (command apply / state build).
+        self._bp_library = self.world.get_blueprint_library()
+        self._last_world_frame = None  # from wait_for_tick()/tick(); avoids get_snapshot()
+        self._av_actor = None  # cached ego handle; re-resolved on failure/reconcile
+        self.ego_label_enabled = _env_bool("CARLA_COSIM_EGO_LABEL", True)
+        # role_name -> actor indexes, maintained incrementally at spawn/destroy.
+        # A full world scan runs once at start and then every N ticks as a
+        # consistency net (0 = never reconcile).
+        self._vehicle_actor_index = {}
+        self._pedestrian_actor_index = {}
+        self._actor_index_seeded = False
+        self._actor_index_reconcile_every = max(
+            0, int(_env_float("CARLA_COSIM_ACTOR_INDEX_RECONCILE_EVERY", 600))
+        )
+        self._ticks_since_reconcile = 0
+
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
         self.pedestrian_blueprints = create_pedestrian_blueprint(self.world)
@@ -380,7 +398,7 @@ class CarlaCosim(object):
             self.sync_cosim_actor_to_carla()
             self.sync_cosim_tls_to_carla()
 
-            self.world.tick()
+            self._last_world_frame = self.world.tick()
             time_end = time.time()
             elapsed = time_end - time_start
             if elapsed < self.step_length:
@@ -410,9 +428,10 @@ class CarlaCosim(object):
             # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
             # psim tick so the two clients stay synchronized on one CARLA server.
             if getattr(self.args, "passive_tick", False):
-                self.world.wait_for_tick()
+                snapshot = self.world.wait_for_tick()
+                self._last_world_frame = getattr(snapshot, "frame", None)
             else:
-                self.world.tick()
+                self._last_world_frame = self.world.tick()
         return True
 
     def _tick_inprocess(self):
@@ -454,9 +473,10 @@ class CarlaCosim(object):
                 self.sync_cosim_tls_to_carla(self._inproc_prev_state)
 
         if getattr(self.args, "passive_tick", False):
-            self.world.wait_for_tick()
+            snapshot = self.world.wait_for_tick()
+            self._last_world_frame = getattr(snapshot, "frame", None)
         else:
-            self.world.tick()
+            self._last_world_frame = self.world.tick()
         return True
 
     def sync_carla_av_to_cosim(self):
@@ -478,23 +498,36 @@ class CarlaCosim(object):
         # (actor missing / av_shape not initialized). Sending is up to the caller: the polling
         # path POSTs it (sync_carla_av_to_cosim), the direct path attaches it to the Tick RPC.
         av_role = getattr(self.args, "av_carla_role", AV_SUMO_ID)
-        vehicle_status, carla_id = get_actor_id_from_attribute(self.world, av_role)
-
-        if not vehicle_status:
-            print(f"AV source actor (role={av_role}) not found in Carla simulation.")
-            return None
 
         if not self.av_shape:
             # av_shape is filled by initialize_av in sync_cosim_actor_to_carla, which runs later in
             # the same tick. Skip until then to avoid indexing an empty shape on the first tick.
             return None
 
-        AV = self.world.get_actor(carla_id)
+        # Resolve the ego handle once and reuse it; the full actor walk
+        # (get_actor_id_from_attribute) is a per-actor attribute conversion
+        # over the whole world and only runs again when the cached handle
+        # fails or after an index reconcile clears it.
+        AV = self._av_actor
+        transform = None
+        if AV is not None:
+            try:
+                transform = AV.get_transform()
+            except Exception:
+                AV = None
         if AV is None:
-            print(f"AV actor {carla_id} not resolvable this loop; command skipped.", flush=True)
-            return None
-        transform = AV.get_transform()
-        draw_text(self.world, transform.location + carla.Location(z=2.5), AV_SUMO_ID)
+            vehicle_status, carla_id = get_actor_id_from_attribute(self.world, av_role)
+            if not vehicle_status:
+                print(f"AV source actor (role={av_role}) not found in Carla simulation.")
+                return None
+            AV = self.world.get_actor(carla_id)
+            if AV is None:
+                print(f"AV actor {carla_id} not resolvable this loop; command skipped.", flush=True)
+                return None
+            self._av_actor = AV
+            transform = AV.get_transform()
+        if self.ego_label_enabled:
+            draw_text(self.world, transform.location + carla.Location(z=2.5), AV_SUMO_ID)
         # draw_point(
         #     self.world,
         #     size=0.05,
@@ -668,8 +701,22 @@ class CarlaCosim(object):
             return
 
         cosim_id_record = set()
-        current_frame = self.world.get_snapshot().frame
-        vehicle_actor_index, pedestrian_actor_index = self._build_actor_role_indexes()
+        # Frame number comes from the last wait_for_tick()/tick() result; the
+        # extra get_snapshot() round-trip only happens before the first tick.
+        current_frame = self._last_world_frame
+        if current_frame is None:
+            current_frame = self.world.get_snapshot().frame
+        # Incrementally-maintained indexes; full world scan only at seed time
+        # and every N ticks as a consistency net.
+        if not self._actor_index_seeded or (
+            self._actor_index_reconcile_every > 0
+            and self._ticks_since_reconcile >= self._actor_index_reconcile_every
+        ):
+            self._build_actor_role_indexes()
+            self._av_actor = None  # re-resolve the ego handle on the same cadence
+        self._ticks_since_reconcile += 1
+        vehicle_actor_index = self._vehicle_actor_index
+        pedestrian_actor_index = self._pedestrian_actor_index
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
         vehicles, vrus = self._filter_actor_details_by_radius(vehicles, vrus)
@@ -720,8 +767,7 @@ class CarlaCosim(object):
 
         self._flush_actor_spawn_batch(spawn_requests, transform_batch)
         self._flush_actor_transform_batch(transform_batch)
-        self._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
-        self._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
+        self._cleanup_stale_actors(cosim_id_record)
         self._prune_spawn_failures(vehicles.keys(), vrus.keys())
 
         # self.sync_cosim_tls_to_carla()
@@ -856,8 +902,10 @@ class CarlaCosim(object):
         return actor_type, actor_id
 
     def _fresh_blueprint(self, blueprint):
+        # The library handle is cached at init; fetching it per spawn was one
+        # blocking RPC per newly-entering vehicle.
         try:
-            return self.world.get_blueprint_library().find(blueprint.id)
+            return self._bp_library.find(blueprint.id)
         except Exception:
             return blueprint
 
@@ -972,7 +1020,9 @@ class CarlaCosim(object):
             actor_index = request.get("actor_index")
             if actor_index is not None:
                 actor_index[actor_id] = actor
-            self._queue_actor_transform(actor, request["post_spawn_transform"], transform_batch)
+            self._queue_actor_transform(
+                actor, request["post_spawn_transform"], transform_batch, cosim_id=actor_id
+            )
             if actor_type == "vru":
                 self._apply_vru_walker_control(request["actor_info"], request["sumo_angle"], actor)
 
@@ -995,10 +1045,17 @@ class CarlaCosim(object):
         except Exception:
             pass
 
-    def _queue_actor_transform(self, actor, transform, transform_batch=None):
-        """Queue or apply a CARLA actor transform according to batching settings."""
+    def _queue_actor_transform(self, actor, transform, transform_batch=None, cosim_id=None):
+        """Queue or apply a CARLA actor transform according to batching settings.
+
+        cosim_id ties the queued command back to the persistent actor index so
+        a failed apply (actor gone) drops the stale handle instead of relying
+        on a per-tick world rescan.
+        """
         if self.batch_transform_enabled and transform_batch is not None:
-            transform_batch.append(carla.command.ApplyTransform(actor.id, transform))
+            transform_batch.append(
+                (carla.command.ApplyTransform(actor.id, transform), cosim_id)
+            )
             return
         actor.set_transform(transform)
 
@@ -1006,10 +1063,25 @@ class CarlaCosim(object):
         """Apply queued actor transforms in one CARLA batch call."""
         if not transform_batch:
             return []
-        return self.client.apply_batch_sync(transform_batch, False)
+        responses = self.client.apply_batch_sync(
+            [command for command, _ in transform_batch], False
+        )
+        for (_, cosim_id), response in zip(transform_batch, responses):
+            if response.error and cosim_id is not None:
+                # Stale handle (e.g. actor destroyed outside this loop): forget
+                # it so the next state entry re-spawns instead of erroring.
+                self._drop_actor_from_indexes(cosim_id)
+        return responses
 
     def _build_actor_role_indexes(self):
-        """Build role_name indexes once per tick instead of scanning CARLA per actor."""
+        """Full world scan seeding the persistent role_name -> actor indexes.
+
+        Runs at start (also picks up leftovers from a previous run so cleanup
+        can retire them) and every N ticks as a consistency net; between scans
+        the indexes are maintained incrementally at spawn/destroy/transform
+        error, so the per-tick get_actors() walk with per-actor attribute
+        conversion is gone from the hot path.
+        """
         vehicle_actor_index = {}
         pedestrian_actor_index = {}
         actors = self.world.get_actors()
@@ -1026,7 +1098,37 @@ class CarlaCosim(object):
         self._last_actor_index_world_actor_count = world_actor_count
         self._last_actor_index_vehicle_actor_count = len(vehicle_actor_index)
         self._last_actor_index_pedestrian_actor_count = len(pedestrian_actor_index)
+        self._vehicle_actor_index = vehicle_actor_index
+        self._pedestrian_actor_index = pedestrian_actor_index
+        self._actor_index_seeded = True
+        self._ticks_since_reconcile = 0
         return vehicle_actor_index, pedestrian_actor_index
+
+    def _drop_actor_from_indexes(self, cosim_id):
+        """Forget a cached actor handle (destroyed or failed); the next state
+        entry for that id goes through the spawn path again."""
+        self._vehicle_actor_index.pop(cosim_id, None)
+        self._pedestrian_actor_index.pop(cosim_id, None)
+
+    def _cleanup_stale_actors(self, cosim_id_record):
+        """Destroy CARLA actors whose SUMO counterpart left the state.
+
+        Index-based (no world scan) and batched: one DestroyActor batch per
+        tick instead of one blocking destroy() RPC per stale actor.
+        """
+        protected = getattr(self.args, "protected_roles", None) or ["AV"]
+        destroy_commands = []
+        for index in (self._vehicle_actor_index, self._pedestrian_actor_index):
+            stale_ids = [
+                cosim_id
+                for cosim_id in index
+                if cosim_id not in cosim_id_record and cosim_id not in protected
+            ]
+            for cosim_id in stale_ids:
+                actor = index.pop(cosim_id)
+                destroy_commands.append(carla.command.DestroyActor(actor.id))
+        if destroy_commands:
+            self.client.apply_batch_sync(destroy_commands, False)
 
     @staticmethod
     def _vru_uses_vehicle_blueprint(vru_info):
@@ -1247,7 +1349,7 @@ class CarlaCosim(object):
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            self._queue_actor_transform(vehicle, carla_trasform, transform_batch)
+            self._queue_actor_transform(vehicle, carla_trasform, transform_batch, cosim_id=veh_id)
 
     def _process_vru(
         self,
@@ -1324,25 +1426,10 @@ class CarlaCosim(object):
             z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
             sumo_offset = self._get_carla_offset(sumo_location, z_off)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            self._queue_actor_transform(pedestrian, carla_trasform, transform_batch)
+            self._queue_actor_transform(pedestrian, carla_trasform, transform_batch, cosim_id=vru_id)
 
         if carla_id > 0:
             self._apply_vru_walker_control(vru_info, sumo_angle, pedestrian)
-
-    def _cleanup_actors(self, actor_type, pattern, cosim_id_record):
-        """Clean up CARLA actors not in the cosim actor record."""
-        # Protect ego (and any other role names passed via protected_roles). In 3-cosim the
-        # psim ego has role_name "ego_vehicle", which must not be destroyed as a "stale" actor.
-        protected = getattr(self.args, "protected_roles", None) or ["AV"]
-        actors_to_destroy = [
-            actor
-            for actor in self.world.get_actors().filter(pattern)
-            if actor.attributes.get("role_name") not in cosim_id_record
-            and actor.attributes.get("role_name") not in protected
-        ]
-
-        for actor in actors_to_destroy:
-            actor.destroy()
 
     def close(self):
         """
