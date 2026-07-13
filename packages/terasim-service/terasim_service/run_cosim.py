@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -71,6 +72,16 @@ def main():
     p.add_argument("--av_carla_role", default="ego_vehicle",
                    help="CARLA role_name whose pose is fed back to the SUMO AV")
     args = p.parse_args()
+
+    # Two threads share one interpreter: while this thread runs Python (CARLA
+    # rendering), the sim thread's short Python phases (command apply, state
+    # publish) wait up to the GIL switch interval per acquisition — at the 5ms
+    # interpreter default that adds several ms per step. 1ms keeps the handoff
+    # fine-grained; set TERASIM_COSIM_SWITCH_INTERVAL=0 to keep the default.
+    switch_interval = float(os.environ.get("TERASIM_COSIM_SWITCH_INTERVAL", "0.001"))
+    if switch_interval > 0:
+        sys.setswitchinterval(switch_interval)
+    logger.info(f"[run_cosim] GIL switch interval: {sys.getswitchinterval() * 1000:.2f}ms")
 
     # 3-cosim passive mode: fixed flags consumed by CarlaCosim.tick()/_cleanup_actors()/close()
     # (same set carla_cosim_3cosim.py pinned for the two-process paths).

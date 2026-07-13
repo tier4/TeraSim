@@ -19,13 +19,18 @@ services:
       - PYTHONUNBUFFERED=1
       - HOME=/tmp
       - CARLA_PORT=2013
-      - SCENARIO=/app/examples/scenarios/cosim_odaiba_osmlike.yaml
+      - SCENARIO=${SCENARIO:-/app/examples/scenarios/cosim_odaiba_osmlike.yaml}
       # CARLA への変換適用・spawn を1リクエストに束ねる(既定 OFF の opt-in 高速化。
       # 背景車両数百台では per-actor RPC が支配的なので常時 ON にする)
       - CARLA_COSIM_BATCH_TRANSFORM=1
       - CARLA_COSIM_BATCH_SPAWN=1
       # ego(AV)周辺のみ CARLA に同期する間引き(既定 OFF、ホスト env で opt-in)
       - CARLA_COSIM_ACTOR_FILTER=${CARLA_COSIM_ACTOR_FILTER:-0}
+      # TeraSim 側の state 構築も ego(AV)周辺に間引く(既定 OFF、ホスト env で opt-in)。
+      # CARLA_COSIM_ACTOR_FILTER と同半径なら挙動等価のまま、state 構築コストが
+      # 総台数比例 → 周辺台数比例になる(高台数域の主要な高速化)
+      - TERASIM_COSIM_STATE_FILTER=${TERASIM_COSIM_STATE_FILTER:-0}
+      - TERASIM_COSIM_STATE_FILTER_RADIUS=${TERASIM_COSIM_STATE_FILTER_RADIUS:-300}
     volumes:
       - ./examples:/app/examples
     command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba_inprocess.sh"]

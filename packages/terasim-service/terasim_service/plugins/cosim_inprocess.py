@@ -236,15 +236,24 @@ class TeraSimCoSimInProcessPlugin(TeraSimCoSimPlugin):
         # One line per step on purpose: with the RPC observation endpoint
         # gone, this log line (console handler prints asctime) is the external
         # interface for step-rate / clock-ratio / vehicle-count measurement.
+        # vehicles= is the TOTAL SUMO vehicle count (the measurement x-axis; it
+        # must not shrink when TERASIM_COSIM_STATE_FILTER trims the published
+        # state); vehicles_state= is what actually went into the state.
         try:
-            vehicle_count = state.agent_count.get("vehicle", -1)
+            state_vehicle_count = state.agent_count.get("vehicle", -1)
         except Exception:
-            vehicle_count = -1
+            state_vehicle_count = -1
+        try:
+            total_vehicle_count = traci.vehicle.getIDCount()
+        except Exception:
+            total_vehicle_count = state_vehicle_count
         self.logger.info(
-            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s vehicles=%s",
+            "Simulation step finished! completed_sumo_time=%s completed_tick_count=%s "
+            "vehicles=%s vehicles_state=%s",
             completed_sumo_time,
             completed_tick_count,
-            vehicle_count,
+            total_vehicle_count,
+            state_vehicle_count,
         )
         return True
 
