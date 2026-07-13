@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 from logging.handlers import RotatingFileHandler
 import numpy as np
@@ -16,7 +17,7 @@ from terasim_nde_nade.adversity import ConstructionAdversity
 
 from .base import BasePlugin, DEFAULT_REDIS_CONFIG
 
-from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
+from ..utils import SimulationState, SUMOSignal, AgentCommand
 from ..utils.sumo_lane_geometry import reconstruct_position_from_lane_geometry
 
 
@@ -113,6 +114,11 @@ DEFAULT_COSIM_PLUGIN_CONFIG = {
 
 
 class TeraSimCoSimPlugin(BasePlugin):
+    # lon/lat in the published state (see state_lonlat_enabled in __init__)
+    STATE_LONLAT_DEFAULT = True
+    # cadence (in steps) for pruning per-vehicle caches of departed ids
+    CACHE_PRUNE_EVERY_STEPS = 1200
+
     def __init__(
         self,
         simulation_uuid: str,
@@ -197,6 +203,21 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "TeraSim co-sim lane-relative reconstructed positions enabled "
                 "for filtered state vehicles"
             )
+
+        # lon/lat per agent costs one convertGeo (projection) per vehicle per
+        # step. The CARLA co-sim client converts from x/y itself and never
+        # reads them, so the in-process plugin turns them off by default
+        # (STATE_LONLAT_DEFAULT); the Redis path keeps them for external
+        # consumers. Env var overrides either way.
+        self.state_lonlat_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_STATE_LONLAT", self.STATE_LONLAT_DEFAULT
+        )
+        # Per-vehicle static attributes (length/width/height/type are constant
+        # in SUMO) and the static half of the traffic-light details; both were
+        # re-fetched/re-serialized every step.
+        self._static_attr_cache = {}
+        self._tls_static_cache = None
+        self._cache_prune_countdown = self.CACHE_PRUNE_EVERY_STEPS
 
     @staticmethod
     def _parse_float_env(name, default):
@@ -577,11 +598,16 @@ class TeraSimCoSimPlugin(BasePlugin):
 
     def get_vehicle_vru_ids(self):
         """Get all vehicle and VRU IDs in the simulation."""
-        all_ids = list(set(traci.vehicle.getIDList() + traci.person.getIDList()))
-        # Separate by type: construction objects, VRUs, and regular vehicles
-        construction_ids = [id for id in all_ids if id.startswith("CONSTRUCTION_")]
-        vru_ids = [id for id in all_ids if "VRU" in id and id not in construction_ids]
-        vehicle_ids = [id for id in all_ids if id not in vru_ids and id not in construction_ids]
+        all_ids = set(traci.vehicle.getIDList() + traci.person.getIDList())
+        # Separate by type in one pass: construction objects, VRUs, and regular vehicles
+        construction_ids, vru_ids, vehicle_ids = [], [], []
+        for agent_id in all_ids:
+            if agent_id.startswith("CONSTRUCTION_"):
+                construction_ids.append(agent_id)
+            elif "VRU" in agent_id:
+                vru_ids.append(agent_id)
+            else:
+                vehicle_ids.append(agent_id)
         return vehicle_ids, vru_ids, construction_ids
 
     def _filter_vehicle_ids_for_state(self, vehicle_ids):
@@ -627,6 +653,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             return vehicle_ids, {}
 
     def _populate_lane_relative_position(self, vehicle_id, vehicle_state):
+        """Fill the lane-relative fields of a vehicle-state dict (opt-in path)."""
         if not self.lane_relative_position_enabled:
             return
 
@@ -640,20 +667,20 @@ class TeraSimCoSimPlugin(BasePlugin):
             lane_shape,
             lane_position,
             lateral_offset,
-            vehicle_state.z,
+            vehicle_state["z"],
         )
 
-        vehicle_state.lane_id = lane_id
-        vehicle_state.lane_position = lane_position
-        vehicle_state.lateral_offset = lateral_offset
+        vehicle_state["lane_id"] = lane_id
+        vehicle_state["lane_position"] = lane_position
+        vehicle_state["lateral_offset"] = lateral_offset
         if reconstructed is None:
             return
         (
-            vehicle_state.reconstructed_x,
-            vehicle_state.reconstructed_y,
-            vehicle_state.reconstructed_z,
+            vehicle_state["reconstructed_x"],
+            vehicle_state["reconstructed_y"],
+            vehicle_state["reconstructed_z"],
         ) = reconstructed
-        vehicle_state.reconstructed_position_valid = True
+        vehicle_state["reconstructed_position_valid"] = True
 
     def _build_simulation_state(self, simulator):
         """Collect the current simulation state from SUMO into a SimulationState.
@@ -664,12 +691,13 @@ class TeraSimCoSimPlugin(BasePlugin):
         instead of writing to Redis.
         """
         simulation_state = SimulationState()
-        simulation_state.simulation_time = traci.simulation.getTime()
+        simulation_time = traci.simulation.getTime()
+        simulation_state.simulation_time = simulation_time
 
         # Get all interested agent IDs
-        vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
+        all_vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
         vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
-            vehicle_ids
+            all_vehicle_ids
         )
         simulation_state.agent_count = {
             "vehicle": len(vehicle_ids),
@@ -677,35 +705,77 @@ class TeraSimCoSimPlugin(BasePlugin):
             "construction": len(construction_ids),
         }
 
-        # Add vehicle states
+        # Occasionally drop departed ids from the per-vehicle caches (they are
+        # keyed by SUMO id and would otherwise grow for the whole run).
+        self._cache_prune_countdown -= 1
+        if self._cache_prune_countdown <= 0:
+            self._cache_prune_countdown = self.CACHE_PRUNE_EVERY_STEPS
+            alive = set(all_vehicle_ids)
+            alive.update(vru_ids)
+            for cache in (self.last_orientations, self._static_attr_cache):
+                for stale_id in [key for key in cache if key not in alive]:
+                    del cache[stale_id]
+
+        # Add vehicle states (plain dicts in the AgentStateSimplified shape;
+        # scalar math via the math module — numpy scalar ufuncs are several
+        # times slower and this loop runs per vehicle per step).
+        lonlat_enabled = self.state_lonlat_enabled
+        static_attrs = self._static_attr_cache
+        last_orientations = self.last_orientations
         vehicles = {}
         for vid in vehicle_ids:
-            vehicle_state = AgentStateSimplified()
             position = vehicle_position_cache.get(vid)
             if position is None:
                 position = traci.vehicle.getPosition3D(vid)
-            vehicle_state.x, vehicle_state.y, vehicle_state.z = position
-            self._populate_lane_relative_position(vid, vehicle_state)
-            vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
-            vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
-            vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
-            vehicle_state.speed = traci.vehicle.getSpeed(vid)
-            vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
-            vehicle_state.length = traci.vehicle.getLength(vid)
-            vehicle_state.width = traci.vehicle.getWidth(vid)
-            vehicle_state.height = traci.vehicle.getHeight(vid)
-            vehicle_state.type = traci.vehicle.getTypeID(vid)
-            vehicle_state.angular_velocity = 0.0  # rad/s
-            now_time = simulation_state.simulation_time
-            now_orientation = vehicle_state.orientation
-            last_orientation, last_time = self.last_orientations.get(vid, (now_orientation, now_time))
-            dt = now_time - last_time
-            if dt > 0:
-                dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
-                vehicle_state.angular_velocity = dtheta / dt
+            x, y, z = position
+            if lonlat_enabled:
+                lon, lat = traci.simulation.convertGeo(x, y)
             else:
-                vehicle_state.angular_velocity = 0.0
-            self.last_orientations[vid] = (now_orientation, now_time)
+                lon = lat = 0.0
+            sumo_angle = traci.vehicle.getAngle(vid)
+            orientation = math.radians((90.0 - sumo_angle) % 360.0)
+            static = static_attrs.get(vid)
+            if static is None:
+                static = (
+                    traci.vehicle.getLength(vid),
+                    traci.vehicle.getWidth(vid),
+                    traci.vehicle.getHeight(vid),
+                    traci.vehicle.getTypeID(vid),
+                )
+                static_attrs[vid] = static
+            last_orientation, last_time = last_orientations.get(vid, (orientation, simulation_time))
+            dt = simulation_time - last_time
+            if dt > 0:
+                dtheta = orientation - last_orientation
+                angular_velocity = math.atan2(math.sin(dtheta), math.cos(dtheta)) / dt
+            else:
+                angular_velocity = 0.0
+            last_orientations[vid] = (orientation, simulation_time)
+            vehicle_state = {
+                "x": x,
+                "y": y,
+                "z": z,
+                "lane_id": "",
+                "lane_position": 0.0,
+                "lateral_offset": 0.0,
+                "reconstructed_x": 0.0,
+                "reconstructed_y": 0.0,
+                "reconstructed_z": 0.0,
+                "reconstructed_position_valid": False,
+                "lon": lon,
+                "lat": lat,
+                "sumo_angle": sumo_angle,
+                "length": static[0],
+                "width": static[1],
+                "height": static[2],
+                "speed": traci.vehicle.getSpeed(vid),
+                "orientation": orientation,
+                "acceleration": traci.vehicle.getAcceleration(vid),
+                "angular_velocity": angular_velocity,
+                "type": static[3],
+            }
+            if self.lane_relative_position_enabled:
+                self._populate_lane_relative_position(vid, vehicle_state)
             vehicles[vid] = vehicle_state
 
         simulation_state.agent_details["vehicle"] = vehicles
@@ -717,91 +787,127 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         vrus = {}
         for vru_id in vru_ids:
-            vru_state = AgentStateSimplified()
-
             # Determine if this VRU is actually a vehicle or person
             if vru_id in current_vehicle_list:
                 # VRU is actually a vehicle (disguised as pedestrian)
-                vru_state.x, vru_state.y, vru_state.z = traci.vehicle.getPosition3D(vru_id)
-                vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
-                vru_state.sumo_angle = traci.vehicle.getAngle(vru_id)
-                vru_state.speed = traci.vehicle.getSpeed(vru_id)
-                vru_state.acceleration = traci.vehicle.getAcceleration(vru_id)
-                vru_state.length = traci.vehicle.getLength(vru_id)
-                vru_state.width = traci.vehicle.getWidth(vru_id)
-                vru_state.height = traci.vehicle.getHeight(vru_id)
-                vru_state.type = traci.vehicle.getTypeID(vru_id)
-                vru_state.angular_velocity = 0.0  # rad/s
-                now_time = simulation_state.simulation_time
-                now_orientation = np.radians((90 - vru_state.sumo_angle) % 360)
-                last_orientation, last_time = self.last_orientations.get(vru_id, (now_orientation, now_time))
-                dt = now_time - last_time
-                if dt > 0:
-                    dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
-                    vru_state.angular_velocity = dtheta / dt
-                else:
-                    vru_state.angular_velocity = 0.0
-                self.last_orientations[vru_id] = (now_orientation, now_time)
-                vru_state.orientation = now_orientation
+                domain = traci.vehicle
             elif vru_id in current_person_list:
                 # VRU is actually a person
-                vru_state.x, vru_state.y, vru_state.z = traci.person.getPosition3D(vru_id)
-                vru_state.lon, vru_state.lat = traci.simulation.convertGeo(vru_state.x, vru_state.y)
-                vru_state.sumo_angle = traci.person.getAngle(vru_id)
-                vru_state.speed = traci.person.getSpeed(vru_id)
-                vru_state.acceleration = traci.person.getAcceleration(vru_id) if hasattr(traci.person, 'getAcceleration') else 0.0
-                vru_state.length = traci.person.getLength(vru_id)
-                vru_state.width = traci.person.getWidth(vru_id)
-                vru_state.height = traci.person.getHeight(vru_id)
-                vru_state.type = traci.person.getTypeID(vru_id)
-                vru_state.angular_velocity = 0.0  # rad/s
-                vru_state.orientation = np.radians((90 - vru_state.sumo_angle) % 360)
+                domain = traci.person
             else:
                 # VRU ID not found in either list, log warning and skip
                 self.logger.warning(f"VRU ID {vru_id} not found in vehicle or person lists, skipping")
                 continue
 
-            vrus[vru_id] = vru_state
+            x, y, z = domain.getPosition3D(vru_id)
+            if lonlat_enabled:
+                lon, lat = traci.simulation.convertGeo(x, y)
+            else:
+                lon = lat = 0.0
+            sumo_angle = domain.getAngle(vru_id)
+            orientation = math.radians((90.0 - sumo_angle) % 360.0)
+            angular_velocity = 0.0
+            if domain is traci.vehicle:
+                last_orientation, last_time = last_orientations.get(vru_id, (orientation, simulation_time))
+                dt = simulation_time - last_time
+                if dt > 0:
+                    dtheta = orientation - last_orientation
+                    angular_velocity = math.atan2(math.sin(dtheta), math.cos(dtheta)) / dt
+                last_orientations[vru_id] = (orientation, simulation_time)
+                acceleration = domain.getAcceleration(vru_id)
+            else:
+                acceleration = (
+                    domain.getAcceleration(vru_id)
+                    if hasattr(domain, "getAcceleration")
+                    else 0.0
+                )
+
+            vrus[vru_id] = {
+                "x": x,
+                "y": y,
+                "z": z,
+                "lane_id": "",
+                "lane_position": 0.0,
+                "lateral_offset": 0.0,
+                "reconstructed_x": 0.0,
+                "reconstructed_y": 0.0,
+                "reconstructed_z": 0.0,
+                "reconstructed_position_valid": False,
+                "lon": lon,
+                "lat": lat,
+                "sumo_angle": sumo_angle,
+                "length": domain.getLength(vru_id),
+                "width": domain.getWidth(vru_id),
+                "height": domain.getHeight(vru_id),
+                "speed": domain.getSpeed(vru_id),
+                "orientation": orientation,
+                "acceleration": acceleration,
+                "angular_velocity": angular_velocity,
+                "type": domain.getTypeID(vru_id),
+            }
 
         simulation_state.agent_details["vru"] = vrus
 
         # Add construction objects
         construction_objects = {}
         for cid in construction_ids:
-            construction_state = AgentStateSimplified()
-            construction_state.x, construction_state.y, construction_state.z = traci.vehicle.getPosition3D(cid)
-            construction_state.lon, construction_state.lat = traci.simulation.convertGeo(construction_state.x, construction_state.y)
-            construction_state.sumo_angle = traci.vehicle.getAngle(cid)
-            construction_state.orientation = np.radians((90 - construction_state.sumo_angle) % 360)
-            construction_state.speed = traci.vehicle.getSpeed(cid)
-            construction_state.acceleration = traci.vehicle.getAcceleration(cid)
-            construction_state.length = traci.vehicle.getLength(cid)
-            construction_state.width = traci.vehicle.getWidth(cid)
-            construction_state.height = traci.vehicle.getHeight(cid)
-            construction_state.type = traci.vehicle.getTypeID(cid)
-            construction_state.angular_velocity = 0.0
-            construction_objects[cid] = construction_state
+            x, y, z = traci.vehicle.getPosition3D(cid)
+            if lonlat_enabled:
+                lon, lat = traci.simulation.convertGeo(x, y)
+            else:
+                lon = lat = 0.0
+            sumo_angle = traci.vehicle.getAngle(cid)
+            construction_objects[cid] = {
+                "x": x,
+                "y": y,
+                "z": z,
+                "lane_id": "",
+                "lane_position": 0.0,
+                "lateral_offset": 0.0,
+                "reconstructed_x": 0.0,
+                "reconstructed_y": 0.0,
+                "reconstructed_z": 0.0,
+                "reconstructed_position_valid": False,
+                "lon": lon,
+                "lat": lat,
+                "sumo_angle": sumo_angle,
+                "length": traci.vehicle.getLength(cid),
+                "width": traci.vehicle.getWidth(cid),
+                "height": traci.vehicle.getHeight(cid),
+                "speed": traci.vehicle.getSpeed(cid),
+                "orientation": math.radians((90.0 - sumo_angle) % 360.0),
+                "acceleration": traci.vehicle.getAcceleration(cid),
+                "angular_velocity": 0.0,
+                "type": traci.vehicle.getTypeID(cid),
+            }
 
         simulation_state.construction_objects = construction_objects
 
-        # Add traffic light states
-        traffic_lights = {}
-        for tl_id in traci.trafficlight.getIDList():
-            sumo_signal = SUMOSignal()
-            sumo_signal.x, sumo_signal.y = 0,0
-            sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
-            tls_information = {
-                "programs": {}
-            }
-            tls = self.simulator.sumo_net.getTLS(tl_id)
-            programs = tls.getPrograms()
-            for program_id, program in programs.items():
-                # Get the program parameters
-                program_parameters = program.getParams()
-                tls_information["programs"][program_id] = {
-                    "parameters": program_parameters
+        # Add traffic light states. The program/parameter block is static per
+        # TLS, so it is resolved from the SUMO net and JSON-encoded exactly
+        # once; only the current signal string changes per step.
+        if self._tls_static_cache is None:
+            self._tls_static_cache = {}
+            for tl_id in traci.trafficlight.getIDList():
+                tls_information = {
+                    "programs": {}
                 }
-            sumo_signal.information = json.dumps(tls_information)
+                tls = self.simulator.sumo_net.getTLS(tl_id)
+                programs = tls.getPrograms()
+                for program_id, program in programs.items():
+                    # Get the program parameters
+                    program_parameters = program.getParams()
+                    tls_information["programs"][program_id] = {
+                        "parameters": program_parameters
+                    }
+                self._tls_static_cache[tl_id] = json.dumps(tls_information)
+
+        traffic_lights = {}
+        for tl_id, information in self._tls_static_cache.items():
+            sumo_signal = SUMOSignal()
+            sumo_signal.x, sumo_signal.y = 0, 0
+            sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
+            sumo_signal.information = information
             traffic_lights[tl_id] = sumo_signal
 
         simulation_state.traffic_light_details = traffic_lights
@@ -958,7 +1064,10 @@ class TeraSimCoSimPlugin(BasePlugin):
                         # entirely by moveToXY (it mirrors the Autoware ego), so this 2-edge route is
                         # only a decoy to keep it alive -- NOT a fixed plan, which is correct because
                         # the Autoware ego chooses its path dynamically.
-                        if command.agent_id == "AV" and "AV" in traci.vehicle.getIDList():
+                        # (No getIDList membership pre-check: materializing the
+                        # full id tuple every step is O(total vehicles), and the
+                        # try/except below already tolerates a missing AV.)
+                        if command.agent_id == "AV":
                             try:
                                 cur = traci.vehicle.getRoadID("AV")
                                 if cur and not cur.startswith(":"):  # skip junction-internal edges
@@ -1000,7 +1109,10 @@ class TeraSimCoSimPlugin(BasePlugin):
                             return False
             
 
-                self.logger.info(f"Agent command executed: {command.model_dump_json()}")
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    # Guarded: the model_dump_json() alone is measurable at one
+                    # command per step, and this fires on the hot path.
+                    self.logger.debug(f"Agent command executed: {command.model_dump_json()}")
                 return True
 
         except Exception as e:

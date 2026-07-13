@@ -24,6 +24,8 @@ State construction is inherited from TeraSimCoSimPlugin
 (_apply_agent_command), so all transports share one implementation.
 """
 
+import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -74,6 +76,11 @@ class TeraSimCoSimInProcessPlugin(TeraSimCoSimPlugin):
     # before auto-stopping (same idle safety net as the Redis plugin).
     IDLE_TIMEOUT_S = 600.0
 
+    # The in-process consumer (CarlaCosim) converts coordinates from x/y
+    # itself and never reads lon/lat, so skip the per-vehicle convertGeo by
+    # default (TERASIM_COSIM_STATE_LONLAT=1 re-enables it).
+    STATE_LONLAT_DEFAULT = False
+
     def __init__(
         self,
         simulation_uuid: str,
@@ -94,6 +101,12 @@ class TeraSimCoSimInProcessPlugin(TeraSimCoSimPlugin):
             # auto_run would advance SUMO without tick requests; this link is
             # strictly lock-stepped, so reject it early.
             raise ValueError("TeraSimCoSimInProcessPlugin requires auto_run=False")
+
+        # This plugin logs on the per-step hot path while holding the GIL, so
+        # DEBUG-level chatter (e.g. the per-command dump) stays off unless
+        # explicitly requested; INFO keeps the step-finished measurement line.
+        if os.getenv("TERASIM_COSIM_LOG_DEBUG", "") in ("", "0", "false", "no"):
+            self.logger.setLevel(logging.INFO)
 
         self._lock = threading.Lock()
         self._status = "created"
@@ -215,7 +228,7 @@ class TeraSimCoSimInProcessPlugin(TeraSimCoSimPlugin):
             self._apply_agent_command(command)
 
         self._set_status("running")
-        self.logger.info("Simulation step started")
+        self.logger.debug("Simulation step started")
         return True
 
     def function_after_env_step(self, simulator: Simulator, ctx):
