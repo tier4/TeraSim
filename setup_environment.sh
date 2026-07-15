@@ -62,56 +62,6 @@ check_gcc_gpp() {
 }
 
 
-check_redis() {
-    log_info "Checking Redis service..."
-    if ! check_command redis-cli; then
-        log_warning "Redis not installed"
-        read -p "Install Redis? (y/n) " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-                sudo apt-get update
-                sudo apt-get install -y redis-server
-            elif [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS
-                if check_command brew; then
-                    brew install redis
-                else
-                    log_error "Please install Homebrew first or install Redis manually"
-                    exit 1
-                fi
-            else
-                log_error "Please install Redis manually: https://redis.io/download"
-                exit 1
-            fi
-        fi
-    fi
-    
-    # Check Redis service status (compatible with different systems)
-    if command -v systemctl &> /dev/null; then
-        if ! systemctl is-active --quiet redis-server 2>/dev/null; then
-            log_warning "Redis service not running"
-            read -p "Start Redis service? (y/n) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                sudo systemctl start redis-server
-                log_info "Redis service started"
-            fi
-        else
-            log_info "Redis service is running"
-        fi
-    else
-        # macOS or other systems
-        if ! redis-cli ping &>/dev/null; then
-            log_warning "Redis not responding. Please start Redis manually"
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                log_info "On macOS, you can start Redis with: brew services start redis"
-            fi
-        else
-            log_info "Redis is responding"
-        fi
-    fi
-}
 
 setup_monorepo() {
     log_info "Setting up TeraSim monorepo..."
@@ -305,7 +255,6 @@ main() {
     
     check_python
     check_gcc_gpp
-    check_redis
     setup_sumo_tools
     setup_environment_variables
     setup_monorepo

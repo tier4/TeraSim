@@ -88,7 +88,7 @@ TeraSim/
 │   ├── terasim-cosmos/     # TeraSim-World integration & generative AI sensor simulation
 │   ├── terasim-sensor/     # Baseline sensor utilities
 │   ├── terasim-datazoo/    # Data processing utilities for real driving datasets
-│   ├── terasim-service/    # RESTful API for external simulators
+│   ├── terasim-service/    # Single-process CARLA co-simulation link
 │   └── terasim-vis/        # Visualization and analysis tools
 ├── examples/               # Example configurations and scenarios
 ├── docs/                   # Documentation and figures
@@ -128,7 +128,6 @@ See [README_DOCKER.md](README_DOCKER.md) for detailed Docker deployment instruct
 
 * Python 3.10–3.12
 * SUMO 1.23.1 (installed by the setup script)
-* Redis for service components
 * gcc/g++ compilers (for Cython extensions)
 
 ---

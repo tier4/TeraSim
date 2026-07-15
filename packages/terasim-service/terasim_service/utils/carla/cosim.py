@@ -24,14 +24,6 @@ from .tools import (
     sumo_to_carla,
     spawn_actor,
 )
-from ..service import (
-    control_agent,
-    start_terasim,
-    stop_terasim,
-    tick_terasim,
-    get_terasim_status,
-    get_terasim_states,
-)
 
 AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
@@ -80,7 +72,6 @@ class CarlaCosim(object):
         self.control_av = args.control_av
         self.initialize_av = False
         self.av_shape = []
-        self.async_mode = args.async_mode
         self.step_length = args.step_length
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
@@ -155,32 +146,21 @@ class CarlaCosim(object):
         self.bike_blueprints = create_bike_blueprint(self.world)
         self.bikeandmotor_blueprints = create_bikeandmotor_blueprint(self.world)
 
-        # self.sync_cosim_construction_zone_to_carla()
-
-        # start / connect to TeraSim
+        # Connect to TeraSim: single-process mode only (terasim_service.run_cosim).
+        # The TeraSim simulation loop runs on another thread of THIS process;
+        # commands and states are exchanged as Python objects (no JSON). The
+        # runner already waited for wait_for_tick.
         self.inprocess_plugin = getattr(args, "inprocess_plugin", None)
+        if self.inprocess_plugin is None:
+            raise ValueError(
+                "CarlaCosim requires args.inprocess_plugin "
+                "(TeraSimCoSimInProcessPlugin); the former Redis/HTTP and gRPC "
+                "transports were removed. Use terasim_service.run_cosim."
+            )
         self._inproc_tick_handle = None
-        self._inproc_prev_state = None
-        if self.inprocess_plugin is not None:
-            # Single-process mode (terasim_service.run_cosim): the TeraSim
-            # simulation loop runs on another thread of THIS process; commands
-            # and states are exchanged as Python objects (no Redis/HTTP/gRPC,
-            # no JSON). The runner already waited for wait_for_tick.
-            # Seed the render pipeline with the initial (post-warmup) state so
-            # the first tick behaves like the polling path (AV shape init etc.).
-            self._inproc_prev_state = self.inprocess_plugin.get_result().state
-            self.terasim = {"simulation_id": "inprocess"}
-        else:
-            terasim_init_command = {
-                "config_file": args.terasim_config,
-                "auto_run": False,
-            }
-            self.terasim = start_terasim(args.terasim_host, args.terasim_port, terasim_init_command)
-            while True:
-                terasim_status = get_terasim_status(args.terasim_host, args.terasim_port, self.terasim["simulation_id"])
-                if terasim_status.get("status", None) == "wait_for_tick":
-                    break
-                time.sleep(0.1)
+        # Seed the render pipeline with the initial (post-warmup) state so the
+        # first tick behaves like later ones (AV shape init etc.).
+        self._inproc_prev_state = self.inprocess_plugin.get_result().state
 
         # Auto-calibrate SUMO-CARLA coordinate transformation
         self.sumo_carla_offset = [0.0, 0.0]
@@ -388,59 +368,12 @@ class CarlaCosim(object):
         return [offset_x, offset_y]
 
     def tick(self):
-        if self.inprocess_plugin is not None:
-            return self._tick_inprocess()
-        if self.async_mode:
-            time_start = time.time()
-            if self.control_av:
-                self.sync_carla_av_to_cosim()
-
-            self.sync_cosim_actor_to_carla()
-            self.sync_cosim_tls_to_carla()
-
-            self._last_world_frame = self.world.tick()
-            time_end = time.time()
-            elapsed = time_end - time_start
-            if elapsed < self.step_length:
-                time.sleep(self.step_length - elapsed)
-        else:
-            while True:
-                terasim_status_http_response = get_terasim_status(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
-                terasim_status = terasim_status_http_response.get("status", None)
-                if terasim_status == "ticked" or terasim_status == "wait_for_tick":
-                    break
-                elif terasim_status is None:
-                    print("TeraSim status is None. Exiting...")
-                    return False
-                else:
-                    time.sleep(0.05)
-
-            if self.control_av:
-                self.sync_carla_av_to_cosim()
-
-            self.sync_cosim_actor_to_carla()
-            if not getattr(self.args, "skip_tls", False):
-                self.sync_cosim_tls_to_carla()
-
-            tick_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
-
-            # 3-cosim passive mode: the psim bridge (autoware_carla_interface) is the sole
-            # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
-            # psim tick so the two clients stay synchronized on one CARLA server.
-            if getattr(self.args, "passive_tick", False):
-                snapshot = self.world.wait_for_tick()
-                self._last_world_frame = getattr(snapshot, "frame", None)
-            else:
-                self._last_world_frame = self.world.tick()
-        return True
-
-    def _tick_inprocess(self):
         """One co-sim step over the in-process link (single process, no RPC).
 
-        Pipeline parity with the two-process paths: the state rendered into
-        CARLA is the previous step's state, and the SUMO step requested this
-        tick computes on the sim thread while this thread renders into CARLA
-        and waits for the CARLA tick.
+        Pipeline parity with the former two-process transports: the state
+        rendered into CARLA is the previous step's state, and the SUMO step
+        requested this tick computes on the sim thread while this thread
+        renders into CARLA and waits for the CARLA tick.
         """
         # Resolve the step requested on the previous tick.
         if self._inproc_tick_handle is not None:
@@ -465,13 +398,16 @@ class CarlaCosim(object):
         # thread renders below and waits for the CARLA tick.
         self._inproc_tick_handle = self.inprocess_plugin.tick_async(commands)
 
-        # Render the previous step's state (same one-step latency as the
-        # other paths, which render the state before requesting its tick).
+        # Render the previous step's state (one step of latency, as the former
+        # transports also rendered the state before requesting its tick).
         if self._inproc_prev_state is not None:
             self.sync_cosim_actor_to_carla(self._inproc_prev_state)
             if not getattr(self.args, "skip_tls", False):
                 self.sync_cosim_tls_to_carla(self._inproc_prev_state)
 
+        # 3-cosim passive mode: the psim bridge (autoware_carla_interface) is the sole
+        # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
+        # psim tick so the two clients stay synchronized on one CARLA server.
         if getattr(self.args, "passive_tick", False):
             snapshot = self.world.wait_for_tick()
             self._last_world_frame = getattr(snapshot, "frame", None)
@@ -479,24 +415,12 @@ class CarlaCosim(object):
             self._last_world_frame = self.world.tick()
         return True
 
-    def sync_carla_av_to_cosim(self):
-        """Build the AV set_state command and send it over the HTTP service link."""
-        av_command = self._build_av_command()
-        if av_command is None:
-            return
-        control_agent(
-            self.args.terasim_host,
-            self.args.terasim_port,
-            self.terasim["simulation_id"],
-            av_command,
-        )
-
     def _build_av_command(self):
         # 3-cosim: the ego that drives in CARLA is the Autoware ego (role "ego_vehicle"), not the
         # SUMO-spawned "AV". Read that actor's pose and build a set_state command for the SUMO AV
         # so background traffic avoids it. Returns None when the command cannot be built yet
-        # (actor missing / av_shape not initialized). Sending is up to the caller: the polling
-        # path POSTs it (sync_carla_av_to_cosim), the direct path attaches it to the Tick RPC.
+        # (actor missing / av_shape not initialized). The caller (tick) attaches it to the
+        # tick_async request.
         av_role = getattr(self.args, "av_carla_role", AV_SUMO_ID)
 
         if not self.av_shape:
@@ -574,10 +498,7 @@ class CarlaCosim(object):
 
         return av_command
         
-    def sync_cosim_tls_to_carla(self, terasim_states=None):
-        if terasim_states is None:
-            terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
-
+    def sync_cosim_tls_to_carla(self, terasim_states):
         if not terasim_states:
             print("terasim_states not available.")
             return
@@ -675,15 +596,8 @@ class CarlaCosim(object):
 
         return filtered_vehicles, vrus
 
-    def sync_cosim_actor_to_carla(self, terasim_states=None):
-        """Update all actors in cosim to CARLA.
-
-        terasim_states: pass the state dict directly (direct/gRPC mode); None
-        fetches it from the service over HTTP (Redis-era path).
-        """
-        if terasim_states is None:
-            terasim_states = get_terasim_states(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
-
+    def sync_cosim_actor_to_carla(self, terasim_states):
+        """Update all actors in cosim to CARLA from the given state dict."""
         if not terasim_states:
             print("terasim_states not available.")
             return
@@ -771,74 +685,6 @@ class CarlaCosim(object):
         self._prune_spawn_failures(vehicles.keys(), vrus.keys())
 
         # self.sync_cosim_tls_to_carla()
-
-    def sync_cosim_construction_zone_to_carla(self):
-        def add_interpolated_points(points, offset):
-            """
-            Interpolates additional points to ensure no two consecutive points
-            after UTM transformation have a distance greater than the specified offset.
-            """
-            refined_points = []
-            print("enter add_interpolated_points")
-            for i in range(len(points) - 1):
-                p1 = points[i]
-                p2 = points[i + 1]
-                # p1 = utm_to_carla(points[i][0], points[i][1])
-                # p2 = utm_to_carla(points[i + 1][0], points[i + 1][1])
-                refined_points.append(p1)  # Add the current transformed point
-
-                # Calculate the 2D distance between transformed points (x, y only)
-                distance = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
-                if distance > offset:
-                    # Add intermediate points
-                    num_new_points = int(distance // offset)
-                    for j in range(1, num_new_points + 1):
-                        # Linear interpolation to find new points
-                        new_x = p1[0] + j * (p2[0] - p1[0]) / (num_new_points + 1)
-                        new_y = p1[1] + j * (p2[1] - p1[1]) / (num_new_points + 1)
-                        refined_points.append((new_x, new_y))
-
-            refined_points.append(points[-1])  # Add the last transformed point
-            return refined_points
-
-        try:
-            construction_zone_info = self.redis_client.get(CONSTRUCTION_ZONE_INFO)
-            if not construction_zone_info:
-                print("construction_zone_info is None or empty")
-                return
-        except Exception as e:
-            print(f"Error fetching construction zone info: {e}")
-            return
-
-        print("entering construction zone")
-        if construction_zone_info:
-            closed_lane_shapes = construction_zone_info.closed_lane_shapes
-
-            for closed_lane_shape in closed_lane_shapes:
-                closed_lane_shape = add_interpolated_points(closed_lane_shape, 10)
-                for cone_point in closed_lane_shape:
-                    construction_cone = create_construction_zone_blueprint(self.world)
-                    spawn_point = carla.Transform()
-                    spawn_point.location.x, spawn_point.location.y = utm_to_carla(
-                        cone_point[0], cone_point[1]
-                    )
-                    spawn_point.location.z = get_z_offset(
-                        self.world,
-                        start_location=carla.Location(
-                            spawn_point.location.x, spawn_point.location.y, 300
-                        ),
-                        end_location=carla.Location(
-                            spawn_point.location.x, spawn_point.location.y, 200
-                        ),
-                    )
-                    id = spawn_actor(
-                        client=self.client,
-                        blueprint=construction_cone,
-                        transform=spawn_point,
-                        world=self.world,
-                        actor_role="construction_cone",
-                    )
-                    print(f"created construction cone: {id}")
 
     def _transform_sumo_to_xodr(self, sumo_x, sumo_y):
         """Transform SUMO coordinates to xodr/CARLA coordinate system.
@@ -1457,7 +1303,4 @@ class CarlaCosim(object):
             destroy_all_actors(self.world)
 
         # stop TeraSim
-        if self.inprocess_plugin is not None:
-            self.inprocess_plugin.request_stop()
-        else:
-            stop_terasim(self.args.terasim_host, self.args.terasim_port, self.terasim["simulation_id"])
+        self.inprocess_plugin.request_stop()

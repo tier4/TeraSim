@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y \
     libproj-dev \
     libxml2-dev \
     libxslt1-dev \
-    redis-server \
     # X11/GL libs needed by SUMO binary
     libx11-6 \
     libxrender1 \
@@ -58,8 +57,5 @@ RUN python3 -c "import terasim; print('terasim OK')" && \
 
 # Create output directory with open permissions
 RUN mkdir -p /app/outputs && chmod 777 /app/outputs
-
-# Expose ports: 8000 (FastAPI), 6379 (Redis)
-EXPOSE 8000 6379
 
 CMD ["/bin/bash"]

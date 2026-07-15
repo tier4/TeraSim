@@ -24,12 +24,14 @@ services:
       # 背景車両数百台では per-actor RPC が支配的なので常時 ON にする)
       - CARLA_COSIM_BATCH_TRANSFORM=1
       - CARLA_COSIM_BATCH_SPAWN=1
-      # ego(AV)周辺のみ CARLA に同期する間引き(既定 OFF、ホスト env で opt-in)
+      # ego(AV)周辺のみ CARLA に同期する間引き(既定 OFF。STATE_FILTER が既定 ON の
+      # ため通常は不要 = state 自体が周辺のみになる)
       - CARLA_COSIM_ACTOR_FILTER=${CARLA_COSIM_ACTOR_FILTER:-0}
-      # TeraSim 側の state 構築も ego(AV)周辺に間引く(既定 OFF、ホスト env で opt-in)。
-      # CARLA_COSIM_ACTOR_FILTER と同半径なら挙動等価のまま、state 構築コストが
-      # 総台数比例 → 周辺台数比例になる(高台数域の主要な高速化)
-      - TERASIM_COSIM_STATE_FILTER=${TERASIM_COSIM_STATE_FILTER:-0}
+      # TeraSim 側の state 構築を ego(AV)周辺に間引く(**既定 ON**、2026-07-15〜。
+      # TERASIM_COSIM_STATE_FILTER=0 で全車両 state に戻せる)。state 構築コストが
+      # 総台数比例 → 周辺台数比例になる(高台数域の主要な高速化。2,000 台 22ms の
+      # 前提施策 = step-time-optimization.md §7/§9)
+      - TERASIM_COSIM_STATE_FILTER=${TERASIM_COSIM_STATE_FILTER:-1}
       - TERASIM_COSIM_STATE_FILTER_RADIUS=${TERASIM_COSIM_STATE_FILTER_RADIUS:-300}
       # ego 頭上の "AV" ラベル描画(毎 tick 1 RPC)。headless 測定では 0 で無効化
       - CARLA_COSIM_EGO_LABEL=${CARLA_COSIM_EGO_LABEL:-1}

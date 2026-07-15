@@ -22,7 +22,7 @@ echo "  CARLA :${CARLA_PORT}"
 echo "  scenario: ${SCENARIO}"
 echo "=========================================="
 
-# ── Step 1: CARLA の ego 以外の車両を掃除(冪等化、redis 版と同一) ──
+# ── Step 1: CARLA の ego 以外の車両を掃除(冪等化) ──
 #   前回 run の SUMO 背景車両が CARLA(=psim 所有、コンテナと別ライフサイクル)に残ると
 #   次回注入が "collision at spawn position" で詰まる。ego(ego_vehicle/hero)は保護。
 echo "[1/2] CARLA :${CARLA_PORT} の ego 以外を掃除(前回残骸の除去、冪等化)"

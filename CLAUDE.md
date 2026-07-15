@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TeraSim is an open-source traffic simulation platform designed for naturalistic and adversarial testing of autonomous vehicles (AVs). It enables high-speed, AI-driven testing environment generation to expose AVs to both routine and rare, high-risk driving conditions. Built upon SUMO (Simulation of Urban MObility), TeraSim extends its capabilities for specialized AV testing.
 
-This is a monorepo containing multiple Python packages managed with uv workspace. The project includes the core simulation engine, NDE-NADE algorithms for naturalistic and adversarial environments, a FastAPI service for integration, environment generation tools, data processing utilities, and visualization components.
+This is a monorepo containing multiple Python packages managed with uv workspace. The project includes the core simulation engine, NDE-NADE algorithms for naturalistic and adversarial environments, a single-process CARLA co-simulation link (terasim-service), environment generation tools, data processing utilities, and visualization components.
 
 ## Common Development Commands
 
@@ -62,21 +62,15 @@ uv run mypy packages/terasim/
 
 ### Running Simulations
 ```bash
-# Run main simulation with HTTP API (default: police pullover scenario)
-python run_experiments.py
-
 # Run debug mode with GUI (cutin scenario)
 python run_experiments_debug.py
-
-# Start TeraSim FastAPI service
-python run_service.py  # Starts on port 8000
 
 # Run basic simulation example
 cd examples/scripts/
 python example.py  # Set gui_flag=True in script for GUI mode
 
-# Run with custom scenario
-python run_experiments.py --config examples/scenarios/urban_construction_ann_arbor.yaml
+# CARLA co-simulation, single process (TeraSim loop + CARLA client in one process)
+python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yaml --carla_port 2013
 ```
 
 ## Architecture Overview
@@ -123,11 +117,10 @@ TeraSim/
 
 ### Service Architecture
 
-**TeraSim Service (`packages/terasim-service/`)**: RESTful API for integration:
-- FastAPI-based service for external simulator integration
-- Supports CARLA co-simulation
-- Real-time visualization with Dash
-- Message passing for agent states and commands
+**TeraSim Service (`packages/terasim-service/`)**: single-process CARLA co-simulation link:
+- TeraSim simulation loop and the CARLA-facing client run as two threads of ONE process
+  (`terasim_service.run_cosim`), exchanging states/commands as plain Python objects
+- The former transports (Redis lists + FastAPI service, then gRPC) were removed
 
 ### Key Design Patterns
 
@@ -158,7 +151,7 @@ TeraSim/
 
 ### Package Dependencies
 - **Core**: eclipse-sumo==1.23.1, numpy==1.26.4, scipy, attrs, bidict
-- **Service**: fastapi, uvicorn, redis, dash
+- **Service**: pydantic, pyyaml, loguru, utm (plus the CARLA client wheel at runtime)
 - **NDE-NADE**: Cython extensions for performance
 - **Visualization**: matplotlib, plotly, folium
 
@@ -184,6 +177,5 @@ TeraSim/
 
 ### Running with CARLA Co-simulation
 1. Start CARLA server
-2. Configure co-simulation in service settings
-3. Use `terasim-service` with cosim plugin
-4. Exchange states via API endpoints
+2. Run `python -m terasim_service.run_cosim --config <scenario yaml> --carla_port <port>`
+   (single process: TeraSimCoSimInProcessPlugin + CarlaCosim client)

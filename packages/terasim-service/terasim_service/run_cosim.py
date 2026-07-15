@@ -28,8 +28,10 @@ from pathlib import Path
 
 from loguru import logger
 
-from .plugins.cosim import DEFAULT_COSIM_PLUGIN_CONFIG
-from .plugins.cosim_inprocess import TeraSimCoSimInProcessPlugin
+from .plugins.cosim_inprocess import (
+    DEFAULT_COSIM_PLUGIN_CONFIG,
+    TeraSimCoSimInProcessPlugin,
+)
 from .utils.base import (
     create_environment,
     create_simulator,
@@ -55,7 +57,7 @@ def main():
     p.add_argument("--config", required=True, help="TeraSim scenario yaml path")
     p.add_argument("--ready_timeout", default=600.0, type=float,
                    help="max seconds to wait for the SUMO network to load")
-    # CARLA client options (mirror examples/scripts/carla_cosim_3cosim.py)
+    # CARLA client options (same set the removed two-process client scripts took)
     p.add_argument("--carla_host", default="127.0.0.1")
     p.add_argument("--carla_port", default=2013, type=int,
                    help="psim CARLA RPC port (default 2013)")
@@ -83,10 +85,8 @@ def main():
         sys.setswitchinterval(switch_interval)
     logger.info(f"[run_cosim] GIL switch interval: {sys.getswitchinterval() * 1000:.2f}ms")
 
-    # 3-cosim passive mode: fixed flags consumed by CarlaCosim.tick()/_cleanup_actors()/close()
-    # (same set carla_cosim_3cosim.py pinned for the two-process paths).
+    # 3-cosim passive mode: fixed flags consumed by CarlaCosim.tick()/_cleanup_actors()/close().
     args.passive_tick = True   # follow psim's world.tick() via wait_for_tick(); never tick here
-    args.async_mode = False
     args.skip_tls = not args.sync_tls
     args.control_av = True     # feed the Autoware ego pose back to the SUMO AV
     args.terasim_config = args.config  # CarlaCosim reads the SUMO net path from the scenario yaml
