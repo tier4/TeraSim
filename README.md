@@ -64,13 +64,21 @@ docker build -f Dockerfile.cosim -t terasim-service:latest .
 
 ## Running
 
+The runners are generic: everything map-specific (SUMO net paths, routes,
+adversity setup, run time) lives in a scenario YAML under
+`examples/scenarios/`, which you pass to the runner. Two ready-to-run
+scenarios ship with their maps: **Town01** (CARLA's stock map — works for
+both co-simulation and standalone runs) and **Mcity** (standalone NADE runs;
+CARLA has no matching map here).
+
 ```bash
 # CARLA co-simulation, single process (a CARLA server must be running)
 python -m terasim_service.run_cosim \
     --config examples/scenarios/cosim_town01.yaml --carla_port 2013
 
-# Standalone NADE run (no CARLA), GUI controlled by the scenario yaml
-python scripts/run_experiments_debug.py --config <scenario yaml>
+# Standalone NADE run (no CARLA needed)
+python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
+python scripts/run_experiments_debug.py --config examples/scenarios/cosim_town01.yaml
 
 # FCD trajectory visualization (fcd_all output -> plots/video)
 python scripts/visualize_fcd.py configs/visulation/example.yaml

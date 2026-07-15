@@ -36,12 +36,17 @@ ruff check packages/
 ```
 
 ### Running Simulations
+
+The runners are generic; everything map-specific lives in the scenario YAML.
+Bundled ready-to-run scenarios: `cosim_town01.yaml` (co-sim + standalone) and
+`Mcity_safety_assessment.yaml` (standalone NADE only — CARLA has no Mcity map).
+
 ```bash
 # CARLA co-simulation, single process (a CARLA server must be running)
 python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yaml --carla_port 2013
 
 # Standalone NADE run (no CARLA), GUI controlled by the scenario yaml
-python scripts/run_experiments_debug.py --config <scenario yaml>
+python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
 
 # FCD trajectory visualization
 python scripts/visualize_fcd.py configs/visulation/example.yaml
