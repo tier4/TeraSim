@@ -15,7 +15,7 @@ def test_defaults_enable_actor_scope_and_batching():
 
     assert config == CosimConfig()
     assert config.actor_scope.enabled is True
-    assert config.lane_relative_position is False
+    assert config.lane_relative_position is True
     assert config.batch.transform_updates is True
     assert config.batch.actor_spawns is True
     assert config.spawn.z_clearance_m == 5.0

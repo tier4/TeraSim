@@ -63,7 +63,7 @@ class CosimConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor_scope: ActorScopeConfig = Field(default_factory=ActorScopeConfig)
-    lane_relative_position: bool = False
+    lane_relative_position: bool = True
     batch: BatchConfig = Field(default_factory=BatchConfig)
     spawn: SpawnConfig = Field(default_factory=SpawnConfig)
     backoff: BackoffConfig = Field(default_factory=BackoffConfig)

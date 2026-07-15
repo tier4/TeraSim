@@ -10,7 +10,7 @@ cosim:
     enabled: true
     center_id: "AV"
     radius_m: 300.0
-  lane_relative_position: false
+  lane_relative_position: true
   batch:
     transform_updates: true
     actor_spawns: true
