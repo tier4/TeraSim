@@ -1,23 +1,26 @@
 import json
 import logging
-import os
+import subprocess
+import time
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
 import numpy as np
 import redis
 from redis.exceptions import RedisError
-import time
-import subprocess
-from pathlib import Path
-
 from terasim.overlay import traci
 from terasim.simulator import Simulator
-
 from terasim_nde_nade.adversity import ConstructionAdversity
 
-from .base import BasePlugin, DEFAULT_REDIS_CONFIG
-
-from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
+from ..cosim_config import (
+    CosimConfig,
+    load_cosim_config,
+    log_effective_cosim_config,
+    save_effective_cosim_config,
+)
+from ..utils import AgentCommand, AgentStateSimplified, SimulationState, SUMOSignal
 from ..utils.sumo_lane_geometry import reconstruct_position_from_lane_geometry
+from .base import DEFAULT_REDIS_CONFIG, BasePlugin
 
 
 def interpolate_by_distance(points, step):
@@ -124,6 +127,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         enable_viz=False,
         viz_port=8050,
         viz_update_freq=5,
+        cosim_config: CosimConfig | None = None,
     ):
         """Initialize the Co-Simulation plugin.
 
@@ -153,6 +157,13 @@ class TeraSimCoSimPlugin(BasePlugin):
         # Setup logging
         self.logger = self._setup_logger(base_dir)
 
+        self.cosim_config = cosim_config or load_cosim_config({})
+        log_effective_cosim_config(self.cosim_config, self.logger)
+        effective_config_path = save_effective_cosim_config(
+            self.cosim_config, base_dir
+        )
+        self.logger.info("Saved effective co-sim config to %s", effective_config_path)
+
         # Maintain controlled agents in each step, assuming each agent can be controlled by only one command
         self.controlled_agents_each_step = set()
 
@@ -166,20 +177,14 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.error_count = 0
         self.last_successful_operation = time.time()
 
-        self.idle_state_write_interval = self._parse_float_env(
-            "TERASIM_COSIM_IDLE_STATE_WRITE_INTERVAL", 0.5
+        self.idle_state_write_interval = (
+            self.cosim_config.idle_state_write_interval_seconds
         )
         self._last_idle_state_write_wall_time = 0.0
 
-        self.state_filter_enabled = self._parse_bool_env(
-            "TERASIM_COSIM_STATE_FILTER", False
-        )
-        self.state_filter_center_id = os.getenv(
-            "TERASIM_COSIM_STATE_FILTER_CENTER_ID", "AV"
-        )
-        self.state_filter_radius = self._parse_optional_float(
-            os.getenv("TERASIM_COSIM_STATE_FILTER_RADIUS", "")
-        )
+        self.state_filter_enabled = self.cosim_config.actor_scope.enabled
+        self.state_filter_center_id = self.cosim_config.actor_scope.center_id
+        self.state_filter_radius = self.cosim_config.actor_scope.radius_m
         self.state_filter_missing_center_logged = False
         self.state_filter_error_logged = False
         if self.state_filter_enabled:
@@ -189,40 +194,14 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self.state_filter_radius,
             )
 
-        self.lane_relative_position_enabled = self._parse_bool_env(
-            "TERASIM_COSIM_LANE_RELATIVE_POSITION", False
+        self.lane_relative_position_enabled = (
+            self.cosim_config.lane_relative_position
         )
         if self.lane_relative_position_enabled:
             self.logger.info(
                 "TeraSim co-sim lane-relative reconstructed positions enabled "
                 "for filtered state vehicles"
             )
-
-    @staticmethod
-    def _parse_float_env(name, default):
-        value = os.getenv(name)
-        if value in (None, ""):
-            return default
-        try:
-            return float(value)
-        except ValueError:
-            return default
-
-    @staticmethod
-    def _parse_bool_env(name, default=False):
-        value = os.getenv(name)
-        if value in (None, ""):
-            return default
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-
-    @staticmethod
-    def _parse_optional_float(value):
-        if value in (None, ""):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
 
     def _setup_logger(self, base_dir: str) -> logging.Logger:
         """Setup logger for the plugin.

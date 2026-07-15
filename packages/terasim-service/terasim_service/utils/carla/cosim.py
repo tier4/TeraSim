@@ -1,14 +1,23 @@
-import time
 import json
 import math
-import os
-import re
-import carla
 import random
-import xml.etree.ElementTree as ET
-import yaml
+import re
 import statistics
+import time
+import xml.etree.ElementTree as ET
 
+import carla
+import yaml
+
+from ...cosim_config import load_cosim_config
+from ..service import (
+    control_agent,
+    get_terasim_states,
+    get_terasim_status,
+    start_terasim,
+    stop_terasim,
+    tick_terasim,
+)
 from .tools import (
     carla_to_sumo,
     create_bike_blueprint,
@@ -21,43 +30,25 @@ from .tools import (
     draw_text,
     get_actor_id_from_attribute,
     log_spawn_actor_failure,
-    sumo_to_carla,
     spawn_actor,
-)
-from ..service import (
-    control_agent,
-    start_terasim,
-    stop_terasim,
-    tick_terasim,
-    get_terasim_status,
-    get_terasim_states,
+    sumo_to_carla,
 )
 
 AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
 
 
-def _env_float(name, default):
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
-        return default
-
-
-def _env_bool(name, default=False):
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 class CarlaCosim(object):
     def __init__(self, args):
         self.args = args
+        with open(args.terasim_config, "r", encoding="utf-8") as stream:
+            scenario_config = yaml.safe_load(stream) or {}
+        self.cosim_config = load_cosim_config(scenario_config)
+        print(
+            "Effective co-sim config: "
+            + json.dumps(self.cosim_config.model_dump(mode="json"), sort_keys=True),
+            flush=True,
+        )
 
         self.client = carla.Client(args.carla_host, args.carla_port)
         self.client.set_timeout(getattr(args, 'carla_timeout', 10.0))
@@ -85,42 +76,25 @@ class CarlaCosim(object):
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
-        self.use_lane_relative_position = _env_bool(
-            "CARLA_COSIM_USE_LANE_RELATIVE_POSITION",
-            bool(getattr(args, "use_lane_relative_position", False)),
-        )
+        self.use_lane_relative_position = self.cosim_config.lane_relative_position
         if self.use_lane_relative_position:
             print("CARLA co-sim lane-relative reconstructed positions enabled.", flush=True)
-        self.spawn_failure_backoff_seconds = max(
-            0.0,
-            _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS", 5.0),
-        )
-        self.spawn_failure_backoff_max_seconds = max(
-            self.spawn_failure_backoff_seconds,
-            _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS", 30.0),
-        )
-        self.batch_transform_enabled = _env_bool("CARLA_COSIM_BATCH_TRANSFORM", False)
+        self.spawn_failure_backoff_seconds = self.cosim_config.backoff.initial_seconds
+        self.spawn_failure_backoff_max_seconds = self.cosim_config.backoff.max_seconds
+        self.batch_transform_enabled = self.cosim_config.batch.transform_updates
         if self.batch_transform_enabled:
             print("CARLA co-sim ApplyTransform batching enabled.", flush=True)
-        self.batch_spawn_enabled = _env_bool("CARLA_COSIM_BATCH_SPAWN", False)
+        self.batch_spawn_enabled = self.cosim_config.batch.actor_spawns
         if self.batch_spawn_enabled:
             print("CARLA co-sim SpawnActor batching enabled.", flush=True)
-        self.spawn_z_clearance = max(
-            0.0,
-            _env_float("CARLA_COSIM_SPAWN_Z_CLEARANCE", self.SPAWN_Z_CLEARANCE),
-        )
+        self.spawn_z_clearance = self.cosim_config.spawn.z_clearance_m
         print(
             f"CARLA co-sim spawn Z clearance: {self.spawn_z_clearance:.1f}m.",
             flush=True,
         )
-        self.actor_filter_enabled = _env_bool("CARLA_COSIM_ACTOR_FILTER", False)
-        self.actor_filter_center_id = (
-            os.environ.get("CARLA_COSIM_ACTOR_FILTER_CENTER_ID") or AV_SUMO_ID
-        )
-        self.actor_filter_radius = max(
-            0.0,
-            _env_float("CARLA_COSIM_ACTOR_FILTER_RADIUS", 300.0),
-        )
+        self.actor_filter_enabled = self.cosim_config.actor_scope.enabled
+        self.actor_filter_center_id = self.cosim_config.actor_scope.center_id
+        self.actor_filter_radius = self.cosim_config.actor_scope.radius_m
         self._actor_filter_missing_center_warned = False
         if self.actor_filter_enabled:
             print(

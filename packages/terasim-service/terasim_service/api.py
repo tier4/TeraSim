@@ -12,21 +12,19 @@ from fastapi import Body, Depends, FastAPI, HTTPException
 from loguru import logger
 from pydantic import Field
 
-from terasim_service.plugins import (
-    DEFAULT_COSIM_PLUGIN_CONFIG, 
-    TeraSimCoSimPlugin
-)
+from terasim_service.cosim_config import load_cosim_config
+from terasim_service.plugins import DEFAULT_COSIM_PLUGIN_CONFIG, TeraSimCoSimPlugin
 from terasim_service.utils import (
+    AgentCommand,
+    AgentCommandBatch,
+    SimulationCommand,
+    SimulationConfig,
+    SimulationStatus,
     check_redis_connection,
     create_environment,
     create_simulator,
     load_config,
     resolve_config_paths,
-    SimulationConfig,
-    SimulationCommand,
-    SimulationStatus,
-    AgentCommand,
-    AgentCommandBatch,
     set_random_seed,
 )
 
@@ -207,7 +205,8 @@ async def run_simulation_task(simulation_id: str, config: dict, auto_run: bool, 
             auto_run=auto_run,
             enable_viz=enable_viz,
             viz_port=viz_port,
-            viz_update_freq=viz_update_freq
+            viz_update_freq=viz_update_freq,
+            cosim_config=load_cosim_config(config),
         )
         terasim_cosim_plugin.inject(sim, {})
         

@@ -5,6 +5,22 @@ parameters:
   simulation_time: 3600
 seed: 42
 
+cosim:
+  actor_scope:
+    enabled: true
+    center_id: "AV"
+    radius_m: 300.0
+  lane_relative_position: false
+  batch:
+    transform_updates: true
+    actor_spawns: true
+  spawn:
+    z_clearance_m: 5.0
+  backoff:
+    initial_seconds: 5.0
+    max_seconds: 30.0
+  idle_state_write_interval_seconds: 0.5
+
 simulation_type: "safetest_mcity_av"
 
 output:

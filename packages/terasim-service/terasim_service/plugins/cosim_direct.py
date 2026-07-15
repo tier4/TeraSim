@@ -25,10 +25,10 @@ import time
 from concurrent import futures
 
 import grpc
-
 from terasim.overlay import traci
 from terasim.simulator import Simulator
 
+from ..cosim_config import CosimConfig
 from ..direct import cosim_direct_pb2, cosim_direct_pb2_grpc
 from .cosim import DEFAULT_COSIM_PLUGIN_CONFIG, TeraSimCoSimPlugin
 
@@ -67,6 +67,7 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
         auto_run: bool = False,
         grpc_host: str = "127.0.0.1",
         grpc_port: int = 8200,
+        cosim_config: CosimConfig | None = None,
     ):
         # Parent __init__ only parses config/env and sets up logging; it does
         # NOT connect to Redis (that happens in its function_before_env_start,
@@ -76,6 +77,7 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
             plugin_config=plugin_config,
             base_dir=base_dir,
             auto_run=auto_run,
+            cosim_config=cosim_config,
         )
         if auto_run:
             # auto_run would advance SUMO without Tick RPCs; the direct

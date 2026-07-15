@@ -17,6 +17,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from .cosim_config import load_cosim_config
 from .plugins.cosim import DEFAULT_COSIM_PLUGIN_CONFIG
 from .plugins.cosim_direct import TeraSimCoSimDirectPlugin
 from .utils.base import (
@@ -39,6 +40,7 @@ def main():
 
     config = load_config(args.config)
     config = resolve_config_paths(config, args.config)
+    cosim_config = load_cosim_config(config)
     simulation_id = str(uuid.uuid4())
 
     base_dir = (
@@ -65,6 +67,7 @@ def main():
         auto_run=False,
         grpc_host=args.grpc_host,
         grpc_port=args.grpc_port,
+        cosim_config=cosim_config,
     )
     plugin.inject(sim, {})
 

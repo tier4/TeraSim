@@ -241,6 +241,10 @@ The following is an overview of the REST API requests used to interact with the 
    }
    ```
 
+## Co-simulation configuration
+
+CARLA/TeraSim behavioral settings, typed YAML validation, and effective configuration output are documented in [co-simulation configuration](../../docs/cosim_configuration.md).
+
 ## License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
