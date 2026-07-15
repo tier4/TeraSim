@@ -74,8 +74,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/simulation/test.yaml",
-        help="Path to YAML configuration file (default: configs/simulation/test.yaml)"
+        required=True,
+        help="Path to the scenario YAML configuration file"
     )
 
     args = parser.parse_args()

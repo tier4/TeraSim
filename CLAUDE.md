@@ -4,73 +4,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TeraSim is an open-source traffic simulation platform designed for naturalistic and adversarial testing of autonomous vehicles (AVs). It enables high-speed, AI-driven testing environment generation to expose AVs to both routine and rare, high-risk driving conditions. Built upon SUMO (Simulation of Urban MObility), TeraSim extends its capabilities for specialized AV testing.
+TeraSim is an open-source traffic simulation platform designed for naturalistic and adversarial testing of autonomous vehicles (AVs), built upon SUMO (Simulation of Urban MObility).
 
-This is a monorepo containing multiple Python packages managed with uv workspace. The project includes the core simulation engine, NDE-NADE algorithms for naturalistic and adversarial environments, a single-process CARLA co-simulation link (terasim-service), environment generation tools, data processing utilities, and visualization components.
+This is the **tier4 fork**, reduced to the minimum needed for 3-way co-simulation (Autoware × CARLA × TeraSim): the core simulation engine, the NDE-NADE algorithms, a single-process CARLA co-simulation link (`terasim-service`), and FCD visualization tools. The upstream extras (TeraSim-World/Cosmos, environment generation, dataset tooling, the Redis/FastAPI service) were removed from this fork.
 
 ## Common Development Commands
 
 ### Environment Setup
 ```bash
-# Quick setup (recommended)
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-./setup_environment.sh  # Automated setup script
+# Native (conda)
+./setup_environment.sh
 
-# Manual setup with uv (if needed)
-conda create -n terasim python=3.10
-conda activate terasim
-uv sync  # Install all workspace dependencies
+# Docker (co-simulation image)
+docker build -f Dockerfile.cosim -t terasim-service:latest .
 ```
 
 ### Testing
 ```bash
-# Run all tests with coverage
-uv run pytest
-# or: make test
+# Run all tests with coverage (config in the root pyproject.toml)
+pytest
 
-# Run specific test suites
-make test-core         # Core simulation tests
-make test-envgen      # Environment generation tests
-make test-service     # Service API tests
-make test-integration # Integration tests
-make test-fast        # Skip slow tests
-
-# Run specific test file
-uv run pytest tests/test_core/test_physics.py::test_dummy
-
-# With coverage HTML report
-uv run pytest --cov=terasim --cov-report=html
+# Run a specific test file
+pytest tests/test_core/test_physics.py::test_dummy
 ```
 
 ### Code Quality
 ```bash
-# Format code
-uv run black packages/
-# or: make format
-
-# Sort imports
-uv run isort packages/
-
-# Lint code (ruff is preferred over flake8)
-uv run ruff check packages/
-# or: make lint
-
-# Type checking
-uv run mypy packages/terasim/
+black packages/
+isort packages/
+ruff check packages/
 ```
 
 ### Running Simulations
 ```bash
-# Run debug mode with GUI (cutin scenario)
-python run_experiments_debug.py
-
-# Run basic simulation example
-cd examples/scripts/
-python example.py  # Set gui_flag=True in script for GUI mode
-
-# CARLA co-simulation, single process (TeraSim loop + CARLA client in one process)
+# CARLA co-simulation, single process (a CARLA server must be running)
 python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yaml --carla_port 2013
+
+# Standalone NADE run (no CARLA), GUI controlled by the scenario yaml
+python scripts/run_experiments_debug.py --config <scenario yaml>
+
+# FCD trajectory visualization
+python scripts/visualize_fcd.py configs/visulation/example.yaml
 ```
 
 ## Architecture Overview
@@ -78,17 +52,16 @@ python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yam
 ### Monorepo Structure
 ```
 TeraSim/
-├── packages/               # Python packages (workspace members)
+├── packages/               # Python packages (uv workspace members)
 │   ├── terasim/           # Core simulation engine
 │   ├── terasim-nde-nade/  # NDE-NADE algorithms for naturalistic/adversarial environments
-│   ├── terasim-service/   # FastAPI service for integration
-│   ├── terasim-envgen/    # Environment generation tools
-│   ├── terasim-datazoo/   # Data processing utilities
-│   └── terasim-vis/       # Visualization tools
-├── examples/              # Example simulations and scenarios
-├── configs/               # Configuration files
-├── tests/                 # Test suites
-└── sumo/                  # SUMO source code (if present)
+│   ├── terasim-service/   # Single-process CARLA co-simulation link
+│   └── terasim-vis/       # Visualization tools (FCD plots/videos)
+├── examples/              # Scenario YAMLs, SUMO maps, co-sim launcher script
+├── configs/visulation/    # visualize_fcd.py config example
+├── scripts/               # Runners and tooling
+├── docs/                  # OpenDRIVE / SUMO plain-XML format notes
+└── tests/                 # Test suites (core, NDE-NADE)
 ```
 
 ### Core Components
@@ -103,7 +76,7 @@ TeraSim/
 **Environment System (`packages/terasim/terasim/envs/`)**: Testing environment abstractions:
 - `BaseEnv`: Abstract base with lifecycle hooks (`on_start`, `on_step`, `on_stop`)
 - `EnvTemplate`: Standard testing scenario implementation
-- Environments control simulation flow, agent creation, and termination conditions
+- NADE environments (`terasim-nde-nade`) control adversarial background traffic
 
 **Agent Architecture**: Modular sensor-decision-controller design:
 - **Agent** (`agent/agent.py`): Base class for all entities
@@ -115,11 +88,16 @@ TeraSim/
 
 **Pipeline System (`terasim/pipeline.py`)**: Ordered execution framework with priority-based scheduling for simulation steps.
 
-### Service Architecture
+### Co-simulation Link
 
 **TeraSim Service (`packages/terasim-service/`)**: single-process CARLA co-simulation link:
-- TeraSim simulation loop and the CARLA-facing client run as two threads of ONE process
-  (`terasim_service.run_cosim`), exchanging states/commands as plain Python objects
+- The TeraSim simulation loop (sim thread) and the CARLA-facing client (main thread) run in ONE
+  process (`terasim_service.run_cosim`), rendezvousing through `TeraSimCoSimInProcessPlugin`
+  (two threading.Events; states/commands passed as plain Python objects, no serialization)
+- `CarlaCosim` (`utils/carla/cosim.py`) mirrors SUMO background traffic into CARLA and feeds an
+  externally driven ego (role_name `ego_vehicle`) back into SUMO as the "AV"
+- In 3-cosim passive mode the psim bridge owns `world.tick()`; this process only follows via
+  `world.wait_for_tick()`
 - The former transports (Redis lists + FastAPI service, then gRPC) were removed
 
 ### Key Design Patterns
@@ -145,9 +123,7 @@ TeraSim/
 
 ### Testing Strategy
 - Unit tests per package in `tests/test_*/`
-- Integration tests in `tests/test_integration/`
 - Markers: `@pytest.mark.slow`, `@pytest.mark.requires_sumo`
-- Coverage target: >80% for core modules
 
 ### Package Dependencies
 - **Core**: eclipse-sumo==1.23.1, numpy==1.26.4, scipy, attrs, bidict
@@ -172,7 +148,7 @@ TeraSim/
 ### Adding Adversarial Behavior
 1. Create adversity in `packages/terasim-nde-nade/terasim_nde_nade/adversity/`
 2. Define trigger conditions and behavior modifications
-3. Register in adversity configuration
+3. Register in the scenario yaml (`adversity_cfg`, see `examples/scenarios/cosim_town01.yaml`)
 4. Test with NADE environment
 
 ### Running with CARLA Co-simulation

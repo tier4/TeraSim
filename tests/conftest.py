@@ -84,12 +84,6 @@ def test_maps_dir() -> Path:
     return PROJECT_ROOT / "examples" / "maps"
 
 
-@pytest.fixture
-def mcity_map_path(test_maps_dir) -> Path:
-    """Provide path to Mcity test map."""
-    return test_maps_dir / "Mcity"
-
-
 @pytest.fixture(autouse=True)
 def setup_test_environment():
     """Set up test environment variables and cleanup after tests."""

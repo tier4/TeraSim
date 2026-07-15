@@ -6,150 +6,86 @@
 </p>
 </div>
 
-
-
 <p align="center">
-<strong>Generative AI–Driven Autonomous Vehicle Simulation for Unknown Unsafe Events Discovery</strong>
+<strong>TeraSim (tier4 fork) — naturalistic & adversarial traffic simulation with a single-process CARLA co-simulation link</strong>
 </p>
 
 ---
 
 ## Overview
 
-TeraSim is an open-source platform for automated autonomous-vehicle (AV) simulation using generative AI.
-Its primary objective is to **efficiently uncover real-world unknown unsafe events** by automatically creating diverse and statistically realistic traffic environments.
+This is the [tier4](https://github.com/tier4/TeraSim) fork of [mcity/TeraSim](https://github.com/mcity/TeraSim), reduced to the minimum needed for **3-way co-simulation (Autoware × CARLA × TeraSim)**:
 
-The framework has evolved from its initial focus on planning-and-control testing to a **complete simulation workflow**, which now includes:
+- **NDE/NADE traffic simulation** on SUMO: naturalistic background traffic with adversarial maneuvers (`terasim`, `terasim-nde-nade`)
+- **A single-process CARLA co-simulation link** (`terasim-service`): the TeraSim simulation loop and the CARLA-facing client run as two threads of one process, exchanging states and commands as plain Python objects. TeraSim background traffic is mirrored into a running CARLA server; an externally driven ego (e.g. Autoware via `autoware_carla_interface`) is fed back into SUMO so background traffic reacts to it.
+- **FCD visualization** (`terasim-vis` + `scripts/visualize_fcd.py`) and an **OpenDRIVE→SUMO map conversion pipeline** (`scripts/xodr_to_sumo_converter.py`, sample maps in `examples/xodr_sumo_maps/`)
 
-1. **High-fidelity HD map generation** for large-scale, accurate simulation environments
-2. **Generative traffic environment creation** for naturalistic and adversarial scenario testing
-3. **Generative sensor simulation** for camera and LiDAR perception validation
+The upstream extras (TeraSim-World/Cosmos generative sensor simulation, environment generation, dataset tooling, the Redis/FastAPI service and its clients) have been removed from this fork; see the upstream repository for those.
 
-This expanded scope enables a unified pipeline from map generation to perception and planning validation.
-
-## 🚀 **Updates**
-
-- **[09/29/2025]**: TeraSim-World source codes are available. See [TeraSim_World.md](docs/TeraSim_World.md) to get started.
-
-
-
-## **🌎 New Feature: TeraSim-World**
-
-
-[<img src="docs/figure/TeraSim_World.png" height="400px">](https://www.youtube.com/watch?v=75T1-2Ce0Ds)
-
-<h3 align="center">
-📄 <a href="https://arxiv.org/abs/2509.13164">arXiv</a> | 🌐 <a href="https://wjiawei.com/terasim-world-web/">Website</a> | 🎥 <a href="https://www.youtube.com/watch?v=75T1-2Ce0Ds">Video</a>
-</h3>
-
-**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. 
-
-✨ **Key Capabilities:**
-- 🗺️ **Global Coverage**: Generate realistic driving scenarios for any location worldwide
-- 🎯 **Safety-Critical Data**: Automatically create safety-critical events for E2E AV safety testing
-- 🔄 **NVIDIA Cosmos-Drive Compatible**: Direct integration with video generation model training platforms
-
-🚀 **Source code is now available!** See [TeraSim_World.md](docs/TeraSim_World.md) for getting started guide.
-
----
-
-## Key Capabilities
-
-### 1. High-Fidelity HD Map Generation
-
-* Tools for building **city-scale, high-resolution digital twins** suitable for AV testing.
-* Automated conversion of real-world survey data into simulation-ready HD maps.
-* Provides accurate lane geometry and traffic-control metadata for downstream simulations.
-
-### 2. Generative Traffic Environment Creation
-
-* Automated scenario generation based on **large-scale naturalistic driving data**.
-* **Adversarial scenario synthesis** to reveal rare or high-risk interactions (e.g., aggressive cut-ins, unexpected pedestrian crossings).
-* Integration with [SUMO](https://www.eclipse.org/sumo/) and third-party simulators such as [CARLA](https://carla.org/) and Autoware.
-
-### 3. Generative Sensor Simulation
-
-* **`terasim-cosmos`** integrates TeraSim-World with **generative AI–based camera and LiDAR simulation**.
-* Enables perception validation and sensor pipeline testing under diverse conditions.
-* **Ongoing work:** support for fully **custom sensor models and configurable realism levels** is under active development.
-
----
-
-## System Architecture
-
-TeraSim uses a modular monorepo design. Each package can be used independently or combined into a complete simulation pipeline.
+## Repository Layout
 
 ```
 TeraSim/
 ├── packages/
-│   ├── terasim/            # Core simulation engine
-│   ├── terasim-envgen/     # HD map and environment generation
-│   ├── terasim-nde-nade/   # Naturalistic & adversarial environment algorithms
-│   ├── terasim-cosmos/     # TeraSim-World integration & generative AI sensor simulation
-│   ├── terasim-sensor/     # Baseline sensor utilities
-│   ├── terasim-datazoo/    # Data processing utilities for real driving datasets
+│   ├── terasim/            # Core simulation engine (SUMO integration, agents, pipeline)
+│   ├── terasim-nde-nade/   # Naturalistic & adversarial environment algorithms (Cython)
 │   ├── terasim-service/    # Single-process CARLA co-simulation link
-│   └── terasim-vis/        # Visualization and analysis tools
-├── examples/               # Example configurations and scenarios
-├── docs/                   # Documentation and figures
-└── tests/                  # Test suites
+│   └── terasim-vis/        # Visualization tools (FCD plots/videos)
+├── examples/
+│   ├── maps/               # SUMO nets used by the example scenarios (Town01, ...)
+│   ├── scenarios/          # Scenario YAMLs (cosim_town01.yaml, ...)
+│   ├── scripts/            # Co-simulation launcher script
+│   └── xodr_sumo_maps/     # OpenDRIVE→SUMO converter test maps
+├── configs/visulation/     # visualize_fcd.py config example
+├── scripts/                # Runners and tooling (see below)
+├── docs/                   # OpenDRIVE / SUMO plain-XML format notes
+└── tests/                  # Test suites (core, NDE-NADE)
 ```
-
----
 
 ## Installation
 
-### Quick Setup
+### Native (conda)
 
 ```bash
-git clone https://github.com/mcity/TeraSim.git
+git clone https://github.com/tier4/TeraSim.git
 cd TeraSim
 conda create -n terasim python=3.10 -y
 conda activate terasim
 ./setup_environment.sh
 ```
 
-This script installs all required Python packages and dependencies, including [SUMO](https://www.eclipse.org/sumo/).
-
-<!-- ### Docker Installation (Recommended for Production)
-
-For a containerized environment with all dependencies pre-installed:
+### Docker (co-simulation image)
 
 ```bash
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-docker-compose up -d --build
-docker-compose exec terasim bash
+docker build -f Dockerfile.cosim -t terasim-service:latest .
 ```
 
-See [README_DOCKER.md](README_DOCKER.md) for detailed Docker deployment instructions. -->
+**Requirements**: Python 3.10–3.12, SUMO 1.23.1 (installed by the setup script), gcc/g++ (Cython extensions).
 
-**Requirements**
+## Running
 
-* Python 3.10–3.12
-* SUMO 1.23.1 (installed by the setup script)
-* gcc/g++ compilers (for Cython extensions)
+```bash
+# CARLA co-simulation, single process (a CARLA server must be running)
+python -m terasim_service.run_cosim \
+    --config examples/scenarios/cosim_town01.yaml --carla_port 2013
 
----
+# Standalone NADE run (no CARLA), GUI controlled by the scenario yaml
+python scripts/run_experiments_debug.py --config <scenario yaml>
 
-## Quick Start Example
+# FCD trajectory visualization (fcd_all output -> plots/video)
+python scripts/visualize_fcd.py configs/visulation/example.yaml
 
-See [TeraSim_World.md](docs/TeraSim_World.md) for Quick Start Example.
+# OpenDRIVE -> SUMO net conversion
+python scripts/xodr_to_sumo_converter.py --help
+```
 
-Additional examples are available in the [`examples/`](examples/) directory.
-
----
-
-## Contributing
-
-Contributions are welcome. Please read the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines and join the [GitHub discussions](https://github.com/mcity/TeraSim/discussions) for feedback or proposals.
-
----
-
+For the full 3-way setup (Autoware + CARLA + TeraSim in passive mode) see
+`docker-compose.cosim-odaiba-3cosim-inprocess.yml` and
+`examples/scripts/run_3cosim_odaiba_inprocess.sh`.
 
 ## Publications
 
-Explore our other research on autonomous driving testing!
+TeraSim builds on the following research:
 
 * **NDE** – Learning naturalistic driving environment with statistical realism
   [Paper](https://doi.org/10.1038/s41467-023-37677-5) | [Code](https://github.com/michigan-traffic-lab/Learning-Naturalistic-Driving-Environment)

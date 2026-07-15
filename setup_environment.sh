@@ -69,14 +69,10 @@ setup_monorepo() {
     # Initialize workspace and install dependencies
     log_info "Installing workspace packages..."
     # Install packages explicitly for conda compatibility
-    pip install waymo-open-dataset-tf-2-11-0
     pip install -e packages/terasim
     pip install -e packages/terasim-nde-nade
     pip install -e packages/terasim-service
-    pip install -e packages/terasim-envgen
-    pip install -e packages/terasim-datazoo
     pip install -e packages/terasim-vis
-    pip install -e packages/terasim-cosmos
 
     # Install development dependencies
     pip install "pytest>=7.4.0" "pytest-cov>=4.1.0" "black>=23.7.0" "ruff>=0.1.0" "mypy>=1.5.1" "isort>=5.12.0"
@@ -112,12 +108,6 @@ try:
     print('✅ TeraSim Visualization imported successfully')
 except ImportError:
     print('⚠️  TeraSim Visualization not available (optional)')
-
-try:
-    import terasim_cosmos
-    print('✅ TeraSim Cosmos imported successfully')
-except ImportError:
-    print('⚠️  TeraSim Cosmos not available (optional)')
 
 print(f'TeraSim version: 0.2.0')
 "
@@ -273,10 +263,7 @@ packages = [
     ('terasim', 'Core simulation platform'),
     ('terasim_nde_nade', 'Neural differential equations enhancement'),
     ('terasim_vis', 'Visualization tools'),
-    ('terasim_envgen', 'Environment generation tools'),
-    ('terasim_datazoo', 'Data processing tools'),
-    ('terasim_service', 'Service API'),
-    ('terasim_cosmos', 'Cosmos-Drive integration')
+    ('terasim_service', 'Co-simulation link'),
 ]
 
 for pkg_name, description in packages:
