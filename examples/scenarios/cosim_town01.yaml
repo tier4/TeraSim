@@ -91,6 +91,7 @@ simulator:
     gui_flag: false
     num_tries: 10
     realtime_flag: false
+    sumo_seed: 42
     sumo_output_file_types:
     - fcd_all
     - collision
