@@ -652,13 +652,17 @@ async def control_agents_batch(
                 status_code=404, detail="Simulation not found or finished"
             )
 
-        # Add all commands to the queue
-        for command in command_batch.commands:
+        serialized_commands = [
+            json.dumps(command.model_dump()) for command in command_batch.commands
+        ]
+        if serialized_commands:
+            # Keep one feedback batch contiguous and ordered in the Redis queue.
             redis_client.rpush(
-                f"simulation:{simulation_id}:agent_commands", json.dumps(command.model_dump())
+                f"simulation:{simulation_id}:agent_commands", *serialized_commands
             )
         return {
-            "message": f"Batch of {len(command_batch.commands)} agent commands sent successfully"
+            "message": f"Batch of {len(command_batch.commands)} agent commands sent successfully",
+            "queued_count": len(command_batch.commands),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

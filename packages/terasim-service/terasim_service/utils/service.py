@@ -34,3 +34,9 @@ def control_agent(host, port, simulationId, command):
     url = f"http://{host}:{port}/simulation/{simulationId}/agent_command"
     response = requests.post(url, json=command)
     return response.json()
+
+
+def control_agents_batch(host, port, simulationId, commands):
+    url = f"http://{host}:{port}/simulation/{simulationId}/agent_commands_batch"
+    response = requests.post(url, json={"commands": commands})
+    return response.json()

@@ -19,6 +19,12 @@ class AgentStateSimplified(BaseModel):
     reconstructed_z: float = 0.0
     reconstructed_position_valid: bool = False
 
+    # Path-following lookahead target in the SUMO coordinate system.
+    lookahead_x: float = 0.0
+    lookahead_y: float = 0.0
+    lookahead_z: float = 0.0
+    lookahead_position_valid: bool = False
+
     ## longitude of the agent (degrees)
     lon: float = 0.0
     ## latitude of the agent (degrees)
@@ -37,6 +43,11 @@ class AgentStateSimplified(BaseModel):
 
     # Speed
     speed: float = 0.0
+
+    # SUMO's next desired speed and the latest CARLA observation accepted by SUMO.
+    sumo_desired_speed: float | None = None
+    feedback_observed_speed: float | None = None
+    feedback_source_carla_frame: int | None = None
 
     # Orientation
     orientation: float = 0.0

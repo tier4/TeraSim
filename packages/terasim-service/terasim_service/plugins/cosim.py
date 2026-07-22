@@ -17,7 +17,12 @@ from terasim_nde_nade.adversity import ConstructionAdversity
 from .base import BasePlugin, DEFAULT_REDIS_CONFIG
 
 from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
-from ..utils.sumo_lane_geometry import reconstruct_position_from_lane_geometry
+from ..utils.sumo_lane_geometry import (
+    extract_next_link_lane_ids,
+    find_lookahead_position_from_lane_shapes,
+    project_position_by_sumo_angle,
+    reconstruct_position_from_lane_geometry,
+)
 
 
 def interpolate_by_distance(points, step):
@@ -155,12 +160,38 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Maintain controlled agents in each step, assuming each agent can be controlled by only one command
         self.controlled_agents_each_step = set()
+        self.feedback_observed_speeds = {}
+        self.feedback_source_carla_frames = {}
+        feedback_actor_value = os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "")
+        self.ackermann_feedback_actor_ids = {
+            actor_id.strip()
+            for actor_id in feedback_actor_value.split(",")
+            if actor_id.strip()
+        }
+        self.ackermann_feedback_mode = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off"
+        ).strip().lower()
+        default_max_agent_commands = (
+            10000
+            if self.ackermann_feedback_mode != "off" and self.ackermann_feedback_actor_ids
+            else 100
+        )
+        self.max_agent_commands_per_step = max(
+            1,
+            int(
+                self._parse_float_env(
+                    "TERASIM_COSIM_MAX_AGENT_COMMANDS_PER_STEP",
+                    default_max_agent_commands,
+                )
+            ),
+        )
 
         # Cache construction zone shapes
         self.construction_zone_shapes = None
 
         # Initialize last orientations cache
         self.last_orientations = {}  # {vehicle_id: (last_orientation, last_time)}
+        self.lookahead_path_cache = {}  # {vehicle_id: [lane_shape, ...]}
         
         # Initialize health monitoring
         self.error_count = 0
@@ -223,6 +254,12 @@ class TeraSimCoSimPlugin(BasePlugin):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _is_ackermann_feedback_actor(self, actor_id):
+        if getattr(self, "ackermann_feedback_mode", "off") == "off":
+            return False
+        actor_ids = getattr(self, "ackermann_feedback_actor_ids", set())
+        return actor_id in actor_ids or (actor_id != "AV" and "*" in actor_ids)
 
     def _setup_logger(self, base_dir: str) -> logging.Logger:
         """Setup logger for the plugin.
@@ -655,6 +692,72 @@ class TeraSimCoSimPlugin(BasePlugin):
         ) = reconstructed
         vehicle_state.reconstructed_position_valid = True
 
+    @staticmethod
+    def _lookahead_distance(speed):
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            speed = 0.0
+        return min(15.0, max(7.0, speed))
+
+    def _append_lane_shape(self, lane_shapes, seen_lane_ids, lane_id):
+        if not lane_id or lane_id in seen_lane_ids:
+            return
+        try:
+            lane_shape = traci.lane.getShape(lane_id)
+        except Exception:
+            return
+        if lane_shape and len(lane_shape) >= 2:
+            lane_shapes.append(lane_shape)
+            seen_lane_ids.add(lane_id)
+
+    def _get_vehicle_lookahead_lane_shapes(self, vehicle_id):
+        lane_shapes = []
+        seen_lane_ids = set()
+        try:
+            current_lane = traci.vehicle.getLaneID(vehicle_id)
+        except Exception:
+            current_lane = ""
+
+        self._append_lane_shape(lane_shapes, seen_lane_ids, current_lane)
+        if current_lane:
+            try:
+                next_links = traci.vehicle.getNextLinks(vehicle_id)
+            except Exception:
+                next_links = []
+            for lane_id in extract_next_link_lane_ids(next_links):
+                self._append_lane_shape(lane_shapes, seen_lane_ids, lane_id)
+
+        if lane_shapes:
+            self.lookahead_path_cache[vehicle_id] = lane_shapes
+            return lane_shapes
+        return self.lookahead_path_cache.get(vehicle_id, [])
+
+    def _populate_vehicle_lookahead(self, vehicle_id, vehicle_state):
+        lookahead_distance = self._lookahead_distance(vehicle_state.speed)
+        current_position = (vehicle_state.x, vehicle_state.y)
+        lane_shapes = self._get_vehicle_lookahead_lane_shapes(vehicle_id)
+        lookahead = find_lookahead_position_from_lane_shapes(
+            lane_shapes,
+            current_position,
+            lookahead_distance,
+            vehicle_state.z,
+        )
+        if lookahead is None:
+            lookahead = project_position_by_sumo_angle(
+                current_position,
+                vehicle_state.sumo_angle,
+                lookahead_distance,
+                vehicle_state.z,
+            )
+        if lookahead is None:
+            return
+
+        vehicle_state.lookahead_x = lookahead[0]
+        vehicle_state.lookahead_y = lookahead[1]
+        vehicle_state.lookahead_z = lookahead[2]
+        vehicle_state.lookahead_position_valid = True
+
     def _build_simulation_state(self, simulator):
         """Collect the current simulation state from SUMO into a SimulationState.
 
@@ -671,6 +774,14 @@ class TeraSimCoSimPlugin(BasePlugin):
         vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
             vehicle_ids
         )
+        active_vehicle_ids = set(vehicle_ids)
+        for feedback_cache in (
+            self.feedback_observed_speeds,
+            self.feedback_source_carla_frames,
+        ):
+            for vid in list(feedback_cache):
+                if vid not in active_vehicle_ids:
+                    feedback_cache.pop(vid, None)
         simulation_state.agent_count = {
             "vehicle": len(vehicle_ids),
             "vru": len(vru_ids),
@@ -690,6 +801,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
             vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
             vehicle_state.speed = traci.vehicle.getSpeed(vid)
+            if vid == "AV" or self._is_ackermann_feedback_actor(vid):
+                try:
+                    vehicle_state.sumo_desired_speed = traci.vehicle.getSpeedWithoutTraCI(vid)
+                except Exception:
+                    vehicle_state.sumo_desired_speed = vehicle_state.speed
+            vehicle_state.feedback_observed_speed = self.feedback_observed_speeds.get(vid)
+            vehicle_state.feedback_source_carla_frame = (
+                self.feedback_source_carla_frames.get(vid)
+            )
+            self._populate_vehicle_lookahead(vid, vehicle_state)
             vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
             vehicle_state.length = traci.vehicle.getLength(vid)
             vehicle_state.width = traci.vehicle.getWidth(vid)
@@ -962,6 +1083,13 @@ class TeraSimCoSimPlugin(BasePlugin):
 
                         if "speed" in command.data:
                             traci.vehicle.setPreviousSpeed(command.agent_id, command.data["speed"])
+                            if "source_carla_frame" in command.data:
+                                self.feedback_observed_speeds[command.agent_id] = command.data[
+                                    "speed"
+                                ]
+                                self.feedback_source_carla_frames[command.agent_id] = command.data[
+                                    "source_carla_frame"
+                                ]
                     else:  # VRU type
                         # Check if VRU is actually a vehicle or person
                         current_vehicle_list = traci.vehicle.getIDList()
@@ -1014,8 +1142,8 @@ class TeraSimCoSimPlugin(BasePlugin):
             return
         """Handle all pending agent commands in the queue"""
         try:
-            # Process up to 100 commands per step to prevent infinite loops
-            for _ in range(100):
+            # The cap prevents an infinite producer loop while allowing one feedback batch.
+            for _ in range(self.max_agent_commands_per_step):
                 command_data = self.redis_client.lpop(
                     f"simulation:{self.simulation_uuid}:agent_commands"
                 )

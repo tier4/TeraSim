@@ -7,6 +7,7 @@ Usage:
     python carla_cosim_main.py --terasim_config /path/to/config.yaml
 """
 import argparse
+import os
 import time
 
 import carla
@@ -61,6 +62,10 @@ def main():
         default='localhost',
         help='IP of the host server for TeraSim (default: localhost)')
     argparser.add_argument(
+        '--direct_addr',
+        default=None,
+        help='host:port of a TeraSim direct gRPC server; bypasses HTTP/Redis')
+    argparser.add_argument(
         '--terasim_port',
         default=8000,
         type=int,
@@ -69,6 +74,11 @@ def main():
         '--terasim_config',
         default='examples/simulation_Mcity_carla_config.yaml',
         help='Configuration file path for TeraSim')
+    argparser.add_argument(
+        '--vehicle_control_mode',
+        choices=['teleport', 'ackermann_physics'],
+        default=os.environ.get('CARLA_COSIM_VEHICLE_CONTROL_MODE', 'teleport'),
+        help='Background vehicle control mode (default: teleport)')
     args = argparser.parse_args()
     carla_cosim = CarlaCosim(args)
 
