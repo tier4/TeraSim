@@ -1,0 +1,99 @@
+simulation_module: my_simulations
+simulation_class: CarSimulation
+parameters:
+  num_cars: 8
+  simulation_time: 3600
+seed: 42
+
+simulation_type: safetest_odaiba_tlmappings_0708
+
+output:
+  dir: /app/outputs
+  name: odaiba_tlmappings_0708_ackermann
+  nth: "0_0"
+  aggregated_dir: aggregated
+
+environment:
+  module: terasim_nde_nade.envs
+  class: NADEWithAV
+  parameters:
+    vehicle_factory: terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory
+    info_extractor: terasim.logger.infoextractor.InfoExtractor
+    log_flag: true
+    warmup_time_lb: 500
+    warmup_time_ub: 501
+    run_time: 600
+
+    MOBIL_lc_flag: true
+    stochastic_acc_flag: false
+    sumo_net_file_path: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.net.xml
+    sumo_cfg_file_path: /app/examples/scenarios/odaiba_tlmappings_0708.cosim.sumocfg
+    drive_rule: lefthand
+    av_debug_control: true
+
+    adversity_sampling_probability: 0.0
+    adversity_cfg: {}
+
+    AV_cfg:
+      route:
+        - edge_1394
+        - edge_459
+        - edge_426
+        - edge_432
+        - edge_427
+        - edge_0
+        - edge_3
+        - edge_312
+        - edge_310
+        - edge_311
+        - edge_28
+        - edge_264
+        - edge_29
+        - edge_31
+        - edge_32
+        - edge_35
+        - edge_1517
+        - edge_61
+        - edge_62
+        - edge_392
+        - edge_394
+        - edge_434
+        - edge_490
+        - edge_492
+        - edge_406
+        - edge_396
+        - edge_398
+        - edge_412
+        - edge_400
+        - edge_417
+        - edge_420
+        - edge_426
+      type: NDE_URBAN
+      cache_radius: 300
+      control_radius: 50
+      initial_lane_index: 0
+      initial_lane_position: 5.0
+      initial_speed: 5.0
+      clearance_distance: 20.0
+
+simulator:
+  module: terasim.simulator
+  class: Simulator
+  parameters:
+    num_tries: 10
+    gui_flag: false
+    realtime_flag: false
+    traffic_scale: 1.0
+    sumo_output_file_types:
+      - fcd_all
+      - collision
+      - tripinfo
+
+input:
+  sumo_net_file: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.net.xml
+  sumo_config_file: /app/examples/scenarios/odaiba_tlmappings_0708.cosim.sumocfg
+
+logging:
+  levels:
+    - TRACE
+    - INFO

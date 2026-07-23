@@ -1,0 +1,53 @@
+services:
+  terasim_ackermann_odaiba_feedback_gui:
+    build:
+      context: .
+      dockerfile: Dockerfile.cosim
+    image: ${TERASIM_GUI_IMAGE:-terasim-service:ackermann-feedback-gui}
+    networks:
+      - carla_network
+    ports:
+      - "${SUMO_NOVNC_PORT:-6093}:6093"
+      - "${SUMO_VNC_PORT:-5913}:5913"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      ENVIRONMENT: development
+      HOME: /tmp
+      PYTHONPATH: /app/packages/terasim-service
+      CARLA_HOST: "${CARLA_HOST:-carla-novnc-test}"
+      CARLA_PORT: "${CARLA_PORT:-2000}"
+      GRPC_PORT: "${GRPC_PORT:-8200}"
+      TERASIM_CONFIG: "${TERASIM_CONFIG:-/app/examples/scenarios/cosim_odaiba_tlmappings_0708.yaml}"
+      CARLA_COSIM_STEP_LENGTH: "${CARLA_COSIM_STEP_LENGTH:-0.1}"
+      CARLA_COSIM_ASYNC_MODE: "0"
+      CARLA_COSIM_CONTROL_AV: "0"
+      CARLA_COSIM_MAP_NAME: "${CARLA_COSIM_MAP_NAME:-}"
+      CARLA_COSIM_VEHICLE_CONTROL_MODE: ackermann_physics
+      CARLA_COSIM_ACKERMANN_FEEDBACK_MODE: "${CARLA_COSIM_ACKERMANN_FEEDBACK_MODE:-apply}"
+      CARLA_COSIM_ACKERMANN_FEEDBACK_LOG_RECORDS: "${CARLA_COSIM_ACKERMANN_FEEDBACK_LOG_RECORDS:-0}"
+      CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS: "${CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS:-*}"
+      CARLA_COSIM_ACTOR_FILTER: "${CARLA_COSIM_ACTOR_FILTER:-1}"
+      CARLA_COSIM_ACTOR_FILTER_CENTER_ID: "${CARLA_COSIM_ACTOR_FILTER_CENTER_ID:-AV}"
+      CARLA_COSIM_ACTOR_FILTER_RADIUS: "${CARLA_COSIM_ACTOR_FILTER_RADIUS:-300}"
+      TERASIM_COSIM_STATE_FILTER: "${TERASIM_COSIM_STATE_FILTER:-1}"
+      TERASIM_COSIM_STATE_FILTER_CENTER_ID: "${TERASIM_COSIM_STATE_FILTER_CENTER_ID:-AV}"
+      TERASIM_COSIM_STATE_FILTER_RADIUS: "${TERASIM_COSIM_STATE_FILTER_RADIUS:-300}"
+      TERASIM_COSIM_CONSOLE_LOG_LEVEL: "${TERASIM_COSIM_CONSOLE_LOG_LEVEL:-WARNING}"
+      ENABLE_SUMO_GUI: "${ENABLE_SUMO_GUI:-1}"
+      SUMO_DISPLAY: "${SUMO_DISPLAY:-:20}"
+      SUMO_NOVNC_PORT: "6093"
+      SUMO_VNC_PORT: "5913"
+      VNC_PASSWORD: "${VNC_PASSWORD:-headless}"
+      SUMO_GUI_TRACK_VEHICLE: "${SUMO_GUI_TRACK_VEHICLE:-1}"
+      SUMO_GUI_TRACK_ZOOM: "${SUMO_GUI_TRACK_ZOOM:-3000}"
+      SUMO_GUI_REALTIME: "${SUMO_GUI_REALTIME:-1}"
+    volumes:
+      - ./examples:/app/examples:ro
+      - ./outputs:/app/outputs
+      - ./scripts:/app/scripts:ro
+    command: ["/bin/bash", "/app/scripts/run_ackermann_odaiba_feedback_gui_container.sh"]
+
+networks:
+  carla_network:
+    external: true
+    name: ${CARLA_DOCKER_NETWORK:-terasim_default}

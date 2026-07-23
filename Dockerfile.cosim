@@ -7,7 +7,7 @@ FROM python:3.10-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies (build + runtime)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     build-essential \
@@ -26,6 +26,22 @@ RUN apt-get update && apt-get install -y \
     # "Fontconfig error: Cannot load default config file")
     fontconfig \
     fonts-dejavu-core \
+    xvfb \
+    x11vnc \
+    openbox \
+    novnc \
+    websockify \
+    dbus-x11 \
+    libdbus-1-3 \
+    libegl1 \
+    libfreetype6 \
+    libsm6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxext6 \
+    libxi6 \
+    libxkbcommon-x11-0 \
+    libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
@@ -63,7 +79,11 @@ RUN python3 -c "import terasim; print('terasim OK')" && \
 # Create output directory with open permissions
 RUN mkdir -p /app/outputs && chmod 777 /app/outputs
 
-# Expose ports: 8000 (FastAPI), 6379 (Redis)
-EXPOSE 8000 6379
+# SUMO GUI noVNC entrypoint used by the Odaiba feedback runner.
+COPY scripts/start_sumo_novnc.sh /usr/local/bin/start_sumo_novnc
+RUN chmod +x /usr/local/bin/start_sumo_novnc
+
+# Expose ports: 8000 (FastAPI), 6379 (Redis), 6093/5913 (SUMO noVNC/VNC)
+EXPOSE 8000 6379 6093 5913
 
 CMD ["/bin/bash"]

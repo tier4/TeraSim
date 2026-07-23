@@ -1,9 +1,11 @@
-from addict import Dict
 import copy
 import json
+import os
+import random
+
+from addict import Dict
 from loguru import logger
 import numpy as np
-import random
 
 from terasim.overlay import traci, profile
 import terasim.utils as utils
@@ -26,6 +28,18 @@ AV_ID = "AV"
 AV_ROUTE_ID = "av_route"
 
 class NADEWithAV(NADE):
+    def _track_av_in_gui(self):
+        """Track the AV in sumo-gui when GUI tracking is enabled."""
+        if not self.simulator.gui_flag:
+            return
+        track_enabled = os.environ.get("SUMO_GUI_TRACK_VEHICLE", "1").lower()
+        if track_enabled not in {"1", "true", "yes", "on"}:
+            return
+        traci.gui.trackVehicle("View #0", AV_ID)
+        zoom = os.environ.get("SUMO_GUI_TRACK_ZOOM")
+        if zoom:
+            traci.gui.setZoom("View #0", float(zoom))
+
     def __init__(self, av_cfg, av_debug_control=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.av_cfg = av_cfg
@@ -228,9 +242,7 @@ class NADEWithAV(NADE):
                     self.add_av_unsafe(edge_id, lane_id, position, speed)
                     
                 logger.info(f"AV added safely at lane {lane_id}, position {position}, mode: {self.av_control_mode}")
-                if self.simulator.gui_flag:
-                    traci.gui.trackVehicle("View #0", AV_ID)
-                    # traci.gui.setZoom("View #0", 10000)
+                self._track_av_in_gui()
                 return
             else:
                 possible_lane_indexes.remove(lane)
@@ -300,9 +312,7 @@ class NADEWithAV(NADE):
         logger.warning(
             f"AV added using fallback method at lane {lane_id}, position {position}, mode: {self.av_control_mode}"
         )
-        if self.simulator.gui_flag:
-            traci.gui.trackVehicle("View #0", AV_ID)
-            # traci.gui.setZoom("View #0", 10000)
+        self._track_av_in_gui()
 
     def clear_area_around_position(self, lane_id, position, clear_distance):
         """Clear the area around a position on a lane.

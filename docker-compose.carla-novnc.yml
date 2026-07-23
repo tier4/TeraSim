@@ -1,0 +1,37 @@
+services:
+  carla_novnc:
+    build:
+      context: .
+      dockerfile: Dockerfile.carla-novnc
+    image: ${CARLA_NOVNC_IMAGE:-carla-novnc:0.9.16}
+    container_name: carla-novnc-test
+    runtime: nvidia
+    privileged: true
+    shm_size: 8g
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - VNC_PASSWORD=${VNC_PASSWORD:-headless}
+      - DISPLAY=:1
+      - SDL_VIDEODRIVER=x11
+      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+      - RESOLUTION=${RESOLUTION:-1600x900x24}
+      - RESX=${RESX:-1600}
+      - RESY=${RESY:-900}
+      - CARLA_RPC_PORT=2000
+      - CARLA_RENDER_OFFSCREEN=${CARLA_RENDER_OFFSCREEN:-0}
+    volumes:
+      - ./examples/maps/odaiba_ll2:/home/carla/workspace
+      - ./scripts/start_carla_novnc.sh:/start_carla_novnc.sh:ro
+      - /usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nvidia_icd.json:ro
+      - /usr/share/vulkan/implicit_layer.d/nvidia_layers.json:/usr/share/vulkan/implicit_layer.d/nvidia_layers.json:ro
+    ports:
+      - "${CARLA_NOVNC_PORT:-6092}:6080"
+      - "${CARLA_VNC_PORT:-5912}:5900"
+      - "${CARLA_HOST_RPC_PORT:-2010}-${CARLA_HOST_STREAM_PORT:-2012}:2000-2002/tcp"
+      - "${CARLA_HOST_RPC_PORT:-2010}-${CARLA_HOST_STREAM_PORT:-2012}:2000-2002/udp"
+
+networks:
+  default:
+    name: ${CARLA_DOCKER_NETWORK:-terasim_default}

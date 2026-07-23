@@ -169,6 +169,9 @@ class CarlaCosim(object):
             and bool(self.ackermann_feedback_actor_ids)
         )
         self._ackermann_feedback_state = {}
+        self.ackermann_feedback_log_records = _env_bool(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_LOG_RECORDS", True
+        )
         self._ackermann_feedback_actor_index = {}
         self._ackermann_feedback_candidate_actor_ids = set()
         self._ackermann_actor_state = {}
@@ -909,7 +912,8 @@ class CarlaCosim(object):
 
     def _record_ackermann_feedback(self, feedback):
         self._ackermann_feedback_state[feedback["actor_id"]] = feedback
-        print("AckermannFeedback " + json.dumps(feedback, sort_keys=True), flush=True)
+        if getattr(self, "ackermann_feedback_log_records", True):
+            print("AckermannFeedback " + json.dumps(feedback, sort_keys=True), flush=True)
 
     def _collect_ackermann_feedback(self):
         candidate_actor_ids = set(self._ackermann_feedback_candidate_actor_ids)

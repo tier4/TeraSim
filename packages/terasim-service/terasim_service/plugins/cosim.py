@@ -283,7 +283,8 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Create console handler
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        console_level_name = os.getenv("TERASIM_COSIM_CONSOLE_LOG_LEVEL", "INFO").upper()
+        console_handler.setLevel(getattr(logging, console_level_name, logging.INFO))
 
         # Create formatter and add it to the handlers
         formatter = logging.Formatter(
