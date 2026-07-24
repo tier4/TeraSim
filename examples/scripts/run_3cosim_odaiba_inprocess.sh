@@ -15,11 +15,15 @@ cd /app
 CARLA_HOST="${CARLA_HOST:-127.0.0.1}"
 CARLA_PORT="${CARLA_PORT:-2013}"
 SCENARIO="${SCENARIO:-/app/examples/scenarios/cosim_odaiba_osmlike.yaml}"
+# tick モード(stage 3a): follow(既定)= psim bridge が world.tick() を打ち当方は追従 /
+# master = 当方が時計マスター(50ms 定刻で号令、bridge は tick_follower:=true で受け身)
+TICK_MODE="${COSIM_TICK_MODE:-follow}"
 
 echo "=========================================="
-echo " TeraSim 3-cosim (passive, in-process) お台場"
+echo " TeraSim 3-cosim (in-process)"
 echo "  CARLA :${CARLA_PORT}"
 echo "  scenario: ${SCENARIO}"
+echo "  tick_mode: ${TICK_MODE}"
 echo "=========================================="
 
 # ── Step 1: CARLA の ego 以外の車両を掃除(冪等化) ──
@@ -53,4 +57,5 @@ echo "------------------------------------------"
 exec python -m terasim_service.run_cosim \
   --config "${SCENARIO}" \
   --carla_host "${CARLA_HOST}" \
-  --carla_port "${CARLA_PORT}"
+  --carla_port "${CARLA_PORT}" \
+  --tick_mode "${TICK_MODE}"

@@ -73,6 +73,11 @@ class CarlaCosim(object):
         self.initialize_av = False
         self.av_shape = []
         self.step_length = args.step_length
+        # Stage 3a clock-master mode (run_cosim --tick_mode master): this
+        # process owns world.tick() on a fixed step_length wall-clock cadence.
+        # Mutually exclusive with args.passive_tick (follow mode).
+        self.tick_master = bool(getattr(args, "tick_master", False))
+        self._next_tick_deadline = None  # monotonic deadline of the next tick
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
@@ -368,6 +373,65 @@ class CarlaCosim(object):
         return [offset_x, offset_y]
 
     def tick(self):
+        """One co-sim step. Dispatches on the tick mode (design: stage 3a doc).
+
+        follow (default): _tick_follow() - the current passive pipeline, kept
+        unchanged for the future async configuration.
+        master: _tick_master() - fixed-cadence world.tick() + serial SUMO step.
+        """
+        if self.tick_master:
+            return self._tick_master()
+        return self._tick_follow()
+
+    def _tick_master(self):
+        """One cycle as the clock master (stage 3a: sync-realtime, serial).
+
+        Order within a cycle (traffic-cosim-sync-design.md §4.2): wait until
+        the fixed deadline -> world.tick() (the only tick authority in the
+        system; returns when frame N is done) -> read the ego from frame N and
+        build the SUMO AV command -> run exactly one SUMO step and wait for it
+        (serial = background traffic decides on the 50ms-old ego, R13) -> write
+        the post-step state into CARLA (lands in frame N+1).
+
+        Deadlines are pinned to a step_length wall-clock grid and never wait
+        for anyone (R15). An overrun cycle fires immediately and re-pins the
+        grid to "now + step_length" (no debt is carried over; a chronically
+        slow world update turns into slow motion, not a tick burst).
+        """
+        now = time.monotonic()
+        if self._next_tick_deadline is not None and now < self._next_tick_deadline:
+            time.sleep(self._next_tick_deadline - now)
+            self._next_tick_deadline += self.step_length
+        else:
+            self._next_tick_deadline = time.monotonic() + self.step_length
+
+        self._last_world_frame = self.world.tick()
+
+        commands = []
+        if self.control_av:
+            av_command = self._build_av_command()
+            if av_command is not None:
+                commands.append(av_command)
+
+        handle = self.inprocess_plugin.tick_async(commands)
+        try:
+            result = handle.result(timeout=300.0)
+        except TimeoutError as e:
+            print(f"TeraSim in-process tick failed: {e}. Exiting...")
+            return False
+        if result.status in ("finished", "error"):
+            print(f"TeraSim ended (status={result.status}). Exiting...")
+            return False
+        if result.state is not None:
+            self._inproc_prev_state = result.state
+
+        if self._inproc_prev_state is not None:
+            self.sync_cosim_actor_to_carla(self._inproc_prev_state)
+            if not getattr(self.args, "skip_tls", False):
+                self.sync_cosim_tls_to_carla(self._inproc_prev_state)
+        return True
+
+    def _tick_follow(self):
         """One co-sim step over the in-process link (single process, no RPC).
 
         Pipeline parity with the former two-process transports: the state
@@ -1281,18 +1345,22 @@ class CarlaCosim(object):
         """
         Cleans synchronization and resets the simulation settings.
         """
-        if not getattr(self.args, "passive_tick", False):
+        # In both 3-cosim modes (follow AND master) the psim side is still
+        # alive when this process exits, so the world settings and the ego are
+        # preserved. In follow mode the bridge owns synchronous_mode; in master
+        # mode nobody ticks after us and the operating rule is the same as a
+        # dead bridge today: restart CARLA before the next run.
+        preserve_world = getattr(self.args, "passive_tick", False) or self.tick_master
+        if not preserve_world:
             # Configuring carla simulation in async mode.
-            # Skipped in 3-cosim passive mode: the psim bridge owns synchronous_mode, and
-            # resetting it here would break psim's sync loop.
             settings = self.world.get_settings()
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             self.world.apply_settings(settings)
-        
-        # Destroy actors. In 3-cosim passive mode, keep ego (protected_roles) and clear only the
+
+        # Destroy actors. In 3-cosim, keep ego (protected_roles) and clear only the
         # SUMO-spawned background vehicles/pedestrians; otherwise destroy everything.
-        if getattr(self.args, "passive_tick", False):
+        if preserve_world:
             protected = getattr(self.args, "protected_roles", None) or ["AV"]
             for actor in self.world.get_actors().filter("vehicle.*"):
                 if actor.attributes.get("role_name") not in protected:

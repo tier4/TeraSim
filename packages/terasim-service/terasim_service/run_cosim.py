@@ -7,11 +7,17 @@ main thread, and the two rendezvous through TeraSimCoSimInProcessPlugin
 (plain function calls + threading events - no Redis/HTTP/gRPC and no JSON
 serialization of states or commands).
 
-3-cosim passive mode is preserved: the psim bridge (autoware_carla_interface)
-owns world.tick(); this process only follows via world.wait_for_tick() and
-mirrors TeraSim/SUMO background traffic into CARLA. The psim ego
-(role_name="ego_vehicle") is protected from cleanup and its pose is fed back
-to the SUMO "AV" so background traffic avoids it.
+Two tick modes (--tick_mode):
+  follow (default) - 3-cosim passive mode, preserved as-is: the psim bridge
+    (autoware_carla_interface) owns world.tick(); this process only follows via
+    world.wait_for_tick() and mirrors TeraSim/SUMO background traffic into
+    CARLA. Kept for the future async configuration.
+  master (stage 3a) - this process is the clock master: it owns world.tick()
+    on a fixed step_length cadence (deadlines never wait for anyone) and runs
+    one SUMO step serially inside each cycle; the bridge must run passively
+    (tick_follower:=true). Design: traffic-cosim-sync-design.md §4.2.
+In both modes the psim ego (role_name="ego_vehicle") is protected from cleanup
+and its pose is fed back to the SUMO "AV" so background traffic avoids it.
 
 Usage:
   python -m terasim_service.run_cosim \
@@ -67,6 +73,13 @@ def main():
     p.add_argument("-s", "--step_length", default=0.05, type=float)
     p.add_argument("--map_name", default="", type=str,
                    help="leave empty: psim already loaded the world; do NOT reload")
+    p.add_argument("--tick_mode", default="follow", choices=["follow", "master"],
+                   help="follow (default): the psim bridge owns world.tick(); this "
+                        "process follows via wait_for_tick (current behavior, kept "
+                        "for the future async configuration). master: this process "
+                        "is the clock master (stage 3a) -- it ticks CARLA on a fixed "
+                        "step_length cadence and runs SUMO serially inside each "
+                        "cycle; the bridge must run with tick_follower:=true")
     p.add_argument("--sync_tls", action="store_true",
                    help="also sync SUMO traffic lights -> CARLA (off by default)")
     p.add_argument("--protected_roles", nargs="+", default=["AV", "ego_vehicle"],
@@ -85,8 +98,12 @@ def main():
         sys.setswitchinterval(switch_interval)
     logger.info(f"[run_cosim] GIL switch interval: {sys.getswitchinterval() * 1000:.2f}ms")
 
-    # 3-cosim passive mode: fixed flags consumed by CarlaCosim.tick()/_cleanup_actors()/close().
-    args.passive_tick = True   # follow psim's world.tick() via wait_for_tick(); never tick here
+    # 3-cosim mode flags consumed by CarlaCosim.tick()/_cleanup_actors()/close().
+    # follow (default): the psim bridge owns world.tick(); we only wait_for_tick.
+    # master (stage 3a): we own world.tick() on a fixed cadence; the bridge runs
+    # passively with tick_follower:=true.
+    args.passive_tick = args.tick_mode == "follow"
+    args.tick_master = args.tick_mode == "master"
     args.skip_tls = not args.sync_tls
     args.control_av = True     # feed the Autoware ego pose back to the SUMO AV
     args.terasim_config = args.config  # CarlaCosim reads the SUMO net path from the scenario yaml
@@ -154,7 +171,32 @@ def main():
 
     args.inprocess_plugin = plugin
     carla_cosim = CarlaCosim(args)
-    # IMPORTANT: do NOT apply world settings here. The psim bridge owns
+    if args.tick_master:
+        # Stage 3a: as the clock master this process owns synchronous_mode and
+        # fixed_delta_seconds. The passive bridge applies the same values at its
+        # startup, so this is normally a no-op re-apply; a mismatch means the
+        # two sides were launched with different step lengths - warn and win.
+        settings = carla_cosim.world.get_settings()
+        mismatch = (
+            not settings.synchronous_mode
+            or settings.fixed_delta_seconds is None
+            or abs(settings.fixed_delta_seconds - args.step_length) > 1e-9
+        )
+        if mismatch:
+            logger.warning(
+                "[run_cosim] world settings differ (sync={}, fixed_delta={}); "
+                "applying sync=True fixed_delta={} as the clock master",
+                settings.synchronous_mode, settings.fixed_delta_seconds,
+                args.step_length,
+            )
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = args.step_length
+        carla_cosim.world.apply_settings(settings)
+        logger.info(
+            f"[run_cosim] tick_mode=master: this process owns world.tick() "
+            f"({args.step_length * 1000:.0f}ms fixed cadence)"
+        )
+    # In follow mode do NOT apply world settings: the psim bridge owns
     # synchronous_mode and fixed_delta_seconds.
 
     exit_code = 0
@@ -167,7 +209,7 @@ def main():
         logger.exception("[run_cosim] co-sim loop crashed")
         exit_code = 1
     finally:
-        logger.info("[run_cosim] cleaning up (passive: keep ego, do not reset CARLA settings)")
+        logger.info("[run_cosim] cleaning up (keep ego, do not reset CARLA settings)")
         carla_cosim.close()  # stops the plugin, so the sim thread can exit
         sim_thread.join(timeout=60)
         if sim_thread.is_alive():

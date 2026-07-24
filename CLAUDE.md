@@ -101,8 +101,10 @@ TeraSim/
   (two threading.Events; states/commands passed as plain Python objects, no serialization)
 - `CarlaCosim` (`utils/carla/cosim.py`) mirrors SUMO background traffic into CARLA and feeds an
   externally driven ego (role_name `ego_vehicle`) back into SUMO as the "AV"
-- In 3-cosim passive mode the psim bridge owns `world.tick()`; this process only follows via
-  `world.wait_for_tick()`
+- Two tick modes (`--tick_mode`): `follow` (default) — the psim bridge owns `world.tick()`
+  and this process only follows via `world.wait_for_tick()`; `master` (stage 3a) — this
+  process is the clock master, ticking CARLA on a fixed `step_length` cadence and running
+  one SUMO step serially inside each cycle (the bridge must run with `tick_follower:=true`)
 - The former transports (Redis lists + FastAPI service, then gRPC) were removed
 
 ### Key Design Patterns

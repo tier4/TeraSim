@@ -20,6 +20,9 @@ services:
       - HOME=/tmp
       - CARLA_PORT=2013
       - SCENARIO=${SCENARIO:-/app/examples/scenarios/cosim_odaiba_osmlike.yaml}
+      # tick モード(stage 3a): follow(既定)= psim bridge が号令役(現行動作)/
+      # master = TeraSim が時計マスター(bridge は tick_follower:=true で受け身)
+      - COSIM_TICK_MODE=${COSIM_TICK_MODE:-follow}
       # CARLA への変換適用・spawn を1リクエストに束ねる(既定 OFF の opt-in 高速化。
       # 背景車両数百台では per-actor RPC が支配的なので常時 ON にする)
       - CARLA_COSIM_BATCH_TRANSFORM=1
@@ -37,5 +40,8 @@ services:
       - CARLA_COSIM_EGO_LABEL=${CARLA_COSIM_EGO_LABEL:-1}
     volumes:
       - ./examples:/app/examples
+      # terasim-service は image 内で editable install(-e)のため、ソースを bind mount
+      # すると rebuild なしで worktree の最新コードで動く(terasim/nde-nade は image 内のまま)
+      - ./packages/terasim-service/terasim_service:/app/packages/terasim-service/terasim_service
     command: ["/bin/bash", "/app/examples/scripts/run_3cosim_odaiba_inprocess.sh"]
     restart: "no"
