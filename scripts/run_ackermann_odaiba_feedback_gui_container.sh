@@ -14,7 +14,9 @@ SUMO_GUI_REALTIME=${SUMO_GUI_REALTIME:-1}
 
 DIRECT_PID=""
 SUMO_NOVNC_PID=""
+COSIM_PID=""
 DIRECT_LOG=/tmp/terasim_direct.log
+COSIM_SHUTDOWN_TIMEOUT=${COSIM_SHUTDOWN_TIMEOUT:-60}
 
 is_enabled() {
     case "${1,,}" in
@@ -23,8 +25,35 @@ is_enabled() {
     esac
 }
 
+stop_cosim_first() {
+    if [[ -z "${COSIM_PID}" ]] || ! kill -0 "${COSIM_PID}" 2>/dev/null; then
+        return
+    fi
+
+    echo "Stopping CARLA co-simulation client before TeraSim/SUMO..."
+    kill -TERM "${COSIM_PID}" 2>/dev/null || true
+
+    local deadline=$((SECONDS + COSIM_SHUTDOWN_TIMEOUT))
+    while kill -0 "${COSIM_PID}" 2>/dev/null && [[ "${SECONDS}" -lt "${deadline}" ]]; do
+        sleep 0.25
+    done
+
+    if kill -0 "${COSIM_PID}" 2>/dev/null; then
+        echo "WARNING: CARLA co-simulation cleanup did not finish within" \
+            "${COSIM_SHUTDOWN_TIMEOUT}s; still waiting without stopping TeraSim/SUMO." >&2
+        wait "${COSIM_PID}" 2>/dev/null || true
+    fi
+
+    wait "${COSIM_PID}" 2>/dev/null || true
+    COSIM_PID=""
+    echo "CARLA co-simulation cleanup completed; stopping TeraSim/SUMO."
+}
+
 cleanup() {
     status=$?
+    trap - EXIT INT TERM
+
+    stop_cosim_first
     if [[ -n "${DIRECT_PID}" ]]; then
         kill "${DIRECT_PID}" 2>/dev/null || true
         wait "${DIRECT_PID}" 2>/dev/null || true
@@ -33,6 +62,7 @@ cleanup() {
         kill "${SUMO_NOVNC_PID}" 2>/dev/null || true
         wait "${SUMO_NOVNC_PID}" 2>/dev/null || true
     fi
+
     if [[ "${status}" -ne 0 && -f "${DIRECT_LOG}" ]]; then
         echo "Last TeraSim direct-runner log lines:" >&2
         tail -80 "${DIRECT_LOG}" >&2 || true
@@ -99,4 +129,9 @@ fi
 echo "[4/4] Starting synchronous Ackermann feedback co-simulation..."
 echo "  feedback=${CARLA_COSIM_ACKERMANN_FEEDBACK_MODE:-off} actors=${CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS:-}"
 echo "  SUMO noVNC: http://localhost:${SUMO_NOVNC_PORT:-6093}/vnc.html"
-python3 /app/examples/scripts/carla_cosim_main.py "${CARLA_COSIM_ARGS[@]}"
+python3 /app/examples/scripts/carla_cosim_main.py "${CARLA_COSIM_ARGS[@]}" &
+COSIM_PID=$!
+wait "${COSIM_PID}"
+COSIM_STATUS=$?
+COSIM_PID=""
+exit "${COSIM_STATUS}"
