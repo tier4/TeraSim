@@ -10,15 +10,51 @@ Use synchronous CARLA mode and set:
 ```bash
 export CARLA_COSIM_VEHICLE_CONTROL_MODE=ackermann_physics
 export CARLA_COSIM_ACKERMANN_FEEDBACK_MODE=apply
-export CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS='*,AV'
+export CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS=AV
 ```
 
-`*` selects all background vehicles; `AV` must be listed explicitly. `shadow` may be used instead
-of `apply` to observe and log feedback without changing SUMO state.
+The position mode is `moveTo`, which prioritizes longitudinal time consistency:
+
+```bash
+export CARLA_COSIM_ACKERMANN_FEEDBACK_POSITION_MODE=moveTo
+```
+
+`*` selects all background vehicles, but feedback should first be validated with `AV` only.
+`shadow` may be used instead of `apply` to observe and log feedback without changing SUMO state.
 
 The normal HTTP/Redis path queues one ordered command batch before requesting the next TeraSim
 tick. For the direct gRPC path, pass `--direct_addr HOST:PORT`; the same ordered `set_state`
 commands are carried in the next `Tick` request.
+
+## Position synchronization
+
+Before each SUMO simulation step, `moveTo` projects the CARLA front-bumper position onto the
+vehicle current SUMO lane, calls `vehicle.moveTo`, and then calls `setPreviousSpeed`. Unlike
+`moveToXY`, `moveTo` takes effect immediately, so SUMO computes the next speed from a current CARLA
+observation.
+
+CARLA lateral offset does not select a different SUMO lane. SUMO owns lane-change decisions and the
+feedback updates longitudinal progress on the lane that SUMO selected in its preceding step. This
+avoids an instantaneous centerline-to-centerline jump caused by choosing an adjacent lane from
+CARLA x/y.
+
+If the current-lane projection exceeds the configured distance or heading limits, feedback fails
+closed: TeraSim refuses the SUMO step, returns an error to the CARLA client, and the client applies
+a zero-speed emergency-deceleration Ackermann command before stopping.
+
+## Longitudinal diagnostics
+
+Set the following to emit one JSON record per controlled frame:
+
+```bash
+export CARLA_COSIM_ACKERMANN_CONTROL_LOG_RECORDS=1
+```
+
+Each `AckermannControlTrace` contains SUMO desired speed and acceleration, the accepted CARLA
+feedback speed, unclamped requested acceleration, SUMO vehicle-type `emergencyDecel`, the applied
+Ackermann speed/acceleration targets, and measured CARLA speed and longitudinal acceleration.
+CARLA braking uses the vehicle-specific SUMO `emergencyDecel` when it is available; the configured
+Ackermann maximum deceleration is the fallback.
 
 ## Constraints
 
@@ -26,6 +62,8 @@ commands are carried in the next `Tick` request.
 - The CARLA client must own `world.tick()`; `passive_tick` is unsupported.
 - `control_av` cannot be combined with feedback ownership of the AV.
 - Feedback mode requires `ackermann_physics`.
+- `moveTo` does not apply CARLA lateral offset or yaw inside SUMO.
+- Validate AV-only feedback before expanding to background vehicles.
 
 Each feedback command contains the CARLA frame number. TeraSim exposes the accepted observed
 speed and frame in the next simulation state, allowing the controller to detect missing or stale

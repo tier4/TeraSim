@@ -105,6 +105,14 @@ def test_load_av_route_edge_ids_from_text_file(tmp_path):
 def test_ensure_vtypes_and_av_route_writes_only_regular_route_edges(tmp_path):
     module = load_generator_module()
     routes_path = tmp_path / "vehicles.rou.xml"
+    routes_path.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<routes>
+  <vType id="vehicle_passenger" vClass="passenger" />
+</routes>
+""",
+        encoding="utf-8",
+    )
 
     module.ensure_vtypes_and_av_route(
         routes_path,
@@ -114,3 +122,9 @@ def test_ensure_vtypes_and_av_route_writes_only_regular_route_edges(tmp_path):
     route = ET.parse(routes_path).getroot().find("route[@id='av_route']")
     assert route is not None
     assert route.get("edges") == "edge_755 edge_760"
+
+    root = ET.parse(routes_path).getroot()
+    for vtype_id in module.STOPLINE_GAP_VTYPE_IDS:
+        vtype = root.find(f"vType[@id='{vtype_id}']")
+        assert vtype is not None
+        assert vtype.get("jmStoplineGap") == module.SUMO_STOPLINE_GAP

@@ -14,6 +14,18 @@ class AckermannTuning:
 
 
 @dataclass(frozen=True)
+class AckermannControllerTuning:
+    """CARLA's internal cascaded speed/acceleration PID settings."""
+
+    speed_kp: float = 0.15
+    speed_ki: float = 0.0
+    speed_kd: float = 0.25
+    accel_kp: float = 0.01
+    accel_ki: float = 0.0
+    accel_kd: float = 0.01
+
+
+@dataclass(frozen=True)
 class AckermannControlValues:
     steer: float
     raw_steer: float

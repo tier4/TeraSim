@@ -46,6 +46,7 @@ class AgentStateSimplified(BaseModel):
 
     # SUMO's next desired speed and the latest CARLA observation accepted by SUMO.
     sumo_desired_speed: float | None = None
+    sumo_emergency_decel: float | None = None
     feedback_observed_speed: float | None = None
     feedback_source_carla_frame: int | None = None
 

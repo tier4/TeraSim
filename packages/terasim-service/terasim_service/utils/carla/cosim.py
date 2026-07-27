@@ -10,6 +10,7 @@ import yaml
 import statistics
 
 from .ackermann_control import (
+    AckermannControllerTuning,
     AckermannTuning,
     compute_ackermann_control_values,
     horizontal_speed,
@@ -90,6 +91,18 @@ def _env_bool(name, default=False):
 class CarlaCosim(object):
     def __init__(self, args):
         self.args = args
+
+        carla_random_seed = os.environ.get("CARLA_COSIM_RANDOM_SEED", "").strip()
+        if carla_random_seed:
+            try:
+                self.carla_random_seed = int(carla_random_seed)
+            except ValueError as exc:
+                raise ValueError(
+                    "CARLA_COSIM_RANDOM_SEED must be an integer, "
+                    f"got {carla_random_seed!r}"
+                ) from exc
+            random.seed(self.carla_random_seed)
+            print(f"CARLA co-sim random seed: {self.carla_random_seed}", flush=True)
 
         self.client = carla.Client(args.carla_host, args.carla_port)
         self.client.set_timeout(getattr(args, 'carla_timeout', 10.0))
@@ -172,6 +185,9 @@ class CarlaCosim(object):
         self.ackermann_feedback_log_records = _env_bool(
             "CARLA_COSIM_ACKERMANN_FEEDBACK_LOG_RECORDS", True
         )
+        self.ackermann_control_log_records = _env_bool(
+            "CARLA_COSIM_ACKERMANN_CONTROL_LOG_RECORDS", False
+        )
         self._ackermann_feedback_actor_index = {}
         self._ackermann_feedback_candidate_actor_ids = set()
         self._ackermann_actor_state = {}
@@ -198,6 +214,26 @@ class CarlaCosim(object):
             kp_position=_env_float("CARLA_COSIM_ACKERMANN_KP_POSITION", 0.15),
             max_accel=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_ACCEL", 3.0)),
             max_decel=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_DECEL", 6.0)),
+        )
+        self.ackermann_controller_tuning = AckermannControllerTuning(
+            speed_kp=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 0.15)
+            ),
+            speed_ki=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KI", 0.0)
+            ),
+            speed_kd=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.25)
+            ),
+            accel_kp=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.01)
+            ),
+            accel_ki=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KI", 0.0)
+            ),
+            accel_kd=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.01)
+            ),
         )
         self.ackermann_warn_error_m = max(
             0.0, _env_float("CARLA_COSIM_ACKERMANN_WARN_ERROR_M", 3.0)
@@ -254,12 +290,18 @@ class CarlaCosim(object):
             0.0,
             _env_float("CARLA_COSIM_ACTOR_FILTER_RADIUS", 300.0),
         )
+        self.actor_filter_hysteresis = max(
+            0.0,
+            _env_float("CARLA_COSIM_ACTOR_FILTER_HYSTERESIS", 20.0),
+        )
+        self._actor_filter_active_vehicle_ids = set()
         self._actor_filter_missing_center_warned = False
         if self.actor_filter_enabled:
             print(
                 "CARLA co-sim actor radius filter enabled: "
                 f"center={self.actor_filter_center_id} "
-                f"radius={self.actor_filter_radius:.1f}m.",
+                f"enterRadius={self.actor_filter_radius:.1f}m "
+                f"exitRadius={self.actor_filter_radius + self.actor_filter_hysteresis:.1f}m.",
                 flush=True,
             )
 
@@ -518,6 +560,8 @@ class CarlaCosim(object):
             if status is None:
                 print("TeraSim status is None. Exiting...")
                 return None
+            if status in {"finished", "error"}:
+                return status
 
             completed_tick_count = response.get("completed_tick_count")
             if completed_tick_count is not None:
@@ -546,7 +590,9 @@ class CarlaCosim(object):
             time.sleep(0.05)
 
     def _tick_ackermann_feedback_apply_http(self):
-        if self._wait_for_terasim_step() is None:
+        status = self._wait_for_terasim_step()
+        if status is None or status in {"finished", "error"}:
+            self._apply_ackermann_fail_closed_brake(f"terasim_status:{status}")
             return False
 
         self.sync_cosim_actor_to_carla()
@@ -571,9 +617,11 @@ class CarlaCosim(object):
                 response = self._direct_tick_future.result(timeout=300.0)
             except _grpc.RpcError as exc:
                 print(f"TeraSim direct tick failed: {exc}. Exiting...")
+                self._apply_ackermann_fail_closed_brake("direct_tick_rpc_error")
                 return False
             if response.status in ("finished", "error"):
                 print(f"TeraSim ended (status={response.status}). Exiting...")
+                self._apply_ackermann_fail_closed_brake(f"direct_status:{response.status}")
                 return False
             state = parse_state_json(response.state_json)
             if state is not None:
@@ -1073,25 +1121,39 @@ class CarlaCosim(object):
                     flush=True,
                 )
                 self._actor_filter_missing_center_warned = True
+            self._actor_filter_active_vehicle_ids = set(vehicles)
             return vehicles, vrus
 
         center_x, center_y = center_xy
-        radius_squared = self.actor_filter_radius * self.actor_filter_radius
+        previous_active_ids = self._actor_filter_active_vehicle_ids
+        enter_radius_squared = self.actor_filter_radius * self.actor_filter_radius
+        exit_radius = self.actor_filter_radius + self.actor_filter_hysteresis
+        exit_radius_squared = exit_radius * exit_radius
 
         filtered_vehicles = {}
+        active_vehicle_ids = set()
         for veh_id, veh_info in vehicles.items():
             if veh_id in {self.actor_filter_center_id, AV_SUMO_ID}:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
                 continue
             vehicle_xy = self._actor_xy(veh_info)
             if vehicle_xy is None:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
                 continue
             dx = vehicle_xy[0] - center_x
             dy = vehicle_xy[1] - center_y
+            radius_squared = (
+                exit_radius_squared
+                if veh_id in previous_active_ids
+                else enter_radius_squared
+            )
             if dx * dx + dy * dy <= radius_squared:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
 
+        self._actor_filter_active_vehicle_ids = active_vehicle_ids
         return filtered_vehicles, vrus
 
     def sync_cosim_actor_to_carla(self, terasim_states=None):
@@ -1347,12 +1409,81 @@ class CarlaCosim(object):
         except Exception:
             pass
 
-    def _ensure_ackermann_actor_physics(self, actor, veh_id):
+    def _initialize_ackermann_actor_velocity(self, actor, veh_id, speed, transform):
+        initial_speed = self._as_finite_float(speed)
+        if initial_speed is None:
+            return False
+        initial_speed = max(0.0, initial_speed)
+        yaw = math.radians(transform.rotation.yaw)
+        velocity = carla.Vector3D(
+            initial_speed * math.cos(yaw),
+            initial_speed * math.sin(yaw),
+            0.0,
+        )
+        try:
+            actor.set_target_velocity(velocity)
+        except Exception as exc:
+            print(
+                f"Warning: failed to initialize CARLA velocity for {veh_id!r}: {exc}",
+                flush=True,
+            )
+            return False
+
+        print(
+            f"CARLA initial velocity applied to {veh_id!r}: {initial_speed:.3f}m/s.",
+            flush=True,
+        )
+        return True
+
+    def _ensure_ackermann_actor_physics(
+        self,
+        actor,
+        veh_id,
+        initial_speed=None,
+        initial_transform=None,
+    ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
-        if state.get("physics_enabled"):
+        if not state.get("physics_enabled"):
+            self._set_actor_simulate_physics(actor, True)
+            state["physics_enabled"] = True
+            if initial_speed is not None and initial_transform is not None:
+                state["initial_velocity_applied"] = self._initialize_ackermann_actor_velocity(
+                    actor,
+                    veh_id,
+                    initial_speed,
+                    initial_transform,
+                )
+        if state.get("controller_settings_attempted"):
             return
-        self._set_actor_simulate_physics(actor, True)
-        state["physics_enabled"] = True
+
+        state["controller_settings_attempted"] = True
+        tuning = self.ackermann_controller_tuning
+        try:
+            settings = carla.AckermannControllerSettings(
+                tuning.speed_kp,
+                tuning.speed_ki,
+                tuning.speed_kd,
+                tuning.accel_kp,
+                tuning.accel_ki,
+                tuning.accel_kd,
+            )
+            actor.apply_ackermann_controller_settings(settings)
+        except Exception as exc:
+            state["controller_settings_applied"] = False
+            print(
+                f"Warning: failed to apply CARLA Ackermann controller settings "
+                f"for {veh_id!r}: {exc}",
+                flush=True,
+            )
+            return
+
+        state["controller_settings_applied"] = True
+        print(
+            f"CARLA Ackermann controller settings applied to {veh_id!r}: "
+            f"speed=({tuning.speed_kp:.4g},{tuning.speed_ki:.4g},{tuning.speed_kd:.4g}) "
+            f"accel=({tuning.accel_kp:.4g},{tuning.accel_ki:.4g},{tuning.accel_kd:.4g})",
+            flush=True,
+        )
 
     def _ensure_actor_teleport_mode(self, actor, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -1419,20 +1550,35 @@ class CarlaCosim(object):
             desired_speed = self._as_finite_float(veh_info.get("speed"))
         return max(0.0, desired_speed or 0.0)
 
+    def _resolve_ackermann_max_decel(self, veh_info):
+        emergency_decel = self._as_finite_float(veh_info.get("sumo_emergency_decel"))
+        if emergency_decel is not None and emergency_decel > 0.0:
+            return emergency_decel
+        return self.ackermann_tuning.max_decel
+
     def _resolve_ackermann_longitudinal_target(self, veh_id, veh_info, current_speed):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        max_decel = self._resolve_ackermann_max_decel(veh_info)
+        state["sumo_emergency_decel"] = max_decel
         desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
         if not self._is_ackermann_feedback_apply_actor(veh_id):
             return desired_speed, None
 
         sumo_next_speed = self._as_finite_float(veh_info.get("sumo_desired_speed"))
         observed_speed = self._as_finite_float(veh_info.get("feedback_observed_speed"))
+        state["sumo_desired_speed"] = sumo_next_speed
+        state["feedback_observed_speed"] = observed_speed
         if sumo_next_speed is None or observed_speed is None or self.step_length <= 0.0:
+            state["sumo_requested_acceleration"] = None
+            state["applied_desired_acceleration"] = None
             return desired_speed, None
-        desired_acceleration = (sumo_next_speed - observed_speed) / self.step_length
+        requested_acceleration = (sumo_next_speed - observed_speed) / self.step_length
         desired_acceleration = min(
             self.ackermann_tuning.max_accel,
-            max(-self.ackermann_tuning.max_decel, desired_acceleration),
+            max(-max_decel, requested_acceleration),
         )
+        state["sumo_requested_acceleration"] = requested_acceleration
+        state["applied_desired_acceleration"] = desired_acceleration
         speed_target = max(
             0.0,
             current_speed + desired_acceleration * self.ackermann_feedback_speed_horizon,
@@ -1454,12 +1600,40 @@ class CarlaCosim(object):
             state["steer"] = steer
         else:
             steer = self._as_finite_float(state.get("steer")) or 0.0
+        max_decel = self._as_finite_float(state.get("sumo_emergency_decel"))
+        if max_decel is None or max_decel <= 0.0:
+            max_decel = self.ackermann_tuning.max_decel
         return carla.VehicleAckermannControl(
             steer=steer,
             speed=0.0,
-            acceleration=-self.ackermann_tuning.max_decel,
+            acceleration=-max_decel,
             jerk=0.0,
         )
+
+    def _apply_ackermann_fail_closed_brake(self, reason):
+        actors = []
+        for actor_id, actor in list(self._ackermann_feedback_actor_index.items()):
+            if actor is not None and self._is_ackermann_feedback_selected_actor(actor_id):
+                actors.append((actor_id, actor))
+        for actor_id, actor in actors:
+            try:
+                actor.apply_ackermann_control(self._make_brake_ackermann_control(actor_id))
+            except Exception as exc:
+                print(
+                    f"Warning: fail-closed brake failed for {actor_id}: {exc}",
+                    flush=True,
+                )
+        if actors:
+            print(
+                f"Ackermann fail-closed brake applied to {len(actors)} actor(s): {reason}",
+                flush=True,
+            )
+            if not getattr(self.args, "passive_tick", False):
+                try:
+                    self.world.tick()
+                except Exception as exc:
+                    print(f"Warning: fail-closed CARLA tick failed: {exc}", flush=True)
+        return len(actors)
 
     def _build_ackermann_control(
         self,
@@ -1550,8 +1724,20 @@ class CarlaCosim(object):
         if feedback_unhealthy or target_behind:
             final_steer = self._neutralize_ackermann_steer(veh_id)
             final_speed = 0.0
-            final_acceleration = -self.ackermann_tuning.max_decel
+            final_acceleration = -self._resolve_ackermann_max_decel(veh_info)
 
+        self._record_ackermann_control_trace(
+            veh_id=veh_id,
+            veh_info=veh_info,
+            vehicle=vehicle,
+            current_transform=current_transform,
+            current_speed=current_speed,
+            target_speed=final_speed,
+            target_acceleration=final_acceleration,
+            position_error=values.position_error,
+            feedback_unhealthy=bool(feedback_unhealthy),
+            target_behind=bool(target_behind),
+        )
         state["steer"] = final_steer
         state["last_position_error"] = values.position_error
         return carla.VehicleAckermannControl(
@@ -1560,6 +1746,91 @@ class CarlaCosim(object):
             acceleration=final_acceleration,
             jerk=values.jerk,
         )
+
+    def _record_ackermann_control_trace(
+        self,
+        *,
+        veh_id,
+        veh_info,
+        vehicle,
+        current_transform,
+        current_speed,
+        target_speed,
+        target_acceleration,
+        position_error,
+        feedback_unhealthy,
+        target_behind,
+    ):
+        if not getattr(self, "ackermann_control_log_records", False):
+            return
+
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        try:
+            snapshot = self.world.get_snapshot()
+            carla_frame = int(snapshot.frame)
+        except Exception:
+            carla_frame = None
+        previous_speed = self._as_finite_float(state.get("trace_previous_speed"))
+        previous_frame = state.get("trace_previous_frame")
+        speed_delta_acceleration = None
+        if (
+            previous_speed is not None
+            and carla_frame is not None
+            and isinstance(previous_frame, int)
+            and carla_frame > previous_frame
+        ):
+            dt = (carla_frame - previous_frame) * self.step_length
+            if dt > 0.0:
+                speed_delta_acceleration = (current_speed - previous_speed) / dt
+        state["trace_previous_speed"] = current_speed
+        state["trace_previous_frame"] = carla_frame
+
+        longitudinal_acceleration = None
+        try:
+            acceleration = vehicle.get_acceleration()
+            yaw = math.radians(current_transform.rotation.yaw)
+            longitudinal_acceleration = (
+                float(acceleration.x) * math.cos(yaw)
+                + float(acceleration.y) * math.sin(yaw)
+            )
+        except Exception:
+            pass
+
+        applied_throttle = None
+        applied_brake = None
+        applied_steer = None
+        try:
+            applied_control = vehicle.get_control()
+            applied_throttle = self._as_finite_float(
+                getattr(applied_control, "throttle", None)
+            )
+            applied_brake = self._as_finite_float(getattr(applied_control, "brake", None))
+            applied_steer = self._as_finite_float(getattr(applied_control, "steer", None))
+        except Exception:
+            pass
+
+        trace = {
+            "actor_id": veh_id,
+            "carla_frame": carla_frame,
+            "simulation_time": self.terasim_states.get("simulation_time"),
+            "sumo_desired_speed": self._as_finite_float(veh_info.get("sumo_desired_speed")),
+            "sumo_reported_acceleration": self._as_finite_float(veh_info.get("acceleration")),
+            "feedback_observed_speed": self._as_finite_float(veh_info.get("feedback_observed_speed")),
+            "sumo_requested_acceleration": state.get("sumo_requested_acceleration"),
+            "sumo_emergency_decel": state.get("sumo_emergency_decel"),
+            "ackermann_target_speed": target_speed,
+            "ackermann_target_acceleration": target_acceleration,
+            "carla_speed": current_speed,
+            "carla_speed_delta_acceleration": speed_delta_acceleration,
+            "carla_longitudinal_acceleration": longitudinal_acceleration,
+            "carla_applied_throttle": applied_throttle,
+            "carla_applied_brake": applied_brake,
+            "carla_applied_steer": applied_steer,
+            "position_error": position_error,
+            "feedback_unhealthy": feedback_unhealthy,
+            "target_behind": target_behind,
+        }
+        print("AckermannControlTrace " + json.dumps(trace, sort_keys=True), flush=True)
 
     def _queue_actor_ackermann_control(self, actor, control, ackermann_batch=None):
         apply_command = getattr(carla.command, "ApplyVehicleAckermannControl", None)
@@ -1715,7 +1986,12 @@ class CarlaCosim(object):
             if request.get("enable_physics_after_spawn", False):
                 self._ackermann_actor_state.pop(actor_id, None)
                 actor.set_transform(request["post_spawn_transform"])
-                self._ensure_ackermann_actor_physics(actor, actor_id)
+                self._ensure_ackermann_actor_physics(
+                    actor,
+                    actor_id,
+                    request["actor_info"].get("speed"),
+                    request["post_spawn_transform"],
+                )
             else:
                 self._queue_actor_transform(actor, request["post_spawn_transform"], transform_batch)
             if actor_type == "vru":
@@ -1992,14 +2268,24 @@ class CarlaCosim(object):
                 vehicle.set_transform(carla_trasform)
                 if uses_ackermann_physics:
                     self._ackermann_actor_state.pop(veh_id, None)
-                    self._ensure_ackermann_actor_physics(vehicle, veh_id)
+                    self._ensure_ackermann_actor_physics(
+                        vehicle,
+                        veh_id,
+                        veh_info.get("speed"),
+                        carla_trasform,
+                    )
             else:
                 self._record_spawn_failure("vehicle", veh_id, sumo_location, current_frame)
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             if uses_ackermann_physics:
-                self._ensure_ackermann_actor_physics(vehicle, veh_id)
+                self._ensure_ackermann_actor_physics(
+                    vehicle,
+                    veh_id,
+                    veh_info.get("speed"),
+                    carla_trasform,
+                )
                 control = self._build_ackermann_control(
                     veh_id,
                     veh_info,
@@ -2112,6 +2398,12 @@ class CarlaCosim(object):
         """
         Cleans synchronization and resets the simulation settings.
         """
+        def wait_for_cleanup_tick(stage):
+            try:
+                self.world.wait_for_tick(10.0)
+            except Exception as exc:
+                print(f"Warning: CARLA cleanup tick failed during {stage}: {exc}")
+
         if not getattr(self.args, "passive_tick", False):
             # Configuring carla simulation in async mode.
             # Skipped in 3-cosim passive mode: the psim bridge owns synchronous_mode, and
@@ -2120,6 +2412,7 @@ class CarlaCosim(object):
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             self.world.apply_settings(settings)
+            wait_for_cleanup_tick("sync-to-async transition")
         
         # Destroy actors. In 3-cosim passive mode, keep ego (protected_roles) and clear only the
         # SUMO-spawned background vehicles/pedestrians; otherwise destroy everything.
@@ -2132,6 +2425,9 @@ class CarlaCosim(object):
                 actor.destroy()
         else:
             destroy_all_actors(self.world)
+            wait_for_cleanup_tick("first actor cleanup")
+            destroy_all_actors(self.world)
+            wait_for_cleanup_tick("final actor cleanup")
 
         # stop TeraSim
         if self.direct_link is not None:

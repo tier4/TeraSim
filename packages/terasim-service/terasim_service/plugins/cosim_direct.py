@@ -172,7 +172,14 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
             self._pending_commands = []
         self.controlled_agents_each_step.clear()
         for raw in commands:
-            self._handle_agent_command(raw)
+            if not self._handle_agent_command(raw):
+                self._record_agent_command_failure(simulator)
+                self._finish("error")
+                simulator.running = False
+                self.logger.critical(
+                    "Fail-closed: direct Tick rejected before SUMO simulationStep"
+                )
+                return False
 
         self._set_status("running")
         self.logger.info("Simulation step started")
@@ -204,7 +211,10 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
         pass
 
     def function_after_env_stop(self, simulator: Simulator, ctx):
-        self._finish("finished")
+        with self._lock:
+            failed = self._status == "error"
+        if not failed:
+            self._finish("finished")
         if self._grpc_server is not None:
             # Let in-flight RPCs drain (they will see status="finished").
             self._grpc_server.stop(grace=2.0)

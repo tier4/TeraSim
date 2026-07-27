@@ -7,7 +7,9 @@ Usage:
     python carla_cosim_main.py --terasim_config /path/to/config.yaml
 """
 import argparse
+import atexit
 import os
+import signal
 import time
 
 import carla
@@ -81,6 +83,27 @@ def main():
         help='Background vehicle control mode (default: teleport)')
     args = argparser.parse_args()
     carla_cosim = CarlaCosim(args)
+    cleanup_state = {"pending": True}
+
+    def close_cosim_once():
+        if not cleanup_state["pending"]:
+            return
+        cleanup_state["pending"] = False
+        print("Cleaning synchronization", flush=True)
+        carla_cosim.close()
+
+    def handle_termination(signum, _frame):
+        print(
+            f"Received signal {signum}; cleaning CARLA before stopping TeraSim/SUMO.",
+            flush=True,
+        )
+        raise SystemExit(128 + signum)
+
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, handle_termination)
+    # This also covers termination during synchronous-mode setup, before the
+    # main tick loop's try/finally block is entered.
+    atexit.register(close_cosim_once)
 
     if not args.async_mode:
         # Apply synchronous mode with retry - OpenDRIVE maps may need multiple attempts
@@ -119,15 +142,25 @@ def main():
 
     try:
         tick_flag = True
+        completed_steps = 0
+        max_steps = max(0, int(os.environ.get("CARLA_COSIM_MAX_STEPS", "0")))
         while tick_flag:
             tick_flag = carla_cosim.tick()
+            completed_steps += 1
+            if max_steps and completed_steps >= max_steps:
+                print(
+                    f"Reached CARLA_COSIM_MAX_STEPS={max_steps}; stopping cleanly.",
+                    flush=True,
+                )
+                break
 
     except KeyboardInterrupt:
         print("Cancelled by user.")
 
     finally:
-        print("Cleaning synchronization")
-        carla_cosim.close()
+        close_cosim_once()
+        atexit.unregister(close_cosim_once)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":
