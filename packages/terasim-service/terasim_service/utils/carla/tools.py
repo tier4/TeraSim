@@ -298,6 +298,7 @@ def destroy_all_actors(world):
     carla_actors = (
         list(world.get_actors().filter("vehicle.*"))
         + list(world.get_actors().filter("walker.pedestrian.*"))
+        + list(world.get_actors().filter("sensor.*"))
         + list(world.get_actors().filter("static.prop.constructioncone"))
     )
 

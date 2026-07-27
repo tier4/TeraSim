@@ -68,6 +68,139 @@ def _project_distance_on_polyline(points, position):
     return best_projected_distance
 
 
+def project_position_to_lane_shape(lane_shape, position, lane_length=None):
+    """Project an x/y position onto a lane shape.
+
+    The returned lane position uses SUMO's lane length rather than the raw
+    polyline length when ``lane_length`` is provided. This matters because
+    ``vehicle.moveTo`` expects the distance from the lane start to the vehicle
+    front bumper in SUMO lane coordinates.
+    """
+    points = _as_2d_points(lane_shape)
+    if len(points) < 2:
+        return None
+
+    try:
+        pos_x = float(position[0])
+        pos_y = float(position[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    travelled = 0.0
+    total_length = 0.0
+    best = None
+    for start, end in zip(points, points[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        segment_length = math.hypot(dx, dy)
+        if segment_length <= 0.0:
+            continue
+        segment_length_sq = segment_length * segment_length
+        t = ((pos_x - start[0]) * dx + (pos_y - start[1]) * dy) / segment_length_sq
+        t = min(1.0, max(0.0, t))
+        proj_x = start[0] + dx * t
+        proj_y = start[1] + dy * t
+        distance = math.hypot(pos_x - proj_x, pos_y - proj_y)
+        projected_distance = travelled + segment_length * t
+        sumo_angle = (90.0 - math.degrees(math.atan2(dy, dx))) % 360.0
+        if best is None or distance < best["distance"]:
+            best = {
+                "shape_position": projected_distance,
+                "distance": distance,
+                "sumo_angle": sumo_angle,
+                "projected_x": proj_x,
+                "projected_y": proj_y,
+            }
+        travelled += segment_length
+        total_length += segment_length
+
+    if best is None or total_length <= 0.0:
+        return None
+
+    if lane_length is None:
+        sumo_lane_length = total_length
+    else:
+        try:
+            sumo_lane_length = max(0.0, float(lane_length))
+        except (TypeError, ValueError):
+            return None
+    best["lane_position"] = min(
+        sumo_lane_length,
+        max(0.0, best["shape_position"] / total_length * sumo_lane_length),
+    )
+    return best
+
+
+def _angle_difference_degrees(first, second):
+    return abs((float(first) - float(second) + 180.0) % 360.0 - 180.0)
+
+
+def select_route_aware_lane_projection(
+    position,
+    sumo_angle,
+    lane_candidates,
+    current_lane_id="",
+    lane_switch_hysteresis=0.35,
+    heading_weight=0.02,
+    max_distance=None,
+    max_heading_error=90.0,
+    prefer_current_lane=False,
+):
+    """Select the best projection among caller-supplied route-aware lanes.
+
+    This function deliberately does not search the whole SUMO network. The
+    caller is responsible for supplying only the current edge, adjacent lanes,
+    route successors and applicable internal lanes.
+    """
+    try:
+        sumo_angle = float(sumo_angle)
+        lane_switch_hysteresis = max(0.0, float(lane_switch_hysteresis))
+        heading_weight = max(0.0, float(heading_weight))
+        max_heading_error = max(0.0, float(max_heading_error))
+        if max_distance is not None:
+            max_distance = max(0.0, float(max_distance))
+    except (TypeError, ValueError):
+        return None
+
+    best = None
+    current_lane_projection = None
+    for candidate in lane_candidates or []:
+        lane_id = candidate.get("lane_id")
+        if not lane_id:
+            continue
+        projection = project_position_to_lane_shape(
+            candidate.get("shape"),
+            position,
+            candidate.get("length"),
+        )
+        if projection is None:
+            continue
+        heading_error = _angle_difference_degrees(
+            sumo_angle,
+            projection["sumo_angle"],
+        )
+        if heading_error > max_heading_error:
+            continue
+        if max_distance is not None and projection["distance"] > max_distance:
+            continue
+
+        continuity_penalty = 0.0 if lane_id == current_lane_id else lane_switch_hysteresis
+        score = projection["distance"] + heading_weight * heading_error + continuity_penalty
+        result = {
+            **projection,
+            "lane_id": lane_id,
+            "heading_error": heading_error,
+            "score": score,
+        }
+        if lane_id == current_lane_id:
+            current_lane_projection = result
+        if best is None or result["score"] < best["score"]:
+            best = result
+    if prefer_current_lane and current_lane_projection is not None:
+        return current_lane_projection
+    return best
+
+
 def point_at_distance_on_polyline(points, target_distance, z=0.0):
     """Return a 3D point at the requested travelled distance along a polyline."""
     if len(points) < 2:

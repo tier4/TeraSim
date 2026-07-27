@@ -22,6 +22,7 @@ from ..utils.sumo_lane_geometry import (
     find_lookahead_position_from_lane_shapes,
     project_position_by_sumo_angle,
     reconstruct_position_from_lane_geometry,
+    select_route_aware_lane_projection,
 )
 
 
@@ -171,6 +172,85 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.ackermann_feedback_mode = os.getenv(
             "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off"
         ).strip().lower()
+        self.ackermann_feedback_position_mode = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_POSITION_MODE", "moveTo"
+        ).strip()
+        if self.ackermann_feedback_position_mode not in {"moveTo", "moveToXY"}:
+            self.logger.warning(
+                "Invalid Ackermann feedback position mode=%s; using moveTo",
+                self.ackermann_feedback_position_mode,
+            )
+            self.ackermann_feedback_position_mode = "moveTo"
+        self.ackermann_feedback_move_to_max_distance = max(
+            0.0,
+            self._parse_float_env(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_MOVE_TO_MAX_DISTANCE", 8.0
+            ),
+        )
+        self.ackermann_feedback_background_move_to_max_distance = (
+            self._parse_optional_float(
+                os.getenv(
+                    "CARLA_COSIM_ACKERMANN_FEEDBACK_BACKGROUND_MOVE_TO_MAX_DISTANCE",
+                    "",
+                )
+            )
+        )
+        if (
+            self.ackermann_feedback_background_move_to_max_distance is not None
+            and self.ackermann_feedback_background_move_to_max_distance < 0.0
+        ):
+            self.logger.warning(
+                "Invalid background Ackermann feedback moveTo max distance=%s; "
+                "using the common limit",
+                self.ackermann_feedback_background_move_to_max_distance,
+            )
+            self.ackermann_feedback_background_move_to_max_distance = None
+        self.ackermann_feedback_move_to_lane_hysteresis = max(
+            0.0,
+            self._parse_float_env(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_MOVE_TO_LANE_HYSTERESIS", 0.35
+            ),
+        )
+        self.feedback_lane_states = {}
+        self.feedback_edge_lane_ids_cache = {}
+        self.feedback_lane_geometry_cache = {}
+        self.last_agent_command_failure = None
+        self.ackermann_feedback_lane_index = self._parse_int_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_LANE_INDEX", 0
+        )
+        self.ackermann_feedback_keep_route = self._parse_int_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_KEEP_ROUTE", 0
+        )
+        if self.ackermann_feedback_keep_route not in range(8):
+            self.logger.warning(
+                "Invalid Ackermann feedback keepRoute=%s; using 0",
+                self.ackermann_feedback_keep_route,
+            )
+            self.ackermann_feedback_keep_route = 0
+        self.ackermann_feedback_log_lane_transitions = self._parse_bool_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_LOG_LANE_TRANSITIONS", False
+        )
+        self.ackermann_feedback_lc_keep_right = self._parse_optional_float(
+            os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_LC_KEEP_RIGHT", "")
+        )
+        if (
+            self.ackermann_feedback_lc_keep_right is not None
+            and self.ackermann_feedback_lc_keep_right < 0.0
+        ):
+            self.logger.warning(
+                "Invalid Ackermann feedback lcKeepRight=%s; leaving SUMO default unchanged",
+                self.ackermann_feedback_lc_keep_right,
+            )
+            self.ackermann_feedback_lc_keep_right = None
+        lc_keep_right_actor_value = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_LC_KEEP_RIGHT_ACTORS", "AV"
+        )
+        self.ackermann_feedback_lc_keep_right_actor_ids = {
+            actor_id.strip()
+            for actor_id in lc_keep_right_actor_value.split(",")
+            if actor_id.strip()
+        }
+        self.ackermann_feedback_lane_change_settings_applied = set()
         default_max_agent_commands = (
             10000
             if self.ackermann_feedback_mode != "off" and self.ackermann_feedback_actor_ids
@@ -240,6 +320,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             return default
 
     @staticmethod
+    def _parse_int_env(name, default):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            return default
+
+    @staticmethod
     def _parse_bool_env(name, default=False):
         value = os.getenv(name)
         if value in (None, ""):
@@ -260,6 +350,223 @@ class TeraSimCoSimPlugin(BasePlugin):
             return False
         actor_ids = getattr(self, "ackermann_feedback_actor_ids", set())
         return actor_id in actor_ids or (actor_id != "AV" and "*" in actor_ids)
+
+    def _ensure_ackermann_feedback_lane_change_settings(self, actor_id):
+        lc_keep_right = getattr(self, "ackermann_feedback_lc_keep_right", None)
+        if lc_keep_right is None:
+            return
+
+        lc_keep_right_actor_ids = getattr(
+            self, "ackermann_feedback_lc_keep_right_actor_ids", {"AV"}
+        )
+        if actor_id not in lc_keep_right_actor_ids and "*" not in lc_keep_right_actor_ids:
+            return
+
+        applied_actor_ids = getattr(
+            self,
+            "ackermann_feedback_lane_change_settings_applied",
+            set(),
+        )
+        if actor_id in applied_actor_ids:
+            return
+
+        parameter_name = "laneChangeModel.lcKeepRight"
+        parameter_value = f"{lc_keep_right:g}"
+        traci.vehicle.setParameter(actor_id, parameter_name, parameter_value)
+        applied_value = traci.vehicle.getParameter(actor_id, parameter_name)
+        try:
+            matches_requested_value = float(applied_value) == lc_keep_right
+        except (TypeError, ValueError):
+            matches_requested_value = False
+        if not matches_requested_value:
+            raise RuntimeError(
+                f"SUMO did not apply {parameter_name}={parameter_value} "
+                f"to {actor_id}; reported {applied_value!r}"
+            )
+
+        applied_actor_ids.add(actor_id)
+        self.ackermann_feedback_lane_change_settings_applied = applied_actor_ids
+        self.logger.info(
+            "Ackermann feedback lane-change settings applied actor=%s %s=%s",
+            actor_id,
+            parameter_name,
+            applied_value,
+        )
+
+    def _read_ackermann_feedback_lane_state(self, actor_id):
+        try:
+            return {
+                "road_id": traci.vehicle.getRoadID(actor_id),
+                "lane_id": traci.vehicle.getLaneID(actor_id),
+                "lane_position": traci.vehicle.getLanePosition(actor_id),
+                "route_index": traci.vehicle.getRouteIndex(actor_id),
+            }
+        except Exception as exc:
+            self.logger.debug(
+                "Could not read Ackermann feedback lane state for %s: %s",
+                actor_id,
+                exc,
+            )
+            return None
+
+    def _log_ackermann_feedback_lane_transition(self, actor_id, source, before, after):
+        if before is None or after is None or before["lane_id"] == after["lane_id"]:
+            return
+        self.logger.warning(
+            "Ackermann feedback lane transition actor=%s source=%s "
+            "road=%s->%s lane=%s->%s lanePos=%s->%s routeIndex=%s->%s",
+            actor_id,
+            source,
+            before["road_id"],
+            after["road_id"],
+            before["lane_id"],
+            after["lane_id"],
+            before["lane_position"],
+            after["lane_position"],
+            before["route_index"],
+            after["route_index"],
+        )
+
+    @staticmethod
+    def _append_unique_lane_id(lane_ids, seen_lane_ids, lane_id):
+        if lane_id and lane_id not in seen_lane_ids:
+            lane_ids.append(lane_id)
+            seen_lane_ids.add(lane_id)
+
+    def _append_edge_lane_ids(self, lane_ids, seen_lane_ids, edge_id):
+        if not edge_id:
+            return
+        edge_lane_ids_cache = getattr(self, "feedback_edge_lane_ids_cache", None)
+        if edge_lane_ids_cache is None:
+            edge_lane_ids_cache = {}
+            self.feedback_edge_lane_ids_cache = edge_lane_ids_cache
+        edge_lane_ids = edge_lane_ids_cache.get(edge_id)
+        if edge_lane_ids is None:
+            try:
+                lane_count = traci.edge.getLaneNumber(edge_id)
+            except Exception:
+                return
+            edge_lane_ids = tuple(f"{edge_id}_{lane_index}" for lane_index in range(lane_count))
+            edge_lane_ids_cache[edge_id] = edge_lane_ids
+        for lane_id in edge_lane_ids:
+            self._append_unique_lane_id(lane_ids, seen_lane_ids, lane_id)
+
+    def _get_ackermann_feedback_lane_candidates(self, actor_id):
+        """Return route-compatible lanes near an Ackermann feedback actor."""
+        lane_ids = []
+        seen_lane_ids = set()
+        current_lane_id = traci.vehicle.getLaneID(actor_id)
+        current_road_id = traci.vehicle.getRoadID(actor_id)
+        route = traci.vehicle.getRoute(actor_id)
+        route_index = traci.vehicle.getRouteIndex(actor_id)
+
+        self._append_unique_lane_id(lane_ids, seen_lane_ids, current_lane_id)
+        self._append_edge_lane_ids(lane_ids, seen_lane_ids, current_road_id)
+
+        try:
+            next_links = traci.vehicle.getNextLinks(actor_id)
+        except Exception:
+            next_links = []
+        for lane_id in extract_next_link_lane_ids(next_links[:1]):
+            self._append_unique_lane_id(lane_ids, seen_lane_ids, lane_id)
+
+        if route:
+            route_start = max(0, route_index)
+            for edge_id in route[route_start : route_start + 2]:
+                self._append_edge_lane_ids(lane_ids, seen_lane_ids, edge_id)
+
+        lane_geometry_cache = getattr(self, "feedback_lane_geometry_cache", None)
+        if lane_geometry_cache is None:
+            lane_geometry_cache = {}
+            self.feedback_lane_geometry_cache = lane_geometry_cache
+        candidates = []
+        for lane_id in lane_ids:
+            geometry = lane_geometry_cache.get(lane_id)
+            if geometry is None:
+                try:
+                    geometry = {
+                        "lane_id": lane_id,
+                        "shape": traci.lane.getShape(lane_id),
+                        "length": traci.lane.getLength(lane_id),
+                    }
+                except Exception:
+                    continue
+                lane_geometry_cache[lane_id] = geometry
+            candidates.append(geometry)
+        return current_lane_id, candidates
+
+    def _move_ackermann_feedback_actor(self, actor_id, position, sumo_angle):
+        current_lane_id, candidates = self._get_ackermann_feedback_lane_candidates(actor_id)
+        # moveTo cannot represent CARLA's lateral offset. Let SUMO own lane
+        # changes and only update longitudinal progress on SUMO's current lane.
+        # Falling back to an adjacent lane based on CARLA x/y causes an
+        # instantaneous centerline-to-centerline jump in SUMO GUI.
+        current_lane_candidates = [
+            candidate for candidate in candidates if candidate["lane_id"] == current_lane_id
+        ]
+        max_distance = getattr(
+            self,
+            "ackermann_feedback_move_to_max_distance",
+            8.0,
+        )
+        if actor_id != "AV":
+            background_max_distance = getattr(
+                self,
+                "ackermann_feedback_background_move_to_max_distance",
+                None,
+            )
+            if background_max_distance is not None:
+                max_distance = background_max_distance
+
+        projection = select_route_aware_lane_projection(
+            position,
+            sumo_angle,
+            current_lane_candidates,
+            current_lane_id=current_lane_id,
+            lane_switch_hysteresis=getattr(
+                self,
+                "ackermann_feedback_move_to_lane_hysteresis",
+                0.35,
+            ),
+            max_distance=max_distance,
+            prefer_current_lane=True,
+        )
+        if projection is None:
+            self.logger.error(
+                "Ackermann feedback moveTo mapping failed actor=%s "
+                "position=(%.3f, %.3f) angle=%.3f currentLane=%s candidates=%s",
+                actor_id,
+                position[0],
+                position[1],
+                sumo_angle,
+                current_lane_id,
+                [candidate["lane_id"] for candidate in candidates],
+            )
+            self.last_agent_command_failure = {
+                "actor_id": actor_id,
+                "reason": "ackermann_feedback_moveTo_mapping_failed",
+                "position": [position[0], position[1]],
+                "sumo_angle": sumo_angle,
+                "current_lane_id": current_lane_id,
+                "candidate_lane_ids": [candidate["lane_id"] for candidate in candidates],
+            }
+            return None
+
+        traci.vehicle.moveTo(
+            actor_id,
+            projection["lane_id"],
+            projection["lane_position"],
+        )
+        self.logger.debug(
+            "Ackermann feedback moveTo actor=%s lane=%s lanePos=%.3f "
+            "distance=%.3f headingError=%.3f",
+            actor_id,
+            projection["lane_id"],
+            projection["lane_position"],
+            projection["distance"],
+            projection["heading_error"],
+        )
+        return projection
 
     def _setup_logger(self, base_dir: str) -> logging.Logger:
         """Setup logger for the plugin.
@@ -283,7 +590,8 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Create console handler
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        console_level_name = os.getenv("TERASIM_COSIM_CONSOLE_LOG_LEVEL", "INFO").upper()
+        console_handler.setLevel(getattr(logging, console_level_name, logging.INFO))
 
         # Create formatter and add it to the handlers
         formatter = logging.Formatter(
@@ -404,7 +712,8 @@ class TeraSimCoSimPlugin(BasePlugin):
 
             # Handle all pending vehicle commands
             self.controlled_agents_each_step.clear()
-            self._handle_pending_agent_commands()
+            if not self._handle_pending_agent_commands(simulator):
+                return False
 
             now = time.time()
             should_write_idle_state = (
@@ -806,6 +1115,10 @@ class TeraSimCoSimPlugin(BasePlugin):
                     vehicle_state.sumo_desired_speed = traci.vehicle.getSpeedWithoutTraCI(vid)
                 except Exception:
                     vehicle_state.sumo_desired_speed = vehicle_state.speed
+                try:
+                    vehicle_state.sumo_emergency_decel = traci.vehicle.getEmergencyDecel(vid)
+                except Exception:
+                    vehicle_state.sumo_emergency_decel = None
             vehicle_state.feedback_observed_speed = self.feedback_observed_speeds.get(vid)
             vehicle_state.feedback_source_carla_frame = (
                 self.feedback_source_carla_frames.get(vid)
@@ -1022,6 +1335,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         Args:
             command_data (str): The agent command data.
         """
+        self.last_agent_command_failure = None
         try:
             command = AgentCommand.model_validate_json(command_data.decode("utf-8"))
             if command.agent_id != '':
@@ -1045,16 +1359,93 @@ class TeraSimCoSimPlugin(BasePlugin):
                         lon, lat = command.data["lonlat"]
                         x, y = traci.simulation.convertGeo(lon, lat, fromGeo=True)
                     if command.agent_type == "vehicle":
-                        # 3-cosim fix: keepRoute=0 (snap to closest lane in the network),
-                        # not 2 (free / off-road). With keepRoute=2 an externally-driven
-                        # vehicle (e.g. the Autoware ego mirrored as SUMO "AV" via control_av)
-                        # lands slightly off the lane centerline -> getLaneID()=="" -> it drops
-                        # out of the AV context subscription -> NADE stops controlling traffic
-                        # around it -> background vehicles no longer yield and rear-end the ego.
-                        # keepRoute=0 keeps the AV on a lane so SUMO traffic avoids it.
-                        traci.vehicle.moveToXY(
-                            command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
+                        is_ackermann_feedback = "source_carla_frame" in command.data
+                        if is_ackermann_feedback:
+                            self._ensure_ackermann_feedback_lane_change_settings(
+                                command.agent_id
+                            )
+                        use_move_to = is_ackermann_feedback and getattr(
+                            self, "ackermann_feedback_position_mode", "moveTo"
+                        ) == "moveTo"
+                        lane_index = (
+                            getattr(self, "ackermann_feedback_lane_index", 0)
+                            if is_ackermann_feedback
+                            else 0
                         )
+                        keep_route = (
+                            getattr(self, "ackermann_feedback_keep_route", 0)
+                            if is_ackermann_feedback
+                            else 0
+                        )
+                        log_lane_transition = is_ackermann_feedback and getattr(
+                            self,
+                            "ackermann_feedback_log_lane_transitions",
+                            False,
+                        )
+                        before_lane_state = None
+                        if log_lane_transition:
+                            before_lane_state = self._read_ackermann_feedback_lane_state(
+                                command.agent_id
+                            )
+                            previous_lane_state = getattr(
+                                self,
+                                "feedback_lane_states",
+                                {},
+                            ).get(command.agent_id)
+                            if previous_lane_state is None and before_lane_state is not None:
+                                self.logger.info(
+                                    "Ackermann feedback lane initial actor=%s road=%s "
+                                    "lane=%s lanePos=%s routeIndex=%s",
+                                    command.agent_id,
+                                    before_lane_state["road_id"],
+                                    before_lane_state["lane_id"],
+                                    before_lane_state["lane_position"],
+                                    before_lane_state["route_index"],
+                                )
+                            else:
+                                self._log_ackermann_feedback_lane_transition(
+                                    command.agent_id,
+                                    "sumo_step",
+                                    previous_lane_state,
+                                    before_lane_state,
+                                )
+                        if use_move_to:
+                            projection = self._move_ackermann_feedback_actor(
+                                command.agent_id,
+                                (x, y),
+                                command.data.get("sumo_angle", 0),
+                            )
+                            if projection is None:
+                                return False
+                            feedback_move_source = "feedback_moveTo"
+                        else:
+                            # keepRoute=0 snaps externally-driven vehicles to a network
+                            # lane. This is retained for non-feedback commands and the
+                            # explicitly selected legacy moveToXY feedback mode.
+                            traci.vehicle.moveToXY(
+                                command.agent_id,
+                                "",
+                                lane_index,
+                                x,
+                                y,
+                                command.data.get("sumo_angle", 0),
+                                keep_route,
+                            )
+                            feedback_move_source = "feedback_moveToXY"
+                        if log_lane_transition:
+                            after_lane_state = self._read_ackermann_feedback_lane_state(
+                                command.agent_id
+                            )
+                            self._log_ackermann_feedback_lane_transition(
+                                command.agent_id,
+                                feedback_move_source,
+                                before_lane_state,
+                                after_lane_state,
+                            )
+                            if after_lane_state is not None:
+                                if not hasattr(self, "feedback_lane_states"):
+                                    self.feedback_lane_states = {}
+                                self.feedback_lane_states[command.agent_id] = after_lane_state
 
                         # 3-cosim fix (dense maps, e.g. Odaiba): right after moveToXY, append one
                         # successor edge so the externally-driven AV's route is never a single
@@ -1065,7 +1456,12 @@ class TeraSimCoSimPlugin(BasePlugin):
                         # entirely by moveToXY (it mirrors the Autoware ego), so this 2-edge route is
                         # only a decoy to keep it alive -- NOT a fixed plan, which is correct because
                         # the Autoware ego chooses its path dynamically.
-                        if command.agent_id == "AV" and "AV" in traci.vehicle.getIDList():
+                        if (
+                            not use_move_to
+                            and keep_route == 0
+                            and command.agent_id == "AV"
+                            and "AV" in traci.vehicle.getIDList()
+                        ):
                             try:
                                 cur = traci.vehicle.getRoadID("AV")
                                 if cur and not cur.startswith(":"):  # skip junction-internal edges
@@ -1118,8 +1514,38 @@ class TeraSimCoSimPlugin(BasePlugin):
                 return True
 
         except Exception as e:
+            if self.last_agent_command_failure is None:
+                self.last_agent_command_failure = {
+                    "reason": "agent_command_exception",
+                    "exception_type": type(e).__name__,
+                }
             self.logger.error(f"Error handling agent command: {e}")
             return False
+
+    def _record_agent_command_failure(self, simulator):
+        failure = self.last_agent_command_failure or {
+            "reason": "agent_command_rejected",
+        }
+        self.logger.critical(
+            "Fail-closed: refusing SUMO simulationStep after agent command failure: %s",
+            failure,
+        )
+        try:
+            simulator.env.record["finish_reason"] = failure["reason"]
+            simulator.env.record["failed_actor"] = failure.get("actor_id", "")
+        except Exception:
+            pass
+        simulator.running = False
+        try:
+            if self.redis_client:
+                self.redis_client.set(
+                    f"simulation:{self.simulation_uuid}:status",
+                    "error",
+                    ex=self.key_expiry,
+                )
+        except Exception as exc:
+            self.logger.error("Failed to publish fail-closed status: %s", exc)
+        return failure
 
     def _reconnect_redis(self):
         """Reconnect to Redis server.
@@ -1136,11 +1562,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             self.logger.error(f"Failed to reconnect to Redis: {e}")
             return False
 
-    def _handle_pending_agent_commands(self):
+    def _handle_pending_agent_commands(self, simulator=None):
         """Handle all pending agent commands in the queue."""
         if not self._check_simulation_status():
-            return
-        """Handle all pending agent commands in the queue"""
+            return False
         try:
             # The cap prevents an infinite producer loop while allowing one feedback batch.
             for _ in range(self.max_agent_commands_per_step):
@@ -1150,9 +1575,20 @@ class TeraSimCoSimPlugin(BasePlugin):
                 if not command_data:
                     break
 
-                self._handle_agent_command(command_data)
+                if not self._handle_agent_command(command_data):
+                    if simulator is not None:
+                        self._record_agent_command_failure(simulator)
+                    return False
+            return True
         except Exception as e:
             self.logger.error(f"Error handling pending agent commands: {e}")
+            self.last_agent_command_failure = {
+                "reason": "pending_agent_command_exception",
+                "exception_type": type(e).__name__,
+            }
+            if simulator is not None:
+                self._record_agent_command_failure(simulator)
+            return False
 
     def _extract_map_geometry(self, sumo_net):
         """Extract static map geometry from SUMO network."""

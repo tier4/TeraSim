@@ -25,6 +25,13 @@ class FakeTransform:
         self.rotation = rotation or FakeRotation()
 
 
+class FakeVector3D:
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+
 class FakeCommand:
     FutureActor = object()
 
@@ -53,12 +60,24 @@ class FakeVehicleAckermannControl:
         self.jerk = jerk
 
 
+class FakeAckermannControllerSettings:
+    def __init__(self, speed_kp, speed_ki, speed_kd, accel_kp, accel_ki, accel_kd):
+        self.speed_kp = speed_kp
+        self.speed_ki = speed_ki
+        self.speed_kd = speed_kd
+        self.accel_kp = accel_kp
+        self.accel_ki = accel_ki
+        self.accel_kd = accel_kd
+
+
 def install_fake_carla():
     sys.modules["carla"] = types.SimpleNamespace(
         Location=FakeLocation,
         Rotation=FakeRotation,
         Transform=FakeTransform,
+        Vector3D=FakeVector3D,
         VehicleAckermannControl=FakeVehicleAckermannControl,
+        AckermannControllerSettings=FakeAckermannControllerSettings,
         command=FakeCommand,
     )
 
@@ -80,6 +99,63 @@ def test_lane_lookahead_crosses_internal_and_destination_lanes():
         1.5,
     )
     assert point == pytest.approx((15.0, 0.0, 1.5))
+
+
+def test_route_aware_projection_switches_lane_after_centerline_midpoint():
+    from terasim_service.utils.sumo_lane_geometry import (
+        select_route_aware_lane_projection,
+    )
+
+    candidates = [
+        {"lane_id": "edge_0_0", "shape": [(0.0, 0.0), (100.0, 0.0)], "length": 80.0},
+        {"lane_id": "edge_0_1", "shape": [(0.0, 3.2), (100.0, 3.2)], "length": 80.0},
+    ]
+    source_projection = select_route_aware_lane_projection(
+        (25.0, 1.6),
+        90.0,
+        candidates,
+        current_lane_id="edge_0_0",
+        lane_switch_hysteresis=0.35,
+    )
+    target_projection = select_route_aware_lane_projection(
+        (25.0, 2.0),
+        90.0,
+        candidates,
+        current_lane_id="edge_0_0",
+        lane_switch_hysteresis=0.35,
+    )
+
+    assert source_projection["lane_id"] == "edge_0_0"
+    assert target_projection["lane_id"] == "edge_0_1"
+    assert target_projection["lane_position"] == pytest.approx(20.0)
+
+
+def test_route_aware_projection_can_preserve_sumo_lane_change_state():
+    from terasim_service.utils.sumo_lane_geometry import (
+        select_route_aware_lane_projection,
+    )
+
+    candidates = [
+        {"lane_id": "edge_0_0", "shape": [(0.0, 0.0), (100.0, 0.0)], "length": 100.0},
+        {"lane_id": "edge_0_1", "shape": [(0.0, 3.2), (100.0, 3.2)], "length": 100.0},
+    ]
+    projection = select_route_aware_lane_projection(
+        (25.0, 3.2), 90.0, candidates, current_lane_id="edge_0_0", prefer_current_lane=True
+    )
+    assert projection["lane_id"] == "edge_0_0"
+
+
+def test_route_aware_projection_rejects_opposing_or_distant_lanes():
+    from terasim_service.utils.sumo_lane_geometry import (
+        select_route_aware_lane_projection,
+    )
+
+    candidates = [{"lane_id": "opposing_0", "shape": [(100.0, 0.0), (0.0, 0.0)], "length": 100.0}]
+    assert select_route_aware_lane_projection((20.0, 0.0), 90.0, candidates) is None
+    assert (
+        select_route_aware_lane_projection((20.0, 10.0), 270.0, candidates, max_distance=8.0)
+        is None
+    )
 
 
 def test_pure_pursuit_steers_and_rate_limits():
@@ -132,6 +208,93 @@ def test_feedback_apply_enables_physics_only_for_selected_actors():
     cosim.ackermann_feedback_all_background_actors = True
     assert cosim._uses_ackermann_physics("BV") is True
     assert cosim._uses_ackermann_physics("AV") is False
+
+
+def test_ackermann_controller_settings_are_applied_once(capsys):
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannControllerTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    settings_applied = []
+    physics_enabled = []
+    actor = types.SimpleNamespace(
+        set_simulate_physics=lambda enabled: physics_enabled.append(enabled),
+        apply_ackermann_controller_settings=lambda settings: settings_applied.append(settings),
+    )
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._ackermann_actor_state = {}
+    cosim.ackermann_controller_tuning = AckermannControllerTuning(accel_kp=0.05, accel_kd=0.005)
+
+    cosim._ensure_ackermann_actor_physics(actor, "AV")
+    cosim._ensure_ackermann_actor_physics(actor, "AV")
+
+    assert physics_enabled == [True]
+    assert len(settings_applied) == 1
+    assert settings_applied[0].speed_kp == pytest.approx(0.15)
+    assert settings_applied[0].accel_kp == pytest.approx(0.05)
+    assert settings_applied[0].accel_kd == pytest.approx(0.005)
+    assert cosim._ackermann_actor_state["AV"]["controller_settings_applied"] is True
+    assert "CARLA Ackermann controller settings applied" in capsys.readouterr().out
+
+
+def test_ackermann_physics_initializes_velocity_from_sumo_state():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannControllerTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    velocities = []
+    actor = types.SimpleNamespace(
+        set_simulate_physics=lambda enabled: None,
+        set_target_velocity=velocities.append,
+        apply_ackermann_controller_settings=lambda settings: None,
+    )
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._ackermann_actor_state = {}
+    cosim.ackermann_controller_tuning = AckermannControllerTuning()
+    transform = FakeTransform(rotation=FakeRotation(yaw=30.0))
+
+    cosim._ensure_ackermann_actor_physics(actor, "BV", 4.0, transform)
+    cosim._ensure_ackermann_actor_physics(actor, "BV", 9.0, transform)
+
+    assert len(velocities) == 1
+    assert velocities[0].x == pytest.approx(4.0 * 3**0.5 / 2.0)
+    assert velocities[0].y == pytest.approx(2.0)
+    assert velocities[0].z == pytest.approx(0.0)
+    assert cosim._ackermann_actor_state["BV"]["initial_velocity_applied"] is True
+
+
+def test_actor_radius_filter_uses_exit_hysteresis():
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.actor_filter_enabled = True
+    cosim.actor_filter_center_id = "AV"
+    cosim.actor_filter_radius = 300.0
+    cosim.actor_filter_hysteresis = 20.0
+    cosim._actor_filter_active_vehicle_ids = set()
+    cosim._actor_filter_missing_center_warned = False
+
+    def vehicles_at(distance):
+        return {
+            "AV": {"x": 0.0, "y": 0.0},
+            "BV": {"x": distance, "y": 0.0},
+        }
+
+    filtered, _ = cosim._filter_actor_details_by_radius(vehicles_at(299.0), {})
+    assert set(filtered) == {"AV", "BV"}
+
+    filtered, _ = cosim._filter_actor_details_by_radius(vehicles_at(310.0), {})
+    assert set(filtered) == {"AV", "BV"}
+
+    filtered, _ = cosim._filter_actor_details_by_radius(vehicles_at(321.0), {})
+    assert set(filtered) == {"AV"}
+
+    filtered, _ = cosim._filter_actor_details_by_radius(vehicles_at(310.0), {})
+    assert set(filtered) == {"AV"}
+
+    filtered, _ = cosim._filter_actor_details_by_radius(vehicles_at(299.0), {})
+    assert set(filtered) == {"AV", "BV"}
 
 
 def test_feedback_batches_valid_actors_and_isolates_invalid_shape(monkeypatch):
@@ -291,6 +454,40 @@ def test_feedback_wait_requires_new_completed_tick(monkeypatch):
     assert cosim._last_completed_terasim_tick_count == 8
 
 
+def test_feedback_lc_keep_right_is_applied_once_and_verified(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    calls = []
+    parameters = {}
+
+    def set_parameter(actor_id, name, value):
+        calls.append((actor_id, name, value))
+        parameters[(actor_id, name)] = value
+
+    fake_vehicle = types.SimpleNamespace(
+        setParameter=set_parameter,
+        getParameter=lambda actor_id, name: parameters[(actor_id, name)],
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.ackermann_feedback_lc_keep_right = 0.0
+    plugin.ackermann_feedback_lc_keep_right_actor_ids = {"AV"}
+    plugin.ackermann_feedback_lane_change_settings_applied = set()
+    plugin.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    plugin._ensure_ackermann_feedback_lane_change_settings("AV")
+    plugin._ensure_ackermann_feedback_lane_change_settings("AV")
+    plugin._ensure_ackermann_feedback_lane_change_settings("BV")
+
+    assert calls == [("AV", "laneChangeModel.lcKeepRight", "0")]
+    assert plugin.ackermann_feedback_lane_change_settings_applied == {"AV"}
+
+
 def test_feedback_ack_is_cached_by_shared_sumo_command_handler(monkeypatch):
     from terasim_service.plugins import cosim as plugin_module
 
@@ -306,10 +503,32 @@ def test_feedback_ack_is_cached_by_shared_sumo_command_handler(monkeypatch):
             "source_carla_frame": 101,
         },
     )
+    lane_state = {
+        "road_id": "edge_0",
+        "lane_id": "edge_0_0",
+        "lane_position": 10.0,
+        "route_index": 0,
+    }
+    warnings = []
+
+    def move_to_xy(*args):
+        calls.append(("move", args))
+        if args[2] == -1:
+            lane_state.update(
+                road_id="edge_0",
+                lane_id="edge_0_1",
+                lane_position=11.0,
+                route_index=0,
+            )
+
     fake_vehicle = types.SimpleNamespace(
-        moveToXY=lambda *args: calls.append(("move", args)),
+        moveToXY=move_to_xy,
         setPreviousSpeed=lambda *args: calls.append(("speed", args)),
         getIDList=lambda: [],
+        getRoadID=lambda _actor_id: lane_state["road_id"],
+        getLaneID=lambda _actor_id: lane_state["lane_id"],
+        getLanePosition=lambda _actor_id: lane_state["lane_position"],
+        getRouteIndex=lambda _actor_id: lane_state["route_index"],
     )
     monkeypatch.setattr(plugin_module, "traci", types.SimpleNamespace(vehicle=fake_vehicle))
     monkeypatch.setattr(
@@ -322,16 +541,144 @@ def test_feedback_ack_is_cached_by_shared_sumo_command_handler(monkeypatch):
     plugin.controlled_agents_each_step = set()
     plugin.feedback_observed_speeds = {}
     plugin.feedback_source_carla_frames = {}
+    plugin.ackermann_feedback_position_mode = "moveToXY"
     plugin.logger = types.SimpleNamespace(
         info=lambda *args, **kwargs: None,
         debug=lambda *args, **kwargs: None,
+        warning=lambda message, *args, **kwargs: warnings.append(message % args),
         error=lambda *args, **kwargs: None,
     )
 
     assert plugin._handle_agent_command(b"{}") is True
+    assert calls[0] == ("move", ("AV", "", 0, 1.0, 2.0, 90.0, 0))
     assert plugin.feedback_observed_speeds == {"AV": 3.5}
     assert plugin.feedback_source_carla_frames == {"AV": 101}
     assert calls[-1] == ("speed", ("AV", 3.5))
+    calls.clear()
+    plugin.controlled_agents_each_step.clear()
+    plugin.ackermann_feedback_lane_index = -1
+    plugin.ackermann_feedback_keep_route = 1
+    plugin.ackermann_feedback_log_lane_transitions = True
+    plugin.feedback_lane_states = {}
+
+    assert plugin._handle_agent_command(b"{}") is True
+    assert calls[0] == ("move", ("AV", "", -1, 1.0, 2.0, 90.0, 1))
+    assert plugin.feedback_lane_states["AV"]["lane_id"] == "edge_0_1"
+    assert any("source=feedback_moveToXY" in warning for warning in warnings)
+
+
+def test_feedback_move_to_is_immediate_and_preserves_current_sumo_lane(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    calls = []
+    command = types.SimpleNamespace(
+        agent_id="BV",
+        agent_type="vehicle",
+        command_type="set_state",
+        data={
+            "position": [25.0, 2.8],
+            "sumo_angle": 90.0,
+            "speed": 3.5,
+            "source_carla_frame": 101,
+        },
+    )
+    lane_state = {
+        "road_id": "edge_0",
+        "lane_id": "edge_0_0",
+        "lane_position": 10.0,
+        "route_index": 0,
+    }
+    lane_shapes = {
+        "edge_0_0": [(0.0, 0.0), (100.0, 0.0)],
+        "edge_0_1": [(0.0, 3.2), (100.0, 3.2)],
+        ":junction_0_0": [(100.0, 0.0), (105.0, 0.0)],
+        "edge_1_0": [(105.0, 0.0), (205.0, 0.0)],
+    }
+
+    def move_to(actor_id, lane_id, lane_position):
+        calls.append(("move", (actor_id, lane_id, lane_position)))
+        lane_state.update(
+            road_id=lane_id.rsplit("_", 1)[0],
+            lane_id=lane_id,
+            lane_position=lane_position,
+        )
+
+    fake_vehicle = types.SimpleNamespace(
+        moveTo=move_to,
+        moveToXY=lambda *args: calls.append(("move_xy", args)),
+        setPreviousSpeed=lambda *args: calls.append(("speed", args)),
+        getIDList=lambda: ["BV"],
+        getRoadID=lambda _actor_id: lane_state["road_id"],
+        getLaneID=lambda _actor_id: lane_state["lane_id"],
+        getLanePosition=lambda _actor_id: lane_state["lane_position"],
+        getRouteIndex=lambda _actor_id: lane_state["route_index"],
+        getRoute=lambda _actor_id: ("edge_0", "edge_1"),
+        getNextLinks=lambda _actor_id: [
+            ("edge_1_0", ":junction_0_0", True, True, False, "G", "s", 5.0)
+        ],
+    )
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda lane_id: lane_shapes[lane_id],
+        getLength=lambda lane_id: 5.0 if lane_id.startswith(":") else 100.0,
+    )
+    fake_edge = types.SimpleNamespace(
+        getLaneNumber=lambda edge_id: 2 if edge_id == "edge_0" else 1,
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle, lane=fake_lane, edge=fake_edge),
+    )
+    monkeypatch.setattr(
+        plugin_module.AgentCommand,
+        "model_validate_json",
+        staticmethod(lambda payload: command),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.controlled_agents_each_step = set()
+    plugin.feedback_observed_speeds = {}
+    plugin.feedback_source_carla_frames = {}
+    plugin.feedback_lane_states = {}
+    plugin.ackermann_feedback_position_mode = "moveTo"
+    plugin.ackermann_feedback_move_to_max_distance = 8.0
+    plugin.ackermann_feedback_background_move_to_max_distance = None
+    plugin.ackermann_feedback_move_to_lane_hysteresis = 0.35
+    plugin.ackermann_feedback_log_lane_transitions = True
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+
+    assert plugin._handle_agent_command(b"{}") is True
+    assert calls[0][0] == "move"
+    assert calls[0][1][0:2] == ("BV", "edge_0_0")
+    assert calls[0][1][2] == pytest.approx(25.0)
+    assert calls[1] == ("speed", ("BV", 3.5))
+    assert not any(call[0] == "move_xy" for call in calls)
+    assert plugin.feedback_lane_states["BV"]["lane_id"] == "edge_0_0"
+
+    # Even when CARLA is closer to the adjacent lane, moveTo must not switch
+    # lanes on CARLA position. An invalid current-lane projection is rejected.
+    calls.clear()
+    plugin.controlled_agents_each_step.clear()
+    command.data["position"] = [25.0, 10.0]
+    assert plugin._handle_agent_command(b"{}") is False
+    assert calls == []
+    assert plugin.last_agent_command_failure["reason"] == (
+        "ackermann_feedback_moveTo_mapping_failed"
+    )
+
+    # A wider background-only tolerance does not relax the AV limit.
+    plugin.ackermann_feedback_background_move_to_max_distance = 20.0
+    plugin.last_agent_command_failure = None
+    plugin.controlled_agents_each_step.clear()
+    assert plugin._handle_agent_command(b"{}") is True
+    assert calls[0][0] == "move"
+    assert calls[0][1][0:2] == ("BV", "edge_0_0")
+    assert calls[0][1][2] == pytest.approx(25.0)
 
 
 def test_ackermann_feedback_acceleration_uses_observed_speed():
@@ -346,6 +693,7 @@ def test_ackermann_feedback_acceleration_uses_observed_speed():
     cosim.step_length = 0.1
     cosim.ackermann_feedback_speed_horizon = 1.0
     cosim.ackermann_tuning = AckermannTuning(max_accel=3.0, max_decel=6.0)
+    cosim._ackermann_actor_state = {}
 
     target, acceleration = cosim._resolve_ackermann_longitudinal_target(
         "AV",
@@ -358,3 +706,147 @@ def test_ackermann_feedback_acceleration_uses_observed_speed():
     )
     assert acceleration == pytest.approx(2.0)
     assert target == pytest.approx(2.4)
+
+
+def test_ackermann_feedback_uses_sumo_emergency_decel():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_feedback_apply_enabled = True
+    cosim.ackermann_feedback_actor_ids = {"AV"}
+    cosim.ackermann_feedback_all_background_actors = False
+    cosim.step_length = 0.1
+    cosim.ackermann_feedback_speed_horizon = 0.1
+    cosim.ackermann_tuning = AckermannTuning(max_accel=3.0, max_decel=6.0)
+    cosim._ackermann_actor_state = {}
+
+    target, acceleration = cosim._resolve_ackermann_longitudinal_target(
+        "AV",
+        {
+            "speed": 1.0,
+            "sumo_desired_speed": 0.0,
+            "feedback_observed_speed": 1.0,
+            "sumo_emergency_decel": 7.06,
+        },
+        current_speed=1.0,
+    )
+
+    assert acceleration == pytest.approx(-7.06)
+    assert target == pytest.approx(0.294)
+
+
+def test_fail_closed_brake_uses_last_sumo_emergency_decel():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    controls = []
+    ticks = []
+    actor = types.SimpleNamespace(apply_ackermann_control=controls.append)
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_feedback_apply_enabled = True
+    cosim.ackermann_feedback_actor_ids = {"AV"}
+    cosim.ackermann_feedback_all_background_actors = False
+    cosim._ackermann_feedback_actor_index = {"AV": actor}
+    cosim._ackermann_actor_state = {"AV": {"steer": 0.2, "sumo_emergency_decel": 7.06}}
+    cosim.ackermann_tuning = AckermannTuning(max_decel=6.0)
+    cosim.step_length = 0.1
+    cosim.args = types.SimpleNamespace(passive_tick=False)
+    cosim.world = types.SimpleNamespace(tick=lambda: ticks.append("tick"))
+
+    assert cosim._apply_ackermann_fail_closed_brake("test") == 1
+    assert len(controls) == 1
+    assert controls[0].speed == 0.0
+    assert controls[0].acceleration == pytest.approx(-7.06)
+    assert ticks == ["tick"]
+
+
+def test_direct_command_failure_stops_before_sumo_step():
+    from terasim_service.plugins import cosim_direct as direct_module
+
+    plugin = direct_module.TeraSimCoSimDirectPlugin.__new__(direct_module.TeraSimCoSimDirectPlugin)
+    plugin._lock = direct_module.threading.Lock()
+    plugin._status = "wait_for_tick"
+    plugin._state_json = ""
+    plugin._completed_sumo_time = 0.0
+    plugin._completed_tick_count = 0
+    plugin._pending_commands = [b"invalid"]
+    plugin._stop_requested = False
+    plugin._tick_requested = direct_module.threading.Event()
+    plugin._tick_requested.set()
+    plugin._step_done = direct_module.threading.Event()
+    plugin.controlled_agents_each_step = set()
+    plugin.last_agent_command_failure = {
+        "actor_id": "AV",
+        "reason": "ackermann_feedback_moveTo_mapping_failed",
+    }
+    plugin.redis_client = None
+    plugin._handle_agent_command = lambda raw: False
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        critical=lambda *args, **kwargs: None,
+    )
+    simulator = types.SimpleNamespace(
+        running=True,
+        env=types.SimpleNamespace(record={}),
+    )
+
+    assert plugin.function_before_env_step(simulator, {}) is False
+    assert simulator.running is False
+    assert simulator.env.record["finish_reason"] == ("ackermann_feedback_moveTo_mapping_failed")
+    assert plugin._status == "error"
+    assert plugin._step_done.is_set()
+
+
+def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys):
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_control_log_records = True
+    cosim._ackermann_actor_state = {
+        "AV": {
+            "sumo_requested_acceleration": -7.06,
+            "sumo_emergency_decel": 7.06,
+        }
+    }
+    cosim.step_length = 0.1
+    cosim.terasim_states = {"simulation_time": 12.3}
+    cosim.world = types.SimpleNamespace(get_snapshot=lambda: types.SimpleNamespace(frame=42))
+    vehicle = types.SimpleNamespace(
+        get_acceleration=lambda: types.SimpleNamespace(x=-6.5, y=0.0, z=0.0),
+        get_control=lambda: types.SimpleNamespace(throttle=0.0, brake=0.75, steer=0.1),
+    )
+    transform = FakeTransform(rotation=FakeRotation(yaw=0.0))
+
+    cosim._record_ackermann_control_trace(
+        veh_id="AV",
+        veh_info={
+            "sumo_desired_speed": 0.0,
+            "acceleration": -7.06,
+            "feedback_observed_speed": 6.62,
+        },
+        vehicle=vehicle,
+        current_transform=transform,
+        current_speed=6.19,
+        target_speed=0.0,
+        target_acceleration=-7.06,
+        position_error=0.4,
+        feedback_unhealthy=False,
+        target_behind=False,
+    )
+
+    prefix, payload = capsys.readouterr().out.strip().split(" ", 1)
+    record = json.loads(payload)
+    assert prefix == "AckermannControlTrace"
+    assert record["sumo_requested_acceleration"] == pytest.approx(-7.06)
+    assert record["ackermann_target_acceleration"] == pytest.approx(-7.06)
+    assert record["carla_speed"] == pytest.approx(6.19)
+    assert record["carla_longitudinal_acceleration"] == pytest.approx(-6.5)
+    assert record["carla_applied_throttle"] == pytest.approx(0.0)
+    assert record["carla_applied_brake"] == pytest.approx(0.75)
+    assert record["carla_applied_steer"] == pytest.approx(0.1)

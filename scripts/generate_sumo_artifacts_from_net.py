@@ -20,6 +20,9 @@ from pathlib import Path
 import sumolib
 
 
+SUMO_STOPLINE_GAP = "4.0"
+STOPLINE_GAP_VTYPE_IDS = ("NDE_URBAN", "vehicle_passenger")
+
 NDE_VTYPES = [
     {
         "id": "NDE_URBAN",
@@ -36,6 +39,7 @@ NDE_VTYPES = [
         "lcCooperative": "0",
         "lcKeepRight": "1",
         "speedFactor": "normc(1,0.1,0.8,1.2)",
+        "jmStoplineGap": SUMO_STOPLINE_GAP,
     },
     {
         "id": "NDE_HIGHWAY",
@@ -387,6 +391,10 @@ def ensure_vtypes_and_av_route(routes_path: Path, av_route_edges: list[str]) -> 
             continue
         elem = ET.Element("vType", vtype)
         root.insert(insert_index, elem)
+    for vtype_id in STOPLINE_GAP_VTYPE_IDS:
+        vtype = root.find(f"vType[@id='{vtype_id}']")
+        if vtype is not None:
+            vtype.set("jmStoplineGap", SUMO_STOPLINE_GAP)
     existing_route = root.find("route[@id='av_route']")
     if existing_route is not None:
         root.remove(existing_route)
