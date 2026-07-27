@@ -78,6 +78,12 @@ class CarlaCosim(object):
         # Mutually exclusive with args.passive_tick (follow mode).
         self.tick_master = bool(getattr(args, "tick_master", False))
         self._next_tick_deadline = None  # monotonic deadline of the next tick
+        # world.tick() duration stats (master mode): p50/p95/max + 5ms-bin
+        # histogram printed every ~60s. Cheap (2 monotonic calls + one append
+        # per cycle), so always on; this is the direct measurement of the
+        # world-update time whose variance shifts frame-done arrival intervals.
+        self._tick_times_ms = []
+        self._tick_time_hist = [0] * 11  # 0-5,5-10,...,45-50,50+ ms
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
@@ -405,7 +411,23 @@ class CarlaCosim(object):
         else:
             self._next_tick_deadline = time.monotonic() + self.step_length
 
+        t0 = time.monotonic()
         self._last_world_frame = self.world.tick()
+        tick_ms = (time.monotonic() - t0) * 1000.0
+        self._tick_times_ms.append(tick_ms)
+        self._tick_time_hist[min(int(tick_ms // 5), 10)] += 1
+        if len(self._tick_times_ms) >= 1200:
+            arr = sorted(self._tick_times_ms)
+            n = len(arr)
+            hist = "/".join(str(c) for c in self._tick_time_hist)
+            print(
+                f"[tick-timing] world.tick ms: p50={arr[n // 2]:.1f} "
+                f"p95={arr[int(n * 0.95)]:.1f} max={arr[-1]:.1f} n={n} "
+                f"hist(5ms bins,0->50+)={hist}",
+                flush=True,
+            )
+            self._tick_times_ms = []
+            self._tick_time_hist = [0] * 11
 
         commands = []
         if self.control_av:
