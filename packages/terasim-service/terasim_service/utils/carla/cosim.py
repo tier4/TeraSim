@@ -84,6 +84,10 @@ class CarlaCosim(object):
         # world-update time whose variance shifts frame-done arrival intervals.
         self._tick_times_ms = []
         self._tick_time_hist = [0] * 11  # 0-5,5-10,...,45-50,50+ ms
+        # Timing must always be read together with the vehicle count (lesson
+        # 2026-07-28): min/max of CARLA-synced vehicles within the same window.
+        self._tick_veh_min = None
+        self._tick_veh_max = None
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
@@ -416,6 +420,9 @@ class CarlaCosim(object):
         tick_ms = (time.monotonic() - t0) * 1000.0
         self._tick_times_ms.append(tick_ms)
         self._tick_time_hist[min(int(tick_ms // 5), 10)] += 1
+        nveh = len(self._vehicle_actor_index)
+        self._tick_veh_min = nveh if self._tick_veh_min is None else min(self._tick_veh_min, nveh)
+        self._tick_veh_max = nveh if self._tick_veh_max is None else max(self._tick_veh_max, nveh)
         if len(self._tick_times_ms) >= 1200:
             arr = sorted(self._tick_times_ms)
             n = len(arr)
@@ -423,11 +430,14 @@ class CarlaCosim(object):
             print(
                 f"[tick-timing] world.tick ms: p50={arr[n // 2]:.1f} "
                 f"p95={arr[int(n * 0.95)]:.1f} max={arr[-1]:.1f} n={n} "
-                f"hist(5ms bins,0->50+)={hist}",
+                f"hist(5ms bins,0->50+)={hist} "
+                f"carla_veh={self._tick_veh_min}-{self._tick_veh_max}",
                 flush=True,
             )
             self._tick_times_ms = []
             self._tick_time_hist = [0] * 11
+            self._tick_veh_min = None
+            self._tick_veh_max = None
 
         commands = []
         if self.control_av:
