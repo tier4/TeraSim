@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from terasim.overlay import traci
+from terasim.profiling import add_timing, set_value
 from terasim.simulator import Simulator
 
 from terasim_nde_nade.adversity import ConstructionAdversity
@@ -215,6 +216,14 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.feedback_edge_lane_ids_cache = {}
         self.feedback_lane_geometry_cache = {}
         self.last_agent_command_failure = None
+        self.continue_on_ackermann_feedback_failure = self._parse_bool_env(
+            "TERASIM_COSIM_CONTINUE_ON_ACKERMANN_FEEDBACK_FAILURE", False
+        )
+        if self.continue_on_ackermann_feedback_failure:
+            self.logger.warning(
+                "Ackermann feedback failures are non-fatal. This mode is intended "
+                "for performance measurements only."
+            )
         self.ackermann_feedback_lane_index = self._parse_int_env(
             "CARLA_COSIM_ACKERMANN_FEEDBACK_LANE_INDEX", 0
         )
@@ -293,11 +302,32 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         self.state_filter_missing_center_logged = False
         self.state_filter_error_logged = False
+        self.state_detail_radius = self._parse_optional_float(
+            os.getenv("TERASIM_COSIM_STATE_DETAIL_RADIUS", "")
+        )
+        self.state_detail_hysteresis = max(
+            0.0,
+            self._parse_float_env("TERASIM_COSIM_STATE_DETAIL_HYSTERESIS", 10.0),
+        )
+        self.state_detail_filter_enabled = bool(
+            self.state_detail_radius is not None and self.state_detail_radius > 0.0
+        )
+        self.state_detail_active_vehicle_ids = set()
+        self.vehicle_static_state_cache = {}
         if self.state_filter_enabled:
             self.logger.info(
                 "TeraSim co-sim state filter enabled: center=%s radius=%s",
                 self.state_filter_center_id,
                 self.state_filter_radius,
+            )
+
+        if self.state_detail_filter_enabled:
+            self.logger.info(
+                "TeraSim detailed state radius enabled: center=%s "
+                "enterRadius=%.1fm exitRadius=%.1fm",
+                self.state_filter_center_id,
+                self.state_detail_radius,
+                self.state_detail_radius + self.state_detail_hysteresis,
             )
 
         self.lane_relative_position_enabled = self._parse_bool_env(
@@ -350,6 +380,24 @@ class TeraSimCoSimPlugin(BasePlugin):
             return False
         actor_ids = getattr(self, "ackermann_feedback_actor_ids", set())
         return actor_id in actor_ids or (actor_id != "AV" and "*" in actor_ids)
+
+    def _should_continue_after_agent_command_failure(self):
+        if not getattr(self, "continue_on_ackermann_feedback_failure", False):
+            return False
+        failure = self.last_agent_command_failure or {}
+        reason = str(failure.get("reason", ""))
+        is_feedback_failure = bool(failure.get("ackermann_feedback")) or reason.startswith(
+            "ackermann_feedback_"
+        )
+        if not is_feedback_failure:
+            return False
+        self.logger.warning(
+            "Performance mode: ignoring Ackermann feedback command failure and "
+            "continuing SUMO actor=%s reason=%s",
+            failure.get("actor_id", ""),
+            reason or "unknown",
+        )
+        return True
 
     def _ensure_ackermann_feedback_lane_change_settings(self, actor_id):
         lc_keep_right = getattr(self, "ackermann_feedback_lc_keep_right", None)
@@ -545,6 +593,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             self.last_agent_command_failure = {
                 "actor_id": actor_id,
                 "reason": "ackermann_feedback_moveTo_mapping_failed",
+                "ackermann_feedback": True,
                 "position": [position[0], position[1]],
                 "sumo_angle": sumo_angle,
                 "current_lane_id": current_lane_id,
@@ -972,6 +1021,68 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self.state_filter_error_logged = True
             return vehicle_ids, {}
 
+    def _update_state_detail_active_vehicle_ids(self, vehicle_ids, position_cache):
+        vehicle_ids = set(vehicle_ids)
+        if not getattr(self, "state_detail_filter_enabled", False):
+            self.state_detail_active_vehicle_ids = vehicle_ids
+            return vehicle_ids
+
+        center_id = self.state_filter_center_id
+        center_position = position_cache.get(center_id)
+        if center_position is None and center_id in vehicle_ids:
+            try:
+                center_position = traci.vehicle.getPosition3D(center_id)
+                position_cache[center_id] = center_position
+            except Exception:
+                center_position = None
+        if center_position is None:
+            # Preserve the full state contract until the AV exists.
+            self.state_detail_active_vehicle_ids = vehicle_ids
+            return vehicle_ids
+
+        previous_ids = getattr(self, "state_detail_active_vehicle_ids", set())
+        enter_radius_sq = self.state_detail_radius * self.state_detail_radius
+        exit_radius_sq = (
+            self.state_detail_radius + self.state_detail_hysteresis
+        ) ** 2
+        detail_ids = {center_id, "AV"} & vehicle_ids
+        for vehicle_id in vehicle_ids - detail_ids:
+            position = position_cache.get(vehicle_id)
+            if position is None:
+                try:
+                    position = traci.vehicle.getPosition3D(vehicle_id)
+                    position_cache[vehicle_id] = position
+                except Exception:
+                    continue
+            dx = position[0] - center_position[0]
+            dy = position[1] - center_position[1]
+            radius_sq = exit_radius_sq if vehicle_id in previous_ids else enter_radius_sq
+            if dx * dx + dy * dy <= radius_sq:
+                detail_ids.add(vehicle_id)
+        self.state_detail_active_vehicle_ids = detail_ids
+        return detail_ids
+
+    def _populate_vehicle_static_state(self, vehicle_id, vehicle_state):
+        cache = getattr(self, "vehicle_static_state_cache", None)
+        if cache is None:
+            cache = {}
+            self.vehicle_static_state_cache = cache
+        static_state = cache.get(vehicle_id)
+        if static_state is None:
+            static_state = (
+                traci.vehicle.getLength(vehicle_id),
+                traci.vehicle.getWidth(vehicle_id),
+                traci.vehicle.getHeight(vehicle_id),
+                traci.vehicle.getTypeID(vehicle_id),
+            )
+            cache[vehicle_id] = static_state
+        (
+            vehicle_state.length,
+            vehicle_state.width,
+            vehicle_state.height,
+            vehicle_state.type,
+        ) = static_state
+
     def _populate_lane_relative_position(self, vehicle_id, vehicle_state):
         if not self.lane_relative_position_enabled:
             return
@@ -1077,13 +1188,23 @@ class TeraSimCoSimPlugin(BasePlugin):
         """
         simulation_state = SimulationState()
         simulation_state.simulation_time = traci.simulation.getTime()
+        profile_ctx = getattr(simulator, "ctx", None)
 
         # Get all interested agent IDs
+        id_selection_start = time.perf_counter()
         vehicle_ids, vru_ids, construction_ids = self.get_vehicle_vru_ids()
         vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
             vehicle_ids
         )
         active_vehicle_ids = set(vehicle_ids)
+        detail_vehicle_ids = self._update_state_detail_active_vehicle_ids(
+            vehicle_ids, vehicle_position_cache
+        )
+        set_value(
+            profile_ctx,
+            "terasim_internal.state_export.detail_vehicle_count",
+            len(detail_vehicle_ids),
+        )
         for feedback_cache in (
             self.feedback_observed_speeds,
             self.feedback_source_carla_frames,
@@ -1096,8 +1217,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             "vru": len(vru_ids),
             "construction": len(construction_ids),
         }
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.id_selection_filter_s",
+            time.perf_counter() - id_selection_start,
+        )
 
-        # Add vehicle states
+        # Basic pose/shape state is exported for every CARLA actor. Ackermann-only
+        # state (lookahead, desired speed, feedback acknowledgement) is limited
+        # to the same AV-centred radius used for CARLA physics.
+        vehicle_collection_start = time.perf_counter()
         vehicles = {}
         for vid in vehicle_ids:
             vehicle_state = AgentStateSimplified()
@@ -1105,46 +1234,78 @@ class TeraSimCoSimPlugin(BasePlugin):
             if position is None:
                 position = traci.vehicle.getPosition3D(vid)
             vehicle_state.x, vehicle_state.y, vehicle_state.z = position
-            self._populate_lane_relative_position(vid, vehicle_state)
-            vehicle_state.lon,vehicle_state.lat = traci.simulation.convertGeo(vehicle_state.x, vehicle_state.y)
             vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
-            vehicle_state.orientation = np.radians((90 - vehicle_state.sumo_angle) % 360)
-            vehicle_state.speed = traci.vehicle.getSpeed(vid)
-            if vid == "AV" or self._is_ackermann_feedback_actor(vid):
-                try:
-                    vehicle_state.sumo_desired_speed = traci.vehicle.getSpeedWithoutTraCI(vid)
-                except Exception:
-                    vehicle_state.sumo_desired_speed = vehicle_state.speed
-                try:
-                    vehicle_state.sumo_emergency_decel = traci.vehicle.getEmergencyDecel(vid)
-                except Exception:
-                    vehicle_state.sumo_emergency_decel = None
-            vehicle_state.feedback_observed_speed = self.feedback_observed_speeds.get(vid)
-            vehicle_state.feedback_source_carla_frame = (
-                self.feedback_source_carla_frames.get(vid)
+            vehicle_state.orientation = np.radians(
+                (90 - vehicle_state.sumo_angle) % 360
             )
-            self._populate_vehicle_lookahead(vid, vehicle_state)
-            vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
-            vehicle_state.length = traci.vehicle.getLength(vid)
-            vehicle_state.width = traci.vehicle.getWidth(vid)
-            vehicle_state.height = traci.vehicle.getHeight(vid)
-            vehicle_state.type = traci.vehicle.getTypeID(vid)
-            vehicle_state.angular_velocity = 0.0  # rad/s
-            now_time = simulation_state.simulation_time
-            now_orientation = vehicle_state.orientation
-            last_orientation, last_time = self.last_orientations.get(vid, (now_orientation, now_time))
-            dt = now_time - last_time
-            if dt > 0:
-                dtheta = np.arctan2(np.sin(now_orientation - last_orientation), np.cos(now_orientation - last_orientation))
-                vehicle_state.angular_velocity = dtheta / dt
+            vehicle_state.speed = traci.vehicle.getSpeed(vid)
+            self._populate_vehicle_static_state(vid, vehicle_state)
+
+            if vid in detail_vehicle_ids:
+                detail_start = time.perf_counter()
+                self._populate_lane_relative_position(vid, vehicle_state)
+                vehicle_state.lon, vehicle_state.lat = traci.simulation.convertGeo(
+                    vehicle_state.x, vehicle_state.y
+                )
+                if vid == "AV" or self._is_ackermann_feedback_actor(vid):
+                    try:
+                        vehicle_state.sumo_desired_speed = (
+                            traci.vehicle.getSpeedWithoutTraCI(vid)
+                        )
+                    except Exception:
+                        vehicle_state.sumo_desired_speed = vehicle_state.speed
+                    try:
+                        vehicle_state.sumo_emergency_decel = (
+                            traci.vehicle.getEmergencyDecel(vid)
+                        )
+                    except Exception:
+                        vehicle_state.sumo_emergency_decel = None
+                vehicle_state.feedback_observed_speed = (
+                    self.feedback_observed_speeds.get(vid)
+                )
+                vehicle_state.feedback_source_carla_frame = (
+                    self.feedback_source_carla_frames.get(vid)
+                )
+                lookahead_start = time.perf_counter()
+                self._populate_vehicle_lookahead(vid, vehicle_state)
+                add_timing(
+                    profile_ctx,
+                    "terasim_internal.state_export.lookahead_lane_geometry_s",
+                    time.perf_counter() - lookahead_start,
+                )
+                vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
+                now_time = simulation_state.simulation_time
+                now_orientation = vehicle_state.orientation
+                last_orientation, last_time = self.last_orientations.get(
+                    vid, (now_orientation, now_time)
+                )
+                dt = now_time - last_time
+                if dt > 0:
+                    dtheta = np.arctan2(
+                        np.sin(now_orientation - last_orientation),
+                        np.cos(now_orientation - last_orientation),
+                    )
+                    vehicle_state.angular_velocity = dtheta / dt
+                self.last_orientations[vid] = (now_orientation, now_time)
+                add_timing(
+                    profile_ctx,
+                    "terasim_internal.state_export.ackermann_detail_s",
+                    time.perf_counter() - detail_start,
+                )
             else:
-                vehicle_state.angular_velocity = 0.0
-            self.last_orientations[vid] = (now_orientation, now_time)
+                self.last_orientations.pop(vid, None)
+
             vehicles[vid] = vehicle_state
 
         simulation_state.agent_details["vehicle"] = vehicles
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.vehicle_state_collection_s",
+            time.perf_counter() - vehicle_collection_start,
+        )
 
         # Add VRU states
+        vru_collection_start = time.perf_counter()
         # Get current vehicle and person lists to determine actual object type
         current_vehicle_list = traci.vehicle.getIDList()
         current_person_list = traci.person.getIDList()
@@ -1198,8 +1359,14 @@ class TeraSimCoSimPlugin(BasePlugin):
             vrus[vru_id] = vru_state
 
         simulation_state.agent_details["vru"] = vrus
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.vru_state_collection_s",
+            time.perf_counter() - vru_collection_start,
+        )
 
         # Add construction objects
+        construction_collection_start = time.perf_counter()
         construction_objects = {}
         for cid in construction_ids:
             construction_state = AgentStateSimplified()
@@ -1217,8 +1384,14 @@ class TeraSimCoSimPlugin(BasePlugin):
             construction_objects[cid] = construction_state
 
         simulation_state.construction_objects = construction_objects
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.construction_state_collection_s",
+            time.perf_counter() - construction_collection_start,
+        )
 
         # Add traffic light states
+        traffic_light_export_start = time.perf_counter()
         traffic_lights = {}
         for tl_id in traci.trafficlight.getIDList():
             sumo_signal = SUMOSignal()
@@ -1239,6 +1412,11 @@ class TeraSimCoSimPlugin(BasePlugin):
             traffic_lights[tl_id] = sumo_signal
 
         simulation_state.traffic_light_details = traffic_lights
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.traffic_light_state_export_s",
+            time.perf_counter() - traffic_light_export_start,
+        )
 
         # Add construction zone shapes
         if self.construction_zone_shapes is None and simulator.env.static_adversity is not None and simulator.env.static_adversity.adversities is not None:
@@ -1416,8 +1594,13 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 command.data.get("sumo_angle", 0),
                             )
                             if projection is None:
-                                return False
-                            feedback_move_source = "feedback_moveTo"
+                                if not self._should_continue_after_agent_command_failure():
+                                    return False
+                                # Keep SUMO longitudinal position for this step, but
+                                # still apply the observed CARLA speed below.
+                                feedback_move_source = "feedback_moveTo_skipped"
+                            else:
+                                feedback_move_source = "feedback_moveTo"
                         else:
                             # keepRoute=0 snaps externally-driven vehicles to a network
                             # lane. This is retained for non-feedback commands and the
@@ -1515,9 +1698,14 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         except Exception as e:
             if self.last_agent_command_failure is None:
+                failed_command = locals().get("command")
                 self.last_agent_command_failure = {
                     "reason": "agent_command_exception",
                     "exception_type": type(e).__name__,
+                    "actor_id": getattr(failed_command, "agent_id", ""),
+                    "ackermann_feedback": bool(
+                        getattr(failed_command, "data", {}).get("source_carla_frame")
+                    ),
                 }
             self.logger.error(f"Error handling agent command: {e}")
             return False
@@ -1576,6 +1764,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                     break
 
                 if not self._handle_agent_command(command_data):
+                    if self._should_continue_after_agent_command_failure():
+                        continue
                     if simulator is not None:
                         self._record_agent_command_failure(simulator)
                     return False

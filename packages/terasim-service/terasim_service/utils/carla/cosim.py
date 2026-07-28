@@ -1,5 +1,6 @@
 import time
 import json
+from contextlib import contextmanager
 import math
 import os
 import re
@@ -305,6 +306,37 @@ class CarlaCosim(object):
                 flush=True,
             )
 
+        self.physics_radius = max(
+            0.0, _env_float("CARLA_COSIM_PHYSICS_RADIUS", 0.0)
+        )
+        self.physics_radius_enabled = self.physics_radius > 0.0
+        self.physics_radius_center_id = (
+            os.environ.get("CARLA_COSIM_PHYSICS_RADIUS_CENTER_ID") or AV_SUMO_ID
+        )
+        self.physics_radius_hysteresis = max(
+            0.0, _env_float("CARLA_COSIM_PHYSICS_RADIUS_HYSTERESIS", 10.0)
+        )
+        self._physics_active_vehicle_ids = set()
+        if getattr(self, "physics_radius_enabled", False):
+            print(
+                "CARLA co-sim physics radius enabled: "
+                f"center={self.physics_radius_center_id} "
+                f"enterRadius={self.physics_radius:.1f}m "
+                f"exitRadius={self.physics_radius + self.physics_radius_hysteresis:.1f}m.",
+                flush=True,
+            )
+
+        self.profile_steps_enabled = _env_bool(
+            "CARLA_COSIM_PROFILE_STEPS", _env_bool("COSIM_PROFILE_STEPS", False)
+        )
+        self.profile_jsonl_path = os.environ.get("CARLA_COSIM_PROFILE_JSONL", "").strip()
+        self.profile_warmup_steps = max(
+            0, _env_int("CARLA_COSIM_PROFILE_WARMUP_STEPS", 0)
+        )
+        self._profile_step_count = 0
+        self._current_step_profile = None
+        self._pending_terasim_roundtrip = None
+
         self.vehicle_blueprints = create_vehicle_blueprint(self.world)
         self.motor_blueprints = create_motor_blueprint(self.world)
         self.pedestrian_blueprints = create_pedestrian_blueprint(self.world)
@@ -589,6 +621,84 @@ class CarlaCosim(object):
                 return status
             time.sleep(0.05)
 
+    def _start_step_profile(self):
+        self._profile_step_count += 1
+        if not self.profile_steps_enabled:
+            self._current_step_profile = None
+            return
+        self._current_step_profile = {
+            "step": self._profile_step_count,
+            "simulation_time": None,
+            "total_s": 0.0,
+            "terasim_roundtrip": {},
+            "carla_state_apply": {},
+            "carla_tick": {},
+            "feedback": {},
+            "counts": {},
+        }
+
+    def _profile_add(self, path, elapsed_s):
+        if getattr(self, "_current_step_profile", None) is None:
+            return
+        node = self._current_step_profile
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        leaf = parts[-1]
+        node[leaf] = float(node.get(leaf, 0.0)) + float(elapsed_s)
+
+    def _profile_set(self, path, value):
+        if getattr(self, "_current_step_profile", None) is None:
+            return
+        node = self._current_step_profile
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    @contextmanager
+    def _profile_timer(self, path):
+        if getattr(self, "_current_step_profile", None) is None:
+            yield
+            return
+        started_at = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._profile_add(path, time.perf_counter() - started_at)
+
+    def _complete_pending_terasim_roundtrip(self, completed_at):
+        pending = self._pending_terasim_roundtrip
+        if not isinstance(pending, dict):
+            return
+        self._profile_set(
+            "terasim_roundtrip.total_s",
+            max(0.0, completed_at - pending["started_at"]),
+        )
+        self._profile_set(
+            "terasim_roundtrip.tick_request_s", pending.get("tick_request_s", 0.0)
+        )
+        self._pending_terasim_roundtrip = None
+
+    def _finish_step_profile(self, total_s):
+        profile = self._current_step_profile
+        if profile is None:
+            return
+        profile["total_s"] = float(total_s)
+        if isinstance(self.terasim_states, dict):
+            profile["simulation_time"] = self.terasim_states.get("simulation_time")
+            agent_count = self.terasim_states.get("agent_count", {})
+            if isinstance(agent_count, dict):
+                profile["counts"]["exported_sumo_vehicles"] = agent_count.get("vehicle", 0)
+        profile["counts"]["physics_vehicles"] = len(self._physics_active_vehicle_ids)
+        if self._profile_step_count <= self.profile_warmup_steps or not self.profile_jsonl_path:
+            return
+        profile_dir = os.path.dirname(self.profile_jsonl_path)
+        if profile_dir:
+            os.makedirs(profile_dir, exist_ok=True)
+        with open(self.profile_jsonl_path, "a", encoding="utf-8") as profile_file:
+            profile_file.write(json.dumps(profile, separators=(",", ":")) + "\n")
+
     def _tick_ackermann_feedback_apply_http(self):
         status = self._wait_for_terasim_step()
         if status is None or status in {"finished", "error"}:
@@ -613,27 +723,50 @@ class CarlaCosim(object):
         from .direct_link import parse_state_json
 
         if self._direct_tick_future is not None:
+            wait_started_at = time.perf_counter()
             try:
                 response = self._direct_tick_future.result(timeout=300.0)
             except _grpc.RpcError as exc:
                 print(f"TeraSim direct tick failed: {exc}. Exiting...")
                 self._apply_ackermann_fail_closed_brake("direct_tick_rpc_error")
                 return False
+            completion_observed_at = time.perf_counter()
+            self._profile_set(
+                "terasim_roundtrip.completion_wait_s",
+                completion_observed_at - wait_started_at,
+            )
+            self._complete_pending_terasim_roundtrip(completion_observed_at)
             if response.status in ("finished", "error"):
                 print(f"TeraSim ended (status={response.status}). Exiting...")
                 self._apply_ackermann_fail_closed_brake(f"direct_status:{response.status}")
                 return False
-            state = parse_state_json(response.state_json)
+            with self._profile_timer("terasim_roundtrip.state_decode_s"):
+                state = parse_state_json(response.state_json)
             if state is not None:
                 self._direct_prev_state = state
 
+        state_apply_started_at = time.perf_counter()
         if self._direct_prev_state is not None:
             self.sync_cosim_actor_to_carla(self._direct_prev_state)
             if not getattr(self.args, "skip_tls", False):
-                self.sync_cosim_tls_to_carla(self._direct_prev_state)
+                with self._profile_timer("carla_state_apply.tls_sync_s"):
+                    self.sync_cosim_tls_to_carla(self._direct_prev_state)
+        self._profile_set(
+            "carla_state_apply.total_s", time.perf_counter() - state_apply_started_at
+        )
 
-        self.world.tick()
-        commands, feedback_records = self._collect_ackermann_feedback()
+        carla_tick_started_at = time.perf_counter()
+        with self._profile_timer("carla_tick.world_tick_s"):
+            self.world.tick()
+        if getattr(self, "_current_step_profile", None) is not None:
+            with self._profile_timer("carla_tick.snapshot_actor_refresh_s"):
+                snapshot = self.world.get_snapshot()
+                self._profile_set("counts.carla_frame", snapshot.frame)
+        self._profile_set("carla_tick.total_s", time.perf_counter() - carla_tick_started_at)
+
+        with self._profile_timer("feedback.command_conversion_s"):
+            commands, feedback_records = self._collect_ackermann_feedback()
+        request_started_at = time.perf_counter()
         try:
             self._direct_tick_future = self.direct_link.tick_async(commands)
         except Exception as exc:
@@ -643,14 +776,30 @@ class CarlaCosim(object):
                 reason=f"feedback_transport_error:{type(exc).__name__}",
             )
             return False
-        self._finalize_ackermann_feedback_records(
-            feedback_records,
-            accepted=True,
-            reason="accepted_by_grpc_tick",
-        )
+        tick_request_s = time.perf_counter() - request_started_at
+        self._pending_terasim_roundtrip = {
+            "started_at": request_started_at,
+            "tick_request_s": tick_request_s,
+        }
+        self._profile_set("feedback.command_count", len(commands))
+        with self._profile_timer("feedback.bookkeeping_s"):
+            self._finalize_ackermann_feedback_records(
+                feedback_records,
+                accepted=True,
+                reason="accepted_by_grpc_tick",
+            )
         return True
 
     def tick(self):
+        self._start_step_profile()
+        step_started_at = time.perf_counter()
+        try:
+            return self._tick_unprofiled()
+        finally:
+            self._finish_step_profile(time.perf_counter() - step_started_at)
+            self._current_step_profile = None
+
+    def _tick_unprofiled(self):
         if self.direct_link is not None:
             return self._tick_direct()
         if self.ackermann_feedback_apply_enabled:
@@ -1184,19 +1333,33 @@ class CarlaCosim(object):
 
         cosim_id_record = set()
         current_frame = self.world.get_snapshot().frame
+        actor_index_started_at = time.perf_counter()
         vehicle_actor_index, pedestrian_actor_index = self._build_actor_role_indexes()
+        self._profile_add(
+            "carla_state_apply.actor_index_role_lookup_s",
+            time.perf_counter() - actor_index_started_at,
+        )
+        self._profile_set("counts.carla_vehicle_actors", len(vehicle_actor_index))
+        state_filter_started_at = time.perf_counter()
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
         vehicles, vrus = self._filter_actor_details_by_radius(vehicles, vrus)
+        self._update_physics_active_vehicle_ids(vehicles)
+        self._profile_add(
+            "carla_state_apply.state_filter_physics_selection_s",
+            time.perf_counter() - state_filter_started_at,
+        )
         feedback_candidate_actor_ids = {
             veh_id
             for veh_id in vehicles
             if self._is_ackermann_feedback_selected_actor(veh_id)
+            and self._uses_ackermann_physics(veh_id)
         }
         transform_batch = []
         ackermann_batch = []
         spawn_requests = []
 
+        command_conversion_started_at = time.perf_counter()
         for veh_id, veh_info in vehicles.items():
             if self.control_av and veh_id == AV_SUMO_ID:
                 if not self.initialize_av:
@@ -1240,11 +1403,19 @@ class CarlaCosim(object):
                 spawn_requests=spawn_requests,
             )
 
-        self._flush_actor_spawn_batch(spawn_requests, transform_batch)
-        self._flush_actor_transform_batch(transform_batch)
-        self._flush_actor_ackermann_batch(ackermann_batch)
-        self._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
-        self._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
+        self._profile_add(
+            "carla_state_apply.command_conversion_s",
+            time.perf_counter() - command_conversion_started_at,
+        )
+        with self._profile_timer("carla_state_apply.actor_spawn_s"):
+            self._flush_actor_spawn_batch(spawn_requests, transform_batch)
+        with self._profile_timer("carla_state_apply.transform_batch_s"):
+            self._flush_actor_transform_batch(transform_batch)
+        with self._profile_timer("carla_state_apply.ackermann_batch_apply_s"):
+            self._flush_actor_ackermann_batch(ackermann_batch)
+        with self._profile_timer("carla_state_apply.actor_cleanup_s"):
+            self._cleanup_actors("vehicle", "vehicle.*", cosim_id_record)
+            self._cleanup_actors("pedestrian", "walker.pedestrian.*", cosim_id_record)
         self._ackermann_feedback_candidate_actor_ids = feedback_candidate_actor_ids
         self._ackermann_feedback_actor_index = {
             actor_id: vehicle_actor_index[actor_id]
@@ -1513,9 +1684,40 @@ class CarlaCosim(object):
             self._is_ackermann_feedback_selected_actor(veh_id)
         )
 
+    def _update_physics_active_vehicle_ids(self, vehicles):
+        if not self.physics_radius_enabled:
+            return
+        center_info = vehicles.get(self.physics_radius_center_id)
+        center_xy = self._actor_xy(center_info) if center_info is not None else None
+        if center_xy is None:
+            self._physics_active_vehicle_ids = {AV_SUMO_ID}
+            return
+
+        previous_active_ids = self._physics_active_vehicle_ids
+        enter_radius_sq = self.physics_radius**2
+        exit_radius_sq = (self.physics_radius + self.physics_radius_hysteresis) ** 2
+        active_ids = {AV_SUMO_ID, self.physics_radius_center_id}
+        center_x, center_y = center_xy
+        for vehicle_id, vehicle_info in vehicles.items():
+            if vehicle_id in active_ids:
+                continue
+            vehicle_xy = self._actor_xy(vehicle_info)
+            if vehicle_xy is None:
+                continue
+            dx = vehicle_xy[0] - center_x
+            dy = vehicle_xy[1] - center_y
+            radius_sq = (
+                exit_radius_sq if vehicle_id in previous_active_ids else enter_radius_sq
+            )
+            if dx * dx + dy * dy <= radius_sq:
+                active_ids.add(vehicle_id)
+        self._physics_active_vehicle_ids = active_ids
+
     def _uses_ackermann_physics(self, veh_id):
         if not self.ackermann_physics_enabled:
             return False
+        if getattr(self, "physics_radius_enabled", False):
+            return veh_id in self._physics_active_vehicle_ids
         if self.ackermann_feedback_apply_enabled:
             return self._is_ackermann_feedback_apply_actor(veh_id)
         return True

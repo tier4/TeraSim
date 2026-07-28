@@ -297,6 +297,43 @@ def test_actor_radius_filter_uses_exit_hysteresis():
     assert set(filtered) == {"AV", "BV"}
 
 
+
+def test_state_detail_radius_uses_physics_hysteresis():
+    from terasim_service.plugins.cosim import TeraSimCoSimPlugin
+
+    plugin = TeraSimCoSimPlugin.__new__(TeraSimCoSimPlugin)
+    plugin.state_detail_filter_enabled = True
+    plugin.state_detail_radius = 100.0
+    plugin.state_detail_hysteresis = 10.0
+    plugin.state_filter_center_id = "AV"
+    plugin.state_detail_active_vehicle_ids = set()
+
+    def selected_at(distance):
+        positions = {
+            "AV": (0.0, 0.0, 0.0),
+            "BV": (distance, 0.0, 0.0),
+        }
+        return plugin._update_state_detail_active_vehicle_ids(positions, positions.copy())
+
+    assert selected_at(99.0) == {"AV", "BV"}
+    assert selected_at(105.0) == {"AV", "BV"}
+    assert selected_at(111.0) == {"AV"}
+    assert selected_at(105.0) == {"AV"}
+    assert selected_at(99.0) == {"AV", "BV"}
+
+
+def test_state_detail_filter_disabled_preserves_full_state_contract():
+    from terasim_service.plugins.cosim import TeraSimCoSimPlugin
+
+    plugin = TeraSimCoSimPlugin.__new__(TeraSimCoSimPlugin)
+    plugin.state_detail_filter_enabled = False
+    plugin.state_detail_active_vehicle_ids = {"stale"}
+
+    selected = plugin._update_state_detail_active_vehicle_ids({"AV", "BV"}, {})
+
+    assert selected == {"AV", "BV"}
+    assert plugin.state_detail_active_vehicle_ids == {"AV", "BV"}
+
 def test_feedback_batches_valid_actors_and_isolates_invalid_shape(monkeypatch):
     install_fake_carla()
     from terasim_service.utils.carla import cosim as cosim_module

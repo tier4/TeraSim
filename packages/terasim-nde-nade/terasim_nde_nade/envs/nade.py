@@ -1,10 +1,12 @@
 from addict import Dict
 import json
+import time
 from loguru import logger
 import numpy as np
 import os
 
 from terasim.overlay import profile, traci
+from terasim.profiling import add_timing, timed as profile_timed
 from terasim.params import AgentType
 import terasim.utils as utils
 
@@ -96,13 +98,27 @@ class NADE(BaseEnv):
             bool: Flag to indicate if the simulation should continue.
         """  
 
-        _, env_command_information = super().make_decisions(ctx)
-        env_observation = self.get_env_observation(ctx) # get the observation of the environment
-        (
-            env_command_information,
-            env_observation,
-            should_continue_simulation_flag,
-        ) = self.executeMove(ctx, env_command_information, env_observation) # move the simulation half step forward and update useful information
+        nde_background_start = time.perf_counter()
+        with profile_timed(
+            ctx,
+            "terasim_internal.behavior_generation.nde_background_update.background_policy_route_lane_change_s",
+        ):
+            _, env_command_information = super().make_decisions(ctx)
+            env_observation = self.get_env_observation(ctx) # get the observation of the environment
+        with profile_timed(
+            ctx,
+            "terasim_internal.behavior_generation.nde_background_update.execute_move_sumo_move_preparation_s",
+        ):
+            (
+                env_command_information,
+                env_observation,
+                should_continue_simulation_flag,
+            ) = self.executeMove(ctx, env_command_information, env_observation) # move the simulation half step forward and update useful information
+        add_timing(
+            ctx,
+            "terasim_internal.behavior_generation.nde_background_update_s",
+            time.perf_counter() - nde_background_start,
+        )
         return env_command_information, env_observation, should_continue_simulation_flag
     
     def respond_to_emergency_vehicle(self):
@@ -200,15 +216,29 @@ class NADE(BaseEnv):
         Returns:
             bool: Flag to indicate if the simulation should continue.
         """
+        behavior_generation_start = time.perf_counter()
         # Preparation
-        self.preparation()
+        with profile_timed(
+            ctx,
+            "terasim_internal.behavior_generation.av_handling_subscriptions_context_s",
+        ):
+            self.preparation()
 
         # NADE Step 1. Make NDE decisions for all vehicles and vrus
         env_command_information, env_observation, should_continue_simulation_flag = self.NDE_decision(ctx)
         
         # NADE Step 2. Make NADE decision, includes the modification of NDD distribution according to avoidability, and excute the control commands
-        self.NADE_decision_and_control(env_command_information, env_observation)
+        with profile_timed(
+            ctx,
+            "terasim_internal.behavior_generation.nade_decision_control_s",
+        ):
+            self.NADE_decision_and_control(env_command_information, env_observation)
         self.try_insert_emergency_vehicle()
+        add_timing(
+            ctx,
+            "terasim_internal.behavior_generation_s",
+            time.perf_counter() - behavior_generation_start,
+        )
         # self.respond_to_emergency_vehicle()
         return should_continue_simulation_flag
 

@@ -6,6 +6,7 @@ from loguru import logger
 from terasim.agent.agent import AgentDepartureInfo, AgentInitialInfo
 from terasim.overlay import traci
 from terasim.simulator import Simulator
+from terasim.profiling import timed as profile_timed
 import terasim.utils as utils
 from terasim.vehicle.vehicle import VehicleList
 
@@ -188,13 +189,16 @@ class BaseEnv(ABC):
             bool: True if the simulation should continue.
         """
         # First synchronize the vehicle list
-        self._maintain_all_vehicles(ctx)
+        with profile_timed(ctx, "terasim_internal.av_handling_subscriptions_context_s"):
+            self._maintain_all_vehicles(ctx)
 
         # Then call custom env defined step
-        step_result = self.on_step(ctx)
+        with profile_timed(ctx, "terasim_internal.behavior_generation_s"):
+            step_result = self.on_step(ctx)
         
         # Call info extractor snapshot
-        self.info_extractor.get_snapshot_info({"step_result": step_result})
+        with profile_timed(ctx, "terasim_internal.post_step_bookkeeping_s"):
+            self.info_extractor.get_snapshot_info({"step_result": step_result})
 
         # If custom env requested to stop, log some of the information
         if isinstance(step_result, bool):

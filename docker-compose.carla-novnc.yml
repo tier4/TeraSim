@@ -21,8 +21,9 @@ services:
       - RESY=${RESY:-900}
       - CARLA_RPC_PORT=2000
       - CARLA_RENDER_OFFSCREEN=${CARLA_RENDER_OFFSCREEN:-0}
+      - CARLA_NULL_RHI=${CARLA_NULL_RHI:-0}
     volumes:
-      - ./examples/maps/odaiba_ll2:/home/carla/workspace
+      - ${CARLA_MAPS_HOST_DIR:-./examples/maps/odaiba_ll2}:/home/carla/workspace
       - ./scripts/start_carla_novnc.sh:/start_carla_novnc.sh:ro
       - /usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nvidia_icd.json:ro
       - /usr/share/vulkan/implicit_layer.d/nvidia_layers.json:/usr/share/vulkan/implicit_layer.d/nvidia_layers.json:ro

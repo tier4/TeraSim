@@ -7,6 +7,7 @@ RESX="${RESX:-1600}"
 RESY="${RESY:-900}"
 CARLA_RPC_PORT="${CARLA_RPC_PORT:-2000}"
 CARLA_RENDER_OFFSCREEN="${CARLA_RENDER_OFFSCREEN:-0}"
+CARLA_NULL_RHI="${CARLA_NULL_RHI:-0}"
 
 is_enabled() {
     case "${1,,}" in
@@ -45,12 +46,17 @@ cleanup_stale_x_lock() {
     fi
 }
 
-cleanup_stale_x_lock
+if is_enabled "${CARLA_NULL_RHI}"; then
+    echo "CARLA NullRHI enabled; X11 and noVNC are not started."
+else
+    cleanup_stale_x_lock
+    Xvfb "${DISPLAY}" -screen 0 "${RESOLUTION}" -ac +extension GLX +render -noreset &
+    sleep 0.5
+fi
 
-Xvfb "${DISPLAY}" -screen 0 "${RESOLUTION}" -ac +extension GLX +render -noreset &
-sleep 0.5
-
-if is_enabled "${CARLA_RENDER_OFFSCREEN}"; then
+if is_enabled "${CARLA_NULL_RHI}"; then
+    :
+elif is_enabled "${CARLA_RENDER_OFFSCREEN}"; then
     echo "CARLA offscreen rendering enabled; Xvfb is running but no noVNC display will be started."
 else
     openbox >/tmp/openbox.log 2>&1 &
@@ -88,7 +94,9 @@ CARLA_ARGS=(
     -nosound
     -carla-rpc-port="${CARLA_RPC_PORT}"
 )
-if is_enabled "${CARLA_RENDER_OFFSCREEN}"; then
+if is_enabled "${CARLA_NULL_RHI}"; then
+    CARLA_ARGS+=(-nullrhi)
+elif is_enabled "${CARLA_RENDER_OFFSCREEN}"; then
     CARLA_ARGS+=(-RenderOffScreen)
 else
     CARLA_ARGS+=(

@@ -8,6 +8,7 @@ from loguru import logger
 import numpy as np
 
 from terasim.overlay import traci, profile
+from terasim.profiling import timed as profile_timed
 import terasim.utils as utils
 from terasim.params import AgentType
 
@@ -526,7 +527,11 @@ class NADEWithAV(NADE):
         """Refresh AV-neighborhood control IDs before BaseEnv maintains agents."""
         if ctx is None:
             ctx = {}
-        self._update_controlled_vehicle_context(ctx)
+        with profile_timed(
+            ctx,
+            "terasim_internal.behavior_generation.av_handling_subscriptions_context_s",
+        ):
+            self._update_controlled_vehicle_context(ctx)
         return super()._step(simulator, ctx)
 
     def _get_static_adversarial_object_ids(self):
