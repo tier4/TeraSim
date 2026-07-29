@@ -102,6 +102,12 @@ start_carla() {
 for rhi in "${RHI_MODES[@]}"; do
     for radius in "${RADII[@]}"; do
         for repeat in $(seq 1 "${PERF_REPEATS}"); do
+            effective_radius="${radius}"
+            if [[ "${radius}" == "0" ]]; then
+                # A core radius of exactly zero disables radius filtering. Use a
+                # positive epsilon so the benchmark's 0m condition means AV-only.
+                effective_radius="0.000001"
+            fi
             condition="rhi-${rhi}_radius-${radius}m_repeat-${repeat}"
             condition_dir="${PERF_OUTPUT_ROOT}/${condition}"
             mkdir -p "${condition_dir}"
@@ -126,9 +132,9 @@ PY
             export CARLA_COSIM_ACKERMANN_FEEDBACK_MODE=apply CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS="*,AV" CARLA_COSIM_ACKERMANN_FEEDBACK_POSITION_MODE=moveTo
             export CARLA_COSIM_BATCH_TRANSFORM=1 CARLA_COSIM_BATCH_SPAWN=1
             export CARLA_COSIM_ACTOR_FILTER=1 CARLA_COSIM_ACTOR_FILTER_CENTER_ID=AV CARLA_COSIM_ACTOR_FILTER_RADIUS=300 CARLA_COSIM_ACTOR_FILTER_HYSTERESIS=20
-            export CARLA_COSIM_PHYSICS_RADIUS="${radius}" CARLA_COSIM_PHYSICS_RADIUS_CENTER_ID=AV CARLA_COSIM_PHYSICS_RADIUS_HYSTERESIS=10
+            export CARLA_COSIM_PHYSICS_RADIUS="${effective_radius}" CARLA_COSIM_PHYSICS_RADIUS_CENTER_ID=AV CARLA_COSIM_PHYSICS_RADIUS_HYSTERESIS=10
             export TERASIM_COSIM_STATE_FILTER=1 TERASIM_COSIM_STATE_FILTER_CENTER_ID=AV TERASIM_COSIM_STATE_FILTER_RADIUS=320 TERASIM_COSIM_STATE_MAX_VEHICLES=0
-            export TERASIM_COSIM_STATE_DETAIL_RADIUS="${radius}" TERASIM_COSIM_STATE_DETAIL_HYSTERESIS=10 TERASIM_COSIM_CONTINUE_ON_ACKERMANN_FEEDBACK_FAILURE=1
+            export TERASIM_COSIM_STATE_DETAIL_RADIUS="${effective_radius}" TERASIM_COSIM_STATE_DETAIL_HYSTERESIS=10 TERASIM_COSIM_CONTINUE_ON_ACKERMANN_FEEDBACK_FAILURE=1
             export CARLA_COSIM_PROFILE_STEPS=1 CARLA_COSIM_PROFILE_WARMUP_STEPS="${PERF_WARMUP_STEPS}"
             export CARLA_COSIM_PROFILE_JSONL="${CONTAINER_OUTPUT_ROOT}/${condition}/carla_profile.jsonl"
             export TERASIM_COSIM_PROFILE_STEPS=1 TERASIM_COSIM_PROFILE_JSONL="${CONTAINER_OUTPUT_ROOT}/${condition}/terasim_profile.jsonl"
