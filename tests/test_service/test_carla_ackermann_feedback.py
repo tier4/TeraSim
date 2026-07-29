@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 import types
 
@@ -131,17 +132,64 @@ def test_batched_lane_lookahead_matches_scalar_results():
         assert actual_point == pytest.approx(expected_point)
 
 
+def test_vehicle_lookahead_projects_from_continuous_carla_feedback_position(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+    from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
+
+    constants = types.SimpleNamespace(VAR_SPEED_LAT=1, VAR_LANEPOSITION_LAT=2)
+    monkeypatch.setattr(
+        plugin_module, "traci", types.SimpleNamespace(constants=constants)
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_observed_positions = {"AV": (3.0, 0.0)}
+    plugin.lookahead_straight_min_distance = 7.0
+    plugin.lookahead_max_distance = 15.0
+    plugin.lookahead_curve_min_distance = 3.5
+    plugin.lookahead_curve_start_radians = math.radians(5.0)
+    plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
+    plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
+        compile_lane_shapes([[(0.0, 0.0), (100.0, 0.0)]])
+    )
+    state = AgentStateSimplified(x=80.0, y=0.0, speed=0.0, sumo_angle=90.0)
+
+    plugin._populate_vehicle_lookaheads(
+        [(
+            "AV",
+            state,
+            {constants.VAR_SPEED_LAT: 0.0, constants.VAR_LANEPOSITION_LAT: 0.0},
+        )]
+    )
+
+    assert state.lookahead_origin_x == pytest.approx(3.0)
+    assert state.lookahead_origin_y == pytest.approx(0.0)
+    assert state.lookahead_x == pytest.approx(10.0)
+    assert state.lookahead_y == pytest.approx(0.0)
+
+
 def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
     from terasim_service.plugins import cosim as plugin_module
 
-    constants = types.SimpleNamespace(VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3)
+    constants = types.SimpleNamespace(
+        VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3, VAR_EDGES=4
+    )
     lane_shapes = {
         "edge_0_0": [(0.0, 0.0), (10.0, 0.0)],
         ":junction_0_0": [(10.0, 0.0), (12.0, 0.0)],
         "edge_1_0": [(12.0, 0.0), (30.0, 0.0)],
+        ":junction_1_0": [(10.0, 0.0), (12.0, 4.0)],
+        "edge_2_0": [(12.0, 4.0), (30.0, 4.0)],
     }
     shape_calls = []
     next_link_calls = []
+    next_link_results = iter(
+        [
+            [("edge_1_0", ":junction_0_0", True, True, False, "G", "s", 2.0)],
+            [("edge_2_0", ":junction_1_0", True, True, False, "G", "l", 2.0)],
+        ]
+    )
     fake_lane = types.SimpleNamespace(
         getShape=lambda lane_id: shape_calls.append(lane_id) or lane_shapes[lane_id]
     )
@@ -149,9 +197,8 @@ def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
         getLaneID=lambda _vehicle_id: (_ for _ in ()).throw(
             AssertionError("context lane ID must be reused")
         ),
-        getNextLinks=lambda vehicle_id: next_link_calls.append(vehicle_id) or [
-            ("edge_1_0", ":junction_0_0", True, True, False, "G", "s", 2.0)
-        ],
+        getNextLinks=lambda vehicle_id: next_link_calls.append(vehicle_id)
+        or next(next_link_results),
     )
     monkeypatch.setattr(
         plugin_module,
@@ -164,12 +211,12 @@ def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
     )
 
     plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
-    plugin.lookahead_path_cache = {}
     plugin.lookahead_lane_shape_cache = {}
     plugin.lookahead_geometry_cache = {}
     context_values = {
         constants.VAR_LANE_ID: "edge_0_0",
         constants.VAR_ROUTE_ID: "route_a",
+        constants.VAR_EDGES: ("edge_0", "edge_1"),
     }
 
     first = plugin._get_vehicle_lookahead_compiled_path(
@@ -178,16 +225,77 @@ def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
     second = plugin._get_vehicle_lookahead_compiled_path(
         "AV", context_values=context_values
     )
-    context_values[constants.VAR_ROUTE_ID] = "route_b"
+    context_values[constants.VAR_EDGES] = ("edge_0", "edge_2")
     after_reroute = plugin._get_vehicle_lookahead_compiled_path(
         "AV", context_values=context_values
     )
 
     assert first is second
-    assert first is after_reroute
+    assert first is not after_reroute
     assert next_link_calls == ["AV", "AV"]
-    assert shape_calls == ["edge_0_0", ":junction_0_0", "edge_1_0"]
-    assert len(plugin.lookahead_geometry_cache) == 1
+    assert shape_calls == [
+        "edge_0_0",
+        ":junction_0_0",
+        "edge_1_0",
+        ":junction_1_0",
+        "edge_2_0",
+    ]
+    assert len(plugin.lookahead_geometry_cache) == 2
+
+
+def test_lookahead_route_without_route_signature_is_not_cached(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = types.SimpleNamespace(
+        VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3, VAR_EDGES=4
+    )
+    next_link_calls = []
+    fake_vehicle = types.SimpleNamespace(
+        getNextLinks=lambda vehicle_id: next_link_calls.append(vehicle_id) or []
+    )
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda _lane_id: [(0.0, 0.0), (10.0, 0.0)]
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants, lane=fake_lane, vehicle=fake_vehicle
+        ),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.lookahead_lane_shape_cache = {}
+    plugin.lookahead_geometry_cache = {}
+    context_values = {
+        constants.VAR_LANE_ID: "edge_0_0",
+        constants.VAR_ROUTE_ID: "route_a",
+    }
+
+    plugin._get_vehicle_lookahead_compiled_path("AV", context_values=context_values)
+    plugin._get_vehicle_lookahead_compiled_path("AV", context_values=context_values)
+
+    assert next_link_calls == ["AV", "AV"]
+
+
+def test_lookahead_missing_lane_does_not_reuse_stale_path(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = types.SimpleNamespace(
+        VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3, VAR_EDGES=4
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(constants=constants),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+
+    compiled = plugin._get_vehicle_lookahead_compiled_path(
+        "AV", context_values={constants.VAR_LANE_ID: ""}
+    )
+
+    assert compiled is None
 
 
 def test_route_aware_projection_switches_lane_after_centerline_midpoint():
@@ -245,6 +353,82 @@ def test_route_aware_projection_rejects_opposing_or_distant_lanes():
         select_route_aware_lane_projection((20.0, 10.0), 270.0, candidates, max_distance=8.0)
         is None
     )
+
+
+def test_curve_adaptive_lookahead_shortens_before_sharp_turn():
+    from terasim_service.utils.sumo_lane_geometry import (
+        adapt_lookahead_distances_for_compiled_paths,
+        compile_lane_shapes,
+    )
+
+    straight = compile_lane_shapes([[(0.0, 0.0), (30.0, 0.0)]])
+    right_turn = compile_lane_shapes(
+        [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 20.0)]]
+    )
+    distances, heading_changes = adapt_lookahead_distances_for_compiled_paths(
+        [straight, right_turn],
+        [(2.0, 0.0), (2.0, 0.0)],
+        [15.0, 15.0],
+        min_curve_distance=3.5,
+    )
+
+    assert distances[0] == pytest.approx(15.0)
+    assert heading_changes[0] == pytest.approx(0.0)
+    assert distances[1] == pytest.approx(3.5)
+    assert heading_changes[1] == pytest.approx(0.5 * 3.141592653589793)
+
+
+def test_lane_change_lookahead_blends_continuously_with_sumo_heading():
+    from terasim_service.utils.sumo_lane_geometry import (
+        blend_lane_change_lookahead,
+    )
+
+    route_target = (10.0, 3.5, 0.0)
+    inactive, inactive_blend = blend_lane_change_lookahead(
+        route_target, (0.0, 0.0), 90.0, 10.0
+    )
+    active, active_blend = blend_lane_change_lookahead(
+        route_target,
+        (0.0, 0.0),
+        84.0,
+        10.0,
+        lateral_speed=0.35,
+        lateral_offset=0.75,
+    )
+
+    assert inactive == pytest.approx(route_target)
+    assert inactive_blend == pytest.approx(0.0)
+    assert active_blend == pytest.approx(1.0)
+    assert active[0] == pytest.approx(10.0 * math.cos(math.radians(6.0)))
+    assert active[1] == pytest.approx(10.0 * math.sin(math.radians(6.0)))
+
+
+def test_pure_pursuit_uses_rear_axle_control_point_and_vehicle_wheelbase():
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannTuning,
+        compute_ackermann_control_values,
+    )
+
+    values = compute_ackermann_control_values(
+        current_x=10.0,
+        current_y=5.0,
+        yaw_degrees=0.0,
+        current_speed=2.0,
+        desired_x=12.0,
+        desired_y=5.0,
+        lookahead_x=15.0,
+        lookahead_y=8.0,
+        desired_speed=3.0,
+        tuning=AckermannTuning(max_steer_rate_rad_s=0.0),
+        control_point_local_x=-1.4,
+        wheel_base=2.9,
+    )
+
+    assert values.control_point_x == pytest.approx(8.6)
+    assert values.control_point_y == pytest.approx(5.0)
+    assert values.wheel_base == pytest.approx(2.9)
+    assert values.lookahead_local_x == pytest.approx(6.4)
+    assert values.lookahead_local_y == pytest.approx(3.0)
 
 
 def test_pure_pursuit_steers_and_rate_limits():
@@ -324,6 +508,38 @@ def test_ackermann_controller_settings_are_applied_once(capsys):
     assert settings_applied[0].accel_kd == pytest.approx(0.005)
     assert cosim._ackermann_actor_state["AV"]["controller_settings_applied"] is True
     assert "CARLA Ackermann controller settings applied" in capsys.readouterr().out
+
+
+def test_ackermann_geometry_uses_carla_wheel_positions():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannControllerTuning,
+        AckermannTuning,
+    )
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    wheels = [
+        types.SimpleNamespace(position=FakeLocation(x=145.0)),
+        types.SimpleNamespace(position=FakeLocation(x=145.0)),
+        types.SimpleNamespace(position=FakeLocation(x=-135.0)),
+        types.SimpleNamespace(position=FakeLocation(x=-135.0)),
+    ]
+    actor = types.SimpleNamespace(
+        set_simulate_physics=lambda _enabled: None,
+        get_physics_control=lambda: types.SimpleNamespace(wheels=wheels),
+        apply_ackermann_controller_settings=lambda _settings: None,
+    )
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._ackermann_actor_state = {}
+    cosim.ackermann_tuning = AckermannTuning(wheel_base=2.8)
+    cosim.ackermann_controller_tuning = AckermannControllerTuning()
+
+    cosim._ensure_ackermann_actor_physics(actor, "AV")
+
+    state = cosim._ackermann_actor_state["AV"]
+    assert state["geometry_from_physics"] is True
+    assert state["rear_axle_local_x_m"] == pytest.approx(-1.35)
+    assert state["wheel_base_m"] == pytest.approx(2.8)
 
 
 def test_ackermann_physics_initializes_velocity_from_sumo_state():
@@ -431,6 +647,7 @@ def _state_subscription_constants():
         VAR_POSITION3D=3,
         VAR_ANGLE=4,
         VAR_SPEED=5,
+        VAR_SPEED_LAT=14,
         VAR_ACCELERATION=6,
         CMD_GET_VEHICLE_VARIABLE=7,
         VAR_LANE_ID=8,
@@ -438,6 +655,7 @@ def _state_subscription_constants():
         VAR_LANEPOSITION_LAT=10,
         VAR_NEXT_LINKS=11,
         VAR_ROUTE_ID=12,
+        VAR_EDGES=13,
     )
 
 
@@ -509,11 +727,13 @@ def test_state_filter_uses_context_subscription_without_per_vehicle_position_que
                 constants.VAR_POSITION3D,
                 constants.VAR_ANGLE,
                 constants.VAR_SPEED,
+                constants.VAR_SPEED_LAT,
                 constants.VAR_ACCELERATION,
                 constants.VAR_LANE_ID,
                 constants.VAR_LANEPOSITION,
                 constants.VAR_LANEPOSITION_LAT,
                 constants.VAR_ROUTE_ID,
+                constants.VAR_EDGES,
             ],
         )
     ]
@@ -958,6 +1178,13 @@ def test_feedback_move_to_is_immediate_and_preserves_current_sumo_lane(monkeypat
     assert not any(call[0] == "move_xy" for call in calls)
     assert plugin.feedback_lane_states["BV"]["lane_id"] == "edge_0_0"
 
+    calls.clear()
+    plugin.controlled_agents_each_step.clear()
+    plugin.feedback_lane_change_active_actor_ids = {"BV"}
+    assert plugin._handle_agent_command(b"{}") is True
+    assert calls == [("speed", ("BV", 3.5))]
+    plugin.feedback_lane_change_active_actor_ids.clear()
+
     # Even when CARLA is closer to the adjacent lane, moveTo must not switch
     # lanes on CARLA position. An invalid current-lane projection is rejected.
     calls.clear()
@@ -977,6 +1204,66 @@ def test_feedback_move_to_is_immediate_and_preserves_current_sumo_lane(monkeypat
     assert calls[0][0] == "move"
     assert calls[0][1][0:2] == ("BV", "edge_0_0")
     assert calls[0][1][2] == pytest.approx(25.0)
+
+
+def test_feedback_move_to_uses_only_current_lane_and_profiles_calls(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    calls = []
+
+    def unexpected(*_args):
+        raise AssertionError("route and adjacent-lane TraCI calls are unnecessary")
+
+    fake_vehicle = types.SimpleNamespace(
+        getLaneID=lambda actor_id: calls.append(("get_lane", actor_id)) or "edge_0_0",
+        moveTo=lambda *args: calls.append(("move", args)),
+        getRoadID=unexpected,
+        getRoute=unexpected,
+        getRouteIndex=unexpected,
+        getNextLinks=unexpected,
+    )
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda lane_id: calls.append(("shape", lane_id))
+        or [(0.0, 0.0), (100.0, 0.0)],
+        getLength=lambda lane_id: calls.append(("length", lane_id)) or 100.0,
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            vehicle=fake_vehicle,
+            lane=fake_lane,
+            edge=types.SimpleNamespace(getLaneNumber=unexpected),
+        ),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_lane_geometry_cache = {}
+    plugin.ackermann_feedback_move_to_max_distance = 8.0
+    plugin.ackermann_feedback_background_move_to_max_distance = None
+    plugin.ackermann_feedback_move_to_lane_hysteresis = 0.35
+    plugin.logger = types.SimpleNamespace(
+        debug=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+    profile_ctx = {"cosim_profile": {"terasim_internal": {}}}
+
+    projection = plugin._move_ackermann_feedback_actor(
+        "BV", (25.0, 0.0), 90.0, profile_ctx
+    )
+    assert projection["lane_id"] == "edge_0_0"
+    assert [name for name, _value in calls] == ["get_lane", "shape", "length", "move"]
+
+    calls.clear()
+    plugin._move_ackermann_feedback_actor("BV", (26.0, 0.0), 90.0, profile_ctx)
+    assert [name for name, _value in calls] == ["get_lane", "move"]
+    breakdown = profile_ctx["cosim_profile"]["terasim_internal"][
+        "feedback_command_breakdown"
+    ]
+    assert breakdown["lane_geometry_cache_misses"] == pytest.approx(1.0)
+    assert breakdown["lane_geometry_cache_hits"] == pytest.approx(1.0)
+    assert breakdown["traci"]["vehicle_get_lane_id_calls"] == pytest.approx(2.0)
+    assert breakdown["traci"]["vehicle_move_to_calls"] == pytest.approx(2.0)
 
 
 def test_ackermann_feedback_acceleration_uses_observed_speed():
@@ -1110,6 +1397,8 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
         "AV": {
             "sumo_requested_acceleration": -7.06,
             "sumo_emergency_decel": 7.06,
+            "wheel_base_m": 2.85,
+            "rear_axle_local_x_m": -1.4,
         }
     }
     cosim.step_length = 0.1
@@ -1127,6 +1416,8 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
             "sumo_desired_speed": 0.0,
             "acceleration": -7.06,
             "feedback_observed_speed": 6.62,
+            "lookahead_distance": 3.5,
+            "lookahead_heading_change": 0.8,
         },
         vehicle=vehicle,
         current_transform=transform,
@@ -1136,6 +1427,15 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
         position_error=0.4,
         feedback_unhealthy=False,
         target_behind=False,
+        control_values=types.SimpleNamespace(
+            raw_steer=0.7,
+            clamped_steer=0.6,
+            steer=0.55,
+            lookahead_local_x=3.0,
+            lookahead_local_y=1.0,
+            control_point_x=10.0,
+            control_point_y=20.0,
+        ),
     )
 
     prefix, payload = capsys.readouterr().out.strip().split(" ", 1)
@@ -1148,3 +1448,10 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
     assert record["carla_applied_throttle"] == pytest.approx(0.0)
     assert record["carla_applied_brake"] == pytest.approx(0.75)
     assert record["carla_applied_steer"] == pytest.approx(0.1)
+    assert record["lookahead_distance"] == pytest.approx(3.5)
+    assert record["lookahead_heading_change"] == pytest.approx(0.8)
+    assert record["wheel_base_m"] == pytest.approx(2.85)
+    assert record["rear_axle_local_x_m"] == pytest.approx(-1.4)
+    assert record["pure_pursuit_raw_steer"] == pytest.approx(0.7)
+    assert record["pure_pursuit_clamped_steer"] == pytest.approx(0.6)
+    assert record["pure_pursuit_command_steer"] == pytest.approx(0.55)

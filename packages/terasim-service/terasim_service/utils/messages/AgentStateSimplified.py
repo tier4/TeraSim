@@ -24,6 +24,13 @@ class AgentStateSimplified(BaseModel):
     lookahead_y: float = 0.0
     lookahead_z: float = 0.0
     lookahead_position_valid: bool = False
+    lookahead_distance: float = 0.0
+    lookahead_heading_change: float = 0.0
+    lookahead_lane_change_blend: float = 0.0
+    lookahead_origin_x: float = 0.0
+    lookahead_origin_y: float = 0.0
+    lateral_speed: float = 0.0
+    feedback_position_skipped_for_lane_change: bool = False
 
     ## longitude of the agent (degrees)
     lon: float = 0.0

@@ -37,6 +37,9 @@ class AckermannControlValues:
     jerk: float
     position_error: float
     longitudinal_error: float
+    control_point_x: float
+    control_point_y: float
+    wheel_base: float
 
 
 def clamp(value, lower, upper):
@@ -80,12 +83,22 @@ def compute_ackermann_control_values(
     previous_steer=None,
     dt=0.1,
     tuning=AckermannTuning(),
+    control_point_local_x=0.0,
+    wheel_base=None,
 ):
     desired_speed = max(0.0, float(desired_speed))
     current_speed = max(0.0, float(current_speed))
 
+    yaw_radians = math.radians(float(yaw_degrees))
+    control_point_local_x = float(control_point_local_x)
+    control_point_x = float(current_x) + math.cos(yaw_radians) * control_point_local_x
+    control_point_y = float(current_y) + math.sin(yaw_radians) * control_point_local_x
+    effective_wheel_base = (
+        float(tuning.wheel_base) if wheel_base is None else max(0.1, float(wheel_base))
+    )
+
     lookahead_local_x, lookahead_local_y = world_to_vehicle_2d(
-        current_x, current_y, yaw_degrees, lookahead_x, lookahead_y
+        control_point_x, control_point_y, yaw_degrees, lookahead_x, lookahead_y
     )
     desired_local_x, desired_local_y = world_to_vehicle_2d(
         current_x, current_y, yaw_degrees, desired_x, desired_y
@@ -95,7 +108,7 @@ def compute_ackermann_control_values(
     alpha = math.atan2(lookahead_local_y, lookahead_local_x)
     curvature = 2.0 * math.sin(alpha) / lookahead_distance
 
-    raw_steer = math.atan(float(tuning.wheel_base) * curvature)
+    raw_steer = math.atan(effective_wheel_base * curvature)
     clamped_steer = clamp(raw_steer, -tuning.max_steer_rad, tuning.max_steer_rad)
     steer = rate_limit(clamped_steer, previous_steer, tuning.max_steer_rate_rad_s, dt)
 
@@ -116,4 +129,7 @@ def compute_ackermann_control_values(
         jerk=0.0,
         position_error=position_error,
         longitudinal_error=desired_local_x,
+        control_point_x=control_point_x,
+        control_point_y=control_point_y,
+        wheel_base=effective_wheel_base,
     )

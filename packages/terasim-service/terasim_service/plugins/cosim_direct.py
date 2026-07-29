@@ -237,17 +237,21 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
             commands = self._pending_commands
             self._pending_commands = []
         self.controlled_agents_each_step.clear()
-        for raw in commands:
-            if not self._handle_agent_command(raw):
-                if self._should_continue_after_agent_command_failure():
-                    continue
-                self._record_agent_command_failure(simulator)
-                self._finish("error")
-                simulator.running = False
-                self.logger.critical(
-                    "Fail-closed: direct Tick rejected before SUMO simulationStep"
-                )
-                return False
+        self._active_agent_command_profile_ctx = ctx
+        try:
+            for raw in commands:
+                if not self._handle_agent_command(raw):
+                    if self._should_continue_after_agent_command_failure():
+                        continue
+                    self._record_agent_command_failure(simulator)
+                    self._finish("error")
+                    simulator.running = False
+                    self.logger.critical(
+                        "Fail-closed: direct Tick rejected before SUMO simulationStep"
+                    )
+                    return False
+        finally:
+            self._active_agent_command_profile_ctx = None
 
         add_timing(
             ctx,

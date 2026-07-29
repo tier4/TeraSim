@@ -1,13 +1,15 @@
 import json
 import logging
+import math
 import os
+import subprocess
+import time
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
 import numpy as np
 import redis
 from redis.exceptions import RedisError
-import time
-import subprocess
-from pathlib import Path
 
 from terasim.overlay import traci
 from terasim.profiling import add_timing, get_profile, set_value
@@ -19,6 +21,8 @@ from .base import BasePlugin, DEFAULT_REDIS_CONFIG
 
 from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
 from ..utils.sumo_lane_geometry import (
+    adapt_lookahead_distances_for_compiled_paths,
+    blend_lane_change_lookahead,
     compile_lane_shapes,
     extract_next_link_lane_ids,
     find_lookahead_positions_from_compiled_paths,
@@ -164,7 +168,9 @@ class TeraSimCoSimPlugin(BasePlugin):
         # Maintain controlled agents in each step, assuming each agent can be controlled by only one command
         self.controlled_agents_each_step = set()
         self.feedback_observed_speeds = {}
+        self.feedback_observed_positions = {}
         self.feedback_source_carla_frames = {}
+        self.feedback_lane_change_active_actor_ids = set()
         feedback_actor_value = os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "")
         self.ackermann_feedback_actor_ids = {
             actor_id.strip()
@@ -281,11 +287,55 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Initialize last orientations cache
         self.last_orientations = {}  # {vehicle_id: (last_orientation, last_time)}
-        self.lookahead_path_cache = {}  # {vehicle_id: compiled route geometry}
         self.lookahead_lane_shape_cache = {}  # {lane_id: immutable lane shape}
         self.lookahead_geometry_cache = {}  # {lane ID tuple: compiled route geometry}
-        self.lookahead_vehicle_route_cache = {}  # {vehicle_id: {lane_id: next lane IDs}}
-        
+        # Route IDs are identifiers, not immutable route versions, so the full
+        # route edge sequence is part of each per-vehicle cache key.
+        self.lookahead_vehicle_route_cache = {}
+        self.lookahead_straight_min_distance = max(
+            0.1, self._parse_float_env("TERASIM_COSIM_LOOKAHEAD_STRAIGHT_MIN_DISTANCE", 7.0)
+        )
+        self.lookahead_max_distance = max(
+            self.lookahead_straight_min_distance,
+            self._parse_float_env("TERASIM_COSIM_LOOKAHEAD_MAX_DISTANCE", 15.0),
+        )
+        self.lookahead_curve_min_distance = max(
+            0.1, self._parse_float_env("TERASIM_COSIM_LOOKAHEAD_CURVE_MIN_DISTANCE", 3.5)
+        )
+        self.lookahead_curve_start_radians = math.radians(
+            max(0.0, self._parse_float_env("TERASIM_COSIM_LOOKAHEAD_CURVE_START_DEG", 5.0))
+        )
+        self.lookahead_curve_full_scale_radians = math.radians(
+            max(
+                math.degrees(self.lookahead_curve_start_radians) + 0.1,
+                self._parse_float_env("TERASIM_COSIM_LOOKAHEAD_CURVE_FULL_SCALE_DEG", 45.0),
+            )
+        )
+        self.lookahead_lane_change_speed_start = max(
+            0.0,
+            self._parse_float_env(
+                "TERASIM_COSIM_LOOKAHEAD_LANE_CHANGE_SPEED_START", 0.05
+            ),
+        )
+        self.lookahead_lane_change_speed_full = max(
+            self.lookahead_lane_change_speed_start + 1e-3,
+            self._parse_float_env(
+                "TERASIM_COSIM_LOOKAHEAD_LANE_CHANGE_SPEED_FULL", 0.35
+            ),
+        )
+        self.lookahead_lane_change_offset_start = max(
+            0.0,
+            self._parse_float_env(
+                "TERASIM_COSIM_LOOKAHEAD_LANE_CHANGE_OFFSET_START", 0.15
+            ),
+        )
+        self.lookahead_lane_change_offset_full = max(
+            self.lookahead_lane_change_offset_start + 1e-3,
+            self._parse_float_env(
+                "TERASIM_COSIM_LOOKAHEAD_LANE_CHANGE_OFFSET_FULL", 0.75
+            ),
+        )
+
         # Initialize health monitoring
         self.error_count = 0
         self.last_successful_operation = time.time()
@@ -553,15 +603,83 @@ class TeraSimCoSimPlugin(BasePlugin):
             candidates.append(geometry)
         return current_lane_id, candidates
 
-    def _move_ackermann_feedback_actor(self, actor_id, position, sumo_angle):
-        current_lane_id, candidates = self._get_ackermann_feedback_lane_candidates(actor_id)
-        # moveTo cannot represent CARLA's lateral offset. Let SUMO own lane
-        # changes and only update longitudinal progress on SUMO's current lane.
-        # Falling back to an adjacent lane based on CARLA x/y causes an
-        # instantaneous centerline-to-centerline jump in SUMO GUI.
-        current_lane_candidates = [
-            candidate for candidate in candidates if candidate["lane_id"] == current_lane_id
-        ]
+    @staticmethod
+    def _profile_feedback_command_call(
+        profile_ctx, category, command_name, function, *args, **kwargs
+    ):
+        """Call one feedback operation and record its wall time while profiling."""
+        if get_profile(profile_ctx) is None:
+            return function(*args, **kwargs)
+
+        start = time.perf_counter()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - start
+            base = f"terasim_internal.feedback_command_breakdown.{category}"
+            add_timing(profile_ctx, f"{base}.total_s", elapsed)
+            add_timing(profile_ctx, f"{base}.{command_name}_s", elapsed)
+            add_timing(profile_ctx, f"{base}.{command_name}_calls", 1.0)
+
+    def _get_ackermann_feedback_current_lane_candidate(self, actor_id, profile_ctx=None):
+        """Return only the SUMO lane that moveTo is allowed to preserve."""
+        current_lane_id = self._profile_feedback_command_call(
+            profile_ctx,
+            "traci",
+            "vehicle_get_lane_id",
+            traci.vehicle.getLaneID,
+            actor_id,
+        )
+        if not current_lane_id:
+            return current_lane_id, []
+
+        lane_geometry_cache = getattr(self, "feedback_lane_geometry_cache", None)
+        if lane_geometry_cache is None:
+            lane_geometry_cache = {}
+            self.feedback_lane_geometry_cache = lane_geometry_cache
+        geometry = lane_geometry_cache.get(current_lane_id)
+        if geometry is None:
+            shape = self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "lane_get_shape",
+                traci.lane.getShape,
+                current_lane_id,
+            )
+            length = self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "lane_get_length",
+                traci.lane.getLength,
+                current_lane_id,
+            )
+            geometry = {
+                "lane_id": current_lane_id,
+                "shape": shape,
+                "length": length,
+            }
+            lane_geometry_cache[current_lane_id] = geometry
+            add_timing(
+                profile_ctx,
+                "terasim_internal.feedback_command_breakdown.lane_geometry_cache_misses",
+                1.0,
+            )
+        else:
+            add_timing(
+                profile_ctx,
+                "terasim_internal.feedback_command_breakdown.lane_geometry_cache_hits",
+                1.0,
+            )
+        return current_lane_id, [geometry]
+
+    def _move_ackermann_feedback_actor(
+        self, actor_id, position, sumo_angle, profile_ctx=None
+    ):
+        current_lane_id, current_lane_candidates = (
+            self._get_ackermann_feedback_current_lane_candidate(actor_id, profile_ctx)
+        )
+        # moveTo cannot represent CARLA lateral offset. Let SUMO own lane
+        # changes and only update longitudinal progress on its current lane.
         max_distance = getattr(
             self,
             "ackermann_feedback_move_to_max_distance",
@@ -576,7 +694,11 @@ class TeraSimCoSimPlugin(BasePlugin):
             if background_max_distance is not None:
                 max_distance = background_max_distance
 
-        projection = select_route_aware_lane_projection(
+        projection = self._profile_feedback_command_call(
+            profile_ctx,
+            "python",
+            "current_lane_projection",
+            select_route_aware_lane_projection,
             position,
             sumo_angle,
             current_lane_candidates,
@@ -590,6 +712,9 @@ class TeraSimCoSimPlugin(BasePlugin):
             prefer_current_lane=True,
         )
         if projection is None:
+            candidate_lane_ids = [
+                candidate["lane_id"] for candidate in current_lane_candidates
+            ]
             self.logger.error(
                 "Ackermann feedback moveTo mapping failed actor=%s "
                 "position=(%.3f, %.3f) angle=%.3f currentLane=%s candidates=%s",
@@ -598,7 +723,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                 position[1],
                 sumo_angle,
                 current_lane_id,
-                [candidate["lane_id"] for candidate in candidates],
+                candidate_lane_ids,
             )
             self.last_agent_command_failure = {
                 "actor_id": actor_id,
@@ -607,11 +732,15 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "position": [position[0], position[1]],
                 "sumo_angle": sumo_angle,
                 "current_lane_id": current_lane_id,
-                "candidate_lane_ids": [candidate["lane_id"] for candidate in candidates],
+                "candidate_lane_ids": candidate_lane_ids,
             }
             return None
 
-        traci.vehicle.moveTo(
+        self._profile_feedback_command_call(
+            profile_ctx,
+            "traci",
+            "vehicle_move_to",
+            traci.vehicle.moveTo,
             actor_id,
             projection["lane_id"],
             projection["lane_position"],
@@ -998,11 +1127,13 @@ class TeraSimCoSimPlugin(BasePlugin):
             traci.constants.VAR_POSITION3D,
             traci.constants.VAR_ANGLE,
             traci.constants.VAR_SPEED,
+            traci.constants.VAR_SPEED_LAT,
             traci.constants.VAR_ACCELERATION,
             traci.constants.VAR_LANE_ID,
             traci.constants.VAR_LANEPOSITION,
             traci.constants.VAR_LANEPOSITION_LAT,
             traci.constants.VAR_ROUTE_ID,
+            traci.constants.VAR_EDGES,
         ]
 
     def _get_state_vehicle_context_results(self, vehicle_ids):
@@ -1312,13 +1443,14 @@ class TeraSimCoSimPlugin(BasePlugin):
         ) = reconstructed
         vehicle_state.reconstructed_position_valid = True
 
-    @staticmethod
-    def _lookahead_distance(speed):
+    def _lookahead_distance(self, speed):
         try:
             speed = float(speed)
         except (TypeError, ValueError):
             speed = 0.0
-        return min(15.0, max(7.0, speed))
+        minimum = getattr(self, "lookahead_straight_min_distance", 7.0)
+        maximum = getattr(self, "lookahead_max_distance", 15.0)
+        return min(maximum, max(minimum, speed))
 
     def _get_vehicle_lookahead_compiled_path(
         self,
@@ -1357,11 +1489,18 @@ class TeraSimCoSimPlugin(BasePlugin):
                 vehicle_route_cache = {}
                 self.lookahead_vehicle_route_cache = vehicle_route_cache
             lane_route_cache = vehicle_route_cache.setdefault(vehicle_id, {})
-            _, route_id = self._context_vehicle_value(
-                context_values, "VAR_ROUTE_ID"
+            has_route_edges, route_edges = self._context_vehicle_value(
+                context_values, "VAR_EDGES"
             )
-            route_cache_key = (current_lane, route_id or "")
-            next_lane_ids = lane_route_cache.get(route_cache_key)
+            route_signature = tuple(route_edges or ()) if has_route_edges else None
+            route_cache_key = (
+                (current_lane, route_signature) if route_signature is not None else None
+            )
+            next_lane_ids = (
+                lane_route_cache.get(route_cache_key)
+                if route_cache_key is not None
+                else None
+            )
             if next_lane_ids is None:
                 try:
                     next_links = self._profile_detail_traci_call(
@@ -1380,7 +1519,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                         next_links,
                     )
                 )
-                lane_route_cache[route_cache_key] = next_lane_ids
+                if route_cache_key is not None:
+                    lane_route_cache[route_cache_key] = next_lane_ids
         else:
             next_lane_ids = ()
 
@@ -1389,7 +1529,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             if lane_id and lane_id not in lane_ids:
                 lane_ids.append(lane_id)
         if not lane_ids:
-            return getattr(self, "lookahead_path_cache", {}).get(vehicle_id)
+            return None
 
         geometry_cache = getattr(self, "lookahead_geometry_cache", None)
         if geometry_cache is None:
@@ -1422,14 +1562,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                     valid_route_key = tuple(valid_lane_ids)
                     geometry_cache.setdefault(valid_route_key, compiled_path)
 
-        if compiled_path is not None:
-            path_cache = getattr(self, "lookahead_path_cache", None)
-            if path_cache is None:
-                path_cache = {}
-                self.lookahead_path_cache = path_cache
-            path_cache[vehicle_id] = compiled_path
-            return compiled_path
-        return getattr(self, "lookahead_path_cache", {}).get(vehicle_id)
+        return compiled_path
 
     def _populate_vehicle_lookaheads(self, requests, profile_ctx=None):
         if not requests:
@@ -1447,33 +1580,70 @@ class TeraSimCoSimPlugin(BasePlugin):
                     profile_ctx=profile_ctx,
                 )
             )
-            current_positions.append((vehicle_state.x, vehicle_state.y))
+            feedback_positions = getattr(self, "feedback_observed_positions", {})
+            current_position = feedback_positions.get(
+                vehicle_id, (vehicle_state.x, vehicle_state.y)
+            )
+            current_positions.append(current_position)
+            vehicle_state.lookahead_origin_x = current_position[0]
+            vehicle_state.lookahead_origin_y = current_position[1]
             lookahead_distances.append(self._lookahead_distance(vehicle_state.speed))
             z_values.append(vehicle_state.z)
 
+        effective_distances, heading_changes = self._profile_detail_python_call(
+            profile_ctx,
+            "adapt_lookahead_distances_batch",
+            adapt_lookahead_distances_for_compiled_paths,
+            compiled_paths,
+            current_positions,
+            lookahead_distances,
+            getattr(self, "lookahead_curve_min_distance", 3.5),
+            getattr(self, "lookahead_curve_start_radians", math.radians(5.0)),
+            getattr(self, "lookahead_curve_full_scale_radians", math.radians(45.0)),
+        )
         lookaheads = self._profile_detail_python_call(
             profile_ctx,
             "find_lookahead_positions_batch",
             find_lookahead_positions_from_compiled_paths,
             compiled_paths,
             current_positions,
-            lookahead_distances,
+            effective_distances,
             z_values,
         )
-        for request, lookahead, lookahead_distance in zip(
-            requests, lookaheads, lookahead_distances
+        for request, lookahead, lookahead_distance, heading_change in zip(
+            requests, lookaheads, effective_distances, heading_changes
         ):
-            _, vehicle_state, _ = request
-            if lookahead is None:
-                lookahead = self._profile_detail_python_call(
-                    profile_ctx,
-                    "project_position_by_sumo_angle",
-                    project_position_by_sumo_angle,
-                    (vehicle_state.x, vehicle_state.y),
-                    vehicle_state.sumo_angle,
-                    lookahead_distance,
-                    vehicle_state.z,
-                )
+            _, vehicle_state, context_values = request
+            vehicle_state.lookahead_distance = lookahead_distance
+            vehicle_state.lookahead_heading_change = heading_change
+            has_lateral_speed, lateral_speed = self._context_vehicle_value(
+                context_values, "VAR_SPEED_LAT"
+            )
+            if not has_lateral_speed:
+                lateral_speed = 0.0
+            has_lateral_offset, lateral_offset = self._context_vehicle_value(
+                context_values, "VAR_LANEPOSITION_LAT"
+            )
+            if not has_lateral_offset:
+                lateral_offset = getattr(vehicle_state, "lateral_offset", 0.0)
+            vehicle_state.lateral_speed = lateral_speed
+            lookahead, lane_change_blend = self._profile_detail_python_call(
+                profile_ctx,
+                "blend_lane_change_lookahead",
+                blend_lane_change_lookahead,
+                lookahead,
+                (vehicle_state.lookahead_origin_x, vehicle_state.lookahead_origin_y),
+                vehicle_state.sumo_angle,
+                lookahead_distance,
+                lateral_speed,
+                lateral_offset,
+                vehicle_state.z,
+                getattr(self, "lookahead_lane_change_speed_start", 0.05),
+                getattr(self, "lookahead_lane_change_speed_full", 0.35),
+                getattr(self, "lookahead_lane_change_offset_start", 0.15),
+                getattr(self, "lookahead_lane_change_offset_full", 0.75),
+            )
+            vehicle_state.lookahead_lane_change_blend = lane_change_blend
             if lookahead is None:
                 continue
             vehicle_state.lookahead_x = lookahead[0]
@@ -1512,6 +1682,11 @@ class TeraSimCoSimPlugin(BasePlugin):
             vehicle_ids
         )
         active_vehicle_ids = set(vehicle_ids)
+        lane_change_active_actor_ids = getattr(
+            self, "feedback_lane_change_active_actor_ids", set()
+        )
+        lane_change_active_actor_ids.intersection_update(active_vehicle_ids)
+        self.feedback_lane_change_active_actor_ids = lane_change_active_actor_ids
         detail_vehicle_ids = self._update_state_detail_active_vehicle_ids(
             vehicle_ids, vehicle_position_cache
         )
@@ -1522,8 +1697,8 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         for feedback_cache in (
             self.feedback_observed_speeds,
+            self.feedback_observed_positions,
             self.feedback_source_carla_frames,
-            self.lookahead_path_cache,
             self.lookahead_vehicle_route_cache,
         ):
             for vid in list(feedback_cache):
@@ -1567,6 +1742,33 @@ class TeraSimCoSimPlugin(BasePlugin):
             if speed is None:
                 speed = traci.vehicle.getSpeed(vid)
             vehicle_state.speed = speed
+            lane_id = context_values.get(traci.constants.VAR_LANE_ID)
+            if lane_id is not None:
+                vehicle_state.lane_id = lane_id
+            lane_position = context_values.get(traci.constants.VAR_LANEPOSITION)
+            if lane_position is not None:
+                vehicle_state.lane_position = lane_position
+            lateral_offset = context_values.get(
+                traci.constants.VAR_LANEPOSITION_LAT
+            )
+            if lateral_offset is not None:
+                vehicle_state.lateral_offset = lateral_offset
+            lateral_speed = context_values.get(traci.constants.VAR_SPEED_LAT)
+            if lateral_speed is not None:
+                vehicle_state.lateral_speed = lateral_speed
+            lane_change_active = (
+                abs(vehicle_state.lateral_speed)
+                >= getattr(self, "lookahead_lane_change_speed_start", 0.05)
+                or abs(vehicle_state.lateral_offset)
+                >= getattr(self, "lookahead_lane_change_offset_start", 0.15)
+            )
+            if lane_change_active:
+                self.feedback_lane_change_active_actor_ids.add(vid)
+            else:
+                self.feedback_lane_change_active_actor_ids.discard(vid)
+            vehicle_state.feedback_position_skipped_for_lane_change = (
+                lane_change_active
+            )
             self._populate_vehicle_static_state(vid, vehicle_state)
 
             if vid in detail_vehicle_ids:
@@ -1879,8 +2081,13 @@ class TeraSimCoSimPlugin(BasePlugin):
             command_data (str): The agent command data.
         """
         self.last_agent_command_failure = None
+        profile_ctx = getattr(self, "_active_agent_command_profile_ctx", None)
+        feedback_command_start = time.perf_counter()
+        is_ackermann_feedback = False
         try:
+            parse_start = time.perf_counter()
             command = AgentCommand.model_validate_json(command_data.decode("utf-8"))
+            parse_elapsed = time.perf_counter() - parse_start
             if command.agent_id != '':
                 if command.agent_type not in ["vehicle", "vru"]:
                     self.logger.error(f"Invalid agent type: {command.agent_type}")
@@ -1904,8 +2111,17 @@ class TeraSimCoSimPlugin(BasePlugin):
                     if command.agent_type == "vehicle":
                         is_ackermann_feedback = "source_carla_frame" in command.data
                         if is_ackermann_feedback:
-                            self._ensure_ackermann_feedback_lane_change_settings(
-                                command.agent_id
+                            add_timing(
+                                profile_ctx,
+                                "terasim_internal.feedback_command_breakdown.parse_s",
+                                parse_elapsed,
+                            )
+                            self._profile_feedback_command_call(
+                                profile_ctx,
+                                "python",
+                                "ensure_lane_change_settings",
+                                self._ensure_ackermann_feedback_lane_change_settings,
+                                command.agent_id,
                             )
                         use_move_to = is_ackermann_feedback and getattr(
                             self, "ackermann_feedback_position_mode", "moveTo"
@@ -1952,11 +2168,26 @@ class TeraSimCoSimPlugin(BasePlugin):
                                     previous_lane_state,
                                     before_lane_state,
                                 )
-                        if use_move_to:
+                        lane_change_active = command.agent_id in getattr(
+                            self, "feedback_lane_change_active_actor_ids", set()
+                        )
+                        position_feedback_start = time.perf_counter()
+                        if use_move_to and lane_change_active:
+                            projection = None
+                            feedback_move_source = (
+                                "feedback_moveTo_lane_change_skipped"
+                            )
+                            add_timing(
+                                profile_ctx,
+                                "terasim_internal.feedback_command_breakdown.lane_change_skips",
+                                1.0,
+                            )
+                        elif use_move_to:
                             projection = self._move_ackermann_feedback_actor(
                                 command.agent_id,
                                 (x, y),
                                 command.data.get("sumo_angle", 0),
+                                profile_ctx,
                             )
                             if projection is None:
                                 if not self._should_continue_after_agent_command_failure():
@@ -1980,6 +2211,12 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 keep_route,
                             )
                             feedback_move_source = "feedback_moveToXY"
+                        if is_ackermann_feedback:
+                            add_timing(
+                                profile_ctx,
+                                "terasim_internal.feedback_command_breakdown.position_feedback_s",
+                                time.perf_counter() - position_feedback_start,
+                            )
                         if log_lane_transition:
                             after_lane_state = self._read_ackermann_feedback_lane_state(
                                 command.agent_id
@@ -2026,11 +2263,26 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 pass
 
                         if "speed" in command.data:
-                            traci.vehicle.setPreviousSpeed(command.agent_id, command.data["speed"])
+                            if is_ackermann_feedback:
+                                self._profile_feedback_command_call(
+                                    profile_ctx,
+                                    "traci",
+                                    "vehicle_set_previous_speed",
+                                    traci.vehicle.setPreviousSpeed,
+                                    command.agent_id,
+                                    command.data["speed"],
+                                )
+                            else:
+                                traci.vehicle.setPreviousSpeed(
+                                    command.agent_id, command.data["speed"]
+                                )
                             if "source_carla_frame" in command.data:
                                 self.feedback_observed_speeds[command.agent_id] = command.data[
                                     "speed"
                                 ]
+                                if not hasattr(self, "feedback_observed_positions"):
+                                    self.feedback_observed_positions = {}
+                                self.feedback_observed_positions[command.agent_id] = (x, y)
                                 self.feedback_source_carla_frames[command.agent_id] = command.data[
                                     "source_carla_frame"
                                 ]
@@ -2058,7 +2310,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                             return False
             
 
-                self.logger.info(f"Agent command executed: {command_data}")
+                self.logger.debug(f"Agent command executed: {command_data}")
                 return True
 
         except Exception as e:
@@ -2074,6 +2326,18 @@ class TeraSimCoSimPlugin(BasePlugin):
                 }
             self.logger.error(f"Error handling agent command: {e}")
             return False
+        finally:
+            if is_ackermann_feedback:
+                add_timing(
+                    profile_ctx,
+                    "terasim_internal.feedback_command_breakdown.total_s",
+                    time.perf_counter() - feedback_command_start,
+                )
+                add_timing(
+                    profile_ctx,
+                    "terasim_internal.feedback_command_breakdown.command_count",
+                    1.0,
+                )
 
     def _record_agent_command_failure(self, simulator):
         failure = self.last_agent_command_failure or {

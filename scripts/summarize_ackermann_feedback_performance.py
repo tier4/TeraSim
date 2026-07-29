@@ -56,6 +56,21 @@ def main(root_arg):
             "nde_background_mean_ms": mean_ms(tprofiles,"terasim_internal.behavior_generation.nde_background_update_s"),
             "nade_decision_mean_ms": mean_ms(tprofiles,"terasim_internal.behavior_generation.nade_decision_control_s"),
             "state_export_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.total_s"),
+            "feedback_ingestion_mean_ms": mean_ms(tprofiles,"terasim_internal.pre_step_command_ingestion_s"),
+            "feedback_total_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.total_s"),
+            "feedback_parse_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.parse_s"),
+            "feedback_position_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.position_feedback_s"),
+            "feedback_traci_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.total_s"),
+            "feedback_get_lane_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.vehicle_get_lane_id_s"),
+            "feedback_lane_shape_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.lane_get_shape_s"),
+            "feedback_lane_length_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.lane_get_length_s"),
+            "feedback_move_to_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.vehicle_move_to_s"),
+            "feedback_set_previous_speed_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.traci.vehicle_set_previous_speed_s"),
+            "feedback_python_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.python.total_s"),
+            "feedback_projection_mean_ms": mean_ms(tprofiles,"terasim_internal.feedback_command_breakdown.python.current_lane_projection_s"),
+            "feedback_commands_mean": mean_value(tprofiles,"terasim_internal.feedback_command_breakdown.command_count"),
+            "feedback_lane_cache_hits_mean": mean_value(tprofiles,"terasim_internal.feedback_command_breakdown.lane_geometry_cache_hits"),
+            "feedback_lane_cache_misses_mean": mean_value(tprofiles,"terasim_internal.feedback_command_breakdown.lane_geometry_cache_misses"),
             "state_ackermann_detail_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_s"),
             "lookahead_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.lookahead_lane_geometry_s"),
             "detail_traci_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_breakdown.traci.total_s"),
@@ -67,5 +82,23 @@ def main(root_arg):
     for r in summaries:
         cells=[r["rhi"],f'{r["radius_m"]:.0f}m',str(r["samples"]),f'{r["sumo_total_vehicles_mean"]:.1f}',f'{r["exported_vehicles_mean"]:.1f}',f'{r["carla_vehicles_mean"]:.1f}',f'{r["physics_vehicles_mean"]:.1f}/{r["physics_vehicles_max"]:.0f}',f'{r["detail_vehicles_mean"]:.1f}',f'{r["total_mean_ms"]:.1f}/{r["total_p95_ms"]:.1f}',f'{r["deadline_50ms_pct"]:.0f}%',f'{r["realtime_factor"]:.2f}',f'{r["world_tick_mean_ms"]:.1f}',f'{r["terasim_internal_mean_ms"]:.1f}',f'{r["sumo_step_mean_ms"]:.1f}',f'{r["behavior_mean_ms"]:.1f}',f'{r["state_export_mean_ms"]:.1f}']
         lines.append("| "+" | ".join(cells)+" |")
+    lines.extend([
+        "",
+        "## Feedback command ingestion breakdown",
+        "",
+        "| RHI | radius | commands | ingestion ms | handler ms | parse ms | position ms | TraCI ms | getLaneID ms | moveTo ms | setPreviousSpeed ms | projection ms | residual ms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for r in summaries:
+        residual = max(0.0, r["feedback_total_mean_ms"] - r["feedback_parse_mean_ms"] - r["feedback_position_mean_ms"] - r["feedback_set_previous_speed_mean_ms"])
+        cells = [
+            r["rhi"], f'{r["radius_m"]:.0f}m', f'{r["feedback_commands_mean"]:.1f}',
+            f'{r["feedback_ingestion_mean_ms"]:.2f}', f'{r["feedback_total_mean_ms"]:.2f}',
+            f'{r["feedback_parse_mean_ms"]:.2f}', f'{r["feedback_position_mean_ms"]:.2f}',
+            f'{r["feedback_traci_mean_ms"]:.2f}', f'{r["feedback_get_lane_mean_ms"]:.2f}',
+            f'{r["feedback_move_to_mean_ms"]:.2f}', f'{r["feedback_set_previous_speed_mean_ms"]:.2f}',
+            f'{r["feedback_projection_mean_ms"]:.2f}', f'{residual:.2f}',
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     (root/"summary.md").write_text("\n".join(lines)+"\n"); print("\n".join(lines))
 if __name__ == "__main__": main(sys.argv[1])

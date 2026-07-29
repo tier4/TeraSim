@@ -1606,6 +1606,44 @@ class CarlaCosim(object):
         )
         return True
 
+    def _initialize_ackermann_actor_geometry(self, actor, veh_id, state):
+        if state.get("geometry_attempted"):
+            return
+        state["geometry_attempted"] = True
+        fallback_tuning = getattr(self, "ackermann_tuning", AckermannTuning())
+        fallback_wheel_base = float(fallback_tuning.wheel_base)
+        state["wheel_base_m"] = fallback_wheel_base
+        state["rear_axle_local_x_m"] = -0.5 * fallback_wheel_base
+
+        try:
+            physics_control = actor.get_physics_control()
+            wheels = list(getattr(physics_control, "wheels", ()) or ())
+            wheel_x_values = [
+                float(wheel.position.x)
+                for wheel in wheels
+                if getattr(wheel, "position", None) is not None
+            ]
+        except Exception:
+            return
+        if len(wheel_x_values) < 2:
+            return
+
+        # CARLA reports wheel positions in centimetres in current releases.
+        if max(abs(value) for value in wheel_x_values) > 20.0:
+            wheel_x_values = [value / 100.0 for value in wheel_x_values]
+        wheel_x_values.sort()
+        split = max(1, len(wheel_x_values) // 2)
+        rear_axle_x = sum(wheel_x_values[:split]) / split
+        front_values = wheel_x_values[split:]
+        if not front_values:
+            return
+        front_axle_x = sum(front_values) / len(front_values)
+        wheel_base = front_axle_x - rear_axle_x
+        if 0.5 <= wheel_base <= 6.0 and -5.0 <= rear_axle_x <= 2.0:
+            state["wheel_base_m"] = wheel_base
+            state["rear_axle_local_x_m"] = rear_axle_x
+            state["geometry_from_physics"] = True
+
     def _ensure_ackermann_actor_physics(
         self,
         actor,
@@ -1624,6 +1662,7 @@ class CarlaCosim(object):
                     initial_speed,
                     initial_transform,
                 )
+        self._initialize_ackermann_actor_geometry(actor, veh_id, state)
         if state.get("controller_settings_attempted"):
             return
 
@@ -1903,6 +1942,11 @@ class CarlaCosim(object):
             previous_steer=state.get("steer"),
             dt=self.step_length,
             tuning=self.ackermann_tuning,
+            control_point_local_x=state.get(
+                "rear_axle_local_x_m",
+                -0.5 * self.ackermann_tuning.wheel_base,
+            ),
+            wheel_base=state.get("wheel_base_m", self.ackermann_tuning.wheel_base),
         )
         final_steer = values.steer
         final_speed = values.speed
@@ -1939,6 +1983,7 @@ class CarlaCosim(object):
             position_error=values.position_error,
             feedback_unhealthy=bool(feedback_unhealthy),
             target_behind=bool(target_behind),
+            control_values=values,
         )
         state["steer"] = final_steer
         state["last_position_error"] = values.position_error
@@ -1962,6 +2007,7 @@ class CarlaCosim(object):
         position_error,
         feedback_unhealthy,
         target_behind,
+        control_values=None,
     ):
         if not getattr(self, "ackermann_control_log_records", False):
             return
@@ -2015,6 +2061,26 @@ class CarlaCosim(object):
             "actor_id": veh_id,
             "carla_frame": carla_frame,
             "simulation_time": self.terasim_states.get("simulation_time"),
+            "sumo_x": self._as_finite_float(veh_info.get("x")),
+            "sumo_y": self._as_finite_float(veh_info.get("y")),
+            "sumo_lane_id": veh_info.get("lane_id"),
+            "sumo_lane_position": self._as_finite_float(
+                veh_info.get("lane_position")
+            ),
+            "sumo_lateral_offset": self._as_finite_float(
+                veh_info.get("lateral_offset")
+            ),
+            "sumo_lookahead_x": self._as_finite_float(veh_info.get("lookahead_x")),
+            "sumo_lookahead_y": self._as_finite_float(veh_info.get("lookahead_y")),
+            "lookahead_origin_x": self._as_finite_float(
+                veh_info.get("lookahead_origin_x")
+            ),
+            "lookahead_origin_y": self._as_finite_float(
+                veh_info.get("lookahead_origin_y")
+            ),
+            "carla_x": self._as_finite_float(current_transform.location.x),
+            "carla_y": self._as_finite_float(current_transform.location.y),
+            "carla_yaw": self._as_finite_float(current_transform.rotation.yaw),
             "sumo_desired_speed": self._as_finite_float(veh_info.get("sumo_desired_speed")),
             "sumo_reported_acceleration": self._as_finite_float(veh_info.get("acceleration")),
             "feedback_observed_speed": self._as_finite_float(veh_info.get("feedback_observed_speed")),
@@ -2029,6 +2095,47 @@ class CarlaCosim(object):
             "carla_applied_brake": applied_brake,
             "carla_applied_steer": applied_steer,
             "position_error": position_error,
+            "lookahead_distance": self._as_finite_float(
+                veh_info.get("lookahead_distance")
+            ),
+            "lookahead_heading_change": self._as_finite_float(
+                veh_info.get("lookahead_heading_change")
+            ),
+            "lookahead_lane_change_blend": self._as_finite_float(
+                veh_info.get("lookahead_lane_change_blend")
+            ),
+            "sumo_lateral_speed": self._as_finite_float(
+                veh_info.get("lateral_speed")
+            ),
+            "feedback_position_skipped_for_lane_change": bool(
+                veh_info.get("feedback_position_skipped_for_lane_change", False)
+            ),
+            "wheel_base_m": self._as_finite_float(state.get("wheel_base_m")),
+            "rear_axle_local_x_m": self._as_finite_float(
+                state.get("rear_axle_local_x_m")
+            ),
+            "geometry_from_physics": bool(state.get("geometry_from_physics", False)),
+            "pure_pursuit_raw_steer": self._as_finite_float(
+                getattr(control_values, "raw_steer", None)
+            ),
+            "pure_pursuit_clamped_steer": self._as_finite_float(
+                getattr(control_values, "clamped_steer", None)
+            ),
+            "pure_pursuit_command_steer": self._as_finite_float(
+                getattr(control_values, "steer", None)
+            ),
+            "lookahead_local_x": self._as_finite_float(
+                getattr(control_values, "lookahead_local_x", None)
+            ),
+            "lookahead_local_y": self._as_finite_float(
+                getattr(control_values, "lookahead_local_y", None)
+            ),
+            "control_point_x": self._as_finite_float(
+                getattr(control_values, "control_point_x", None)
+            ),
+            "control_point_y": self._as_finite_float(
+                getattr(control_values, "control_point_y", None)
+            ),
             "feedback_unhealthy": feedback_unhealthy,
             "target_behind": target_behind,
         }

@@ -280,6 +280,98 @@ def compile_lane_shapes(lane_shapes):
     }
 
 
+def adapt_lookahead_distances_for_compiled_paths(
+    compiled_paths,
+    current_positions,
+    base_distances,
+    min_curve_distance=3.5,
+    curve_start_radians=math.radians(5.0),
+    curve_full_scale_radians=math.radians(45.0),
+):
+    """Shorten lookahead when the cached route bends inside the base horizon."""
+    count = len(compiled_paths)
+    if len(current_positions) != count or len(base_distances) != count:
+        raise ValueError("compiled path and vehicle input lengths must match")
+
+    try:
+        min_curve_distance = max(0.1, float(min_curve_distance))
+        curve_start_radians = max(0.0, float(curve_start_radians))
+        curve_full_scale_radians = max(
+            curve_start_radians + 1e-6, float(curve_full_scale_radians)
+        )
+    except (TypeError, ValueError):
+        raise ValueError("invalid adaptive lookahead settings") from None
+
+    effective = [max(0.0, float(distance)) for distance in base_distances]
+    heading_changes = [0.0] * count
+    groups = {}
+    for index, compiled_path in enumerate(compiled_paths):
+        if compiled_path is not None:
+            groups.setdefault(id(compiled_path), (compiled_path, []))[1].append(index)
+
+    for compiled_path, indices in groups.values():
+        try:
+            positions = np.asarray(
+                [current_positions[index] for index in indices], dtype=np.float64
+            )
+            distances = np.maximum(
+                0.0, np.asarray([base_distances[index] for index in indices], dtype=np.float64)
+            )
+        except (TypeError, ValueError):
+            continue
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            continue
+
+        starts = compiled_path["starts"]
+        deltas = compiled_path["deltas"]
+        length_sq = compiled_path["length_sq"]
+        lengths = compiled_path["lengths"]
+        cumulative_starts = compiled_path["cumulative_starts"]
+        cumulative_ends = compiled_path["cumulative_ends"]
+
+        offsets = positions[:, None, :] - starts[None, :, :]
+        ratios = np.einsum("bsi,si->bs", offsets, deltas) / length_sq[None, :]
+        ratios = np.clip(ratios, 0.0, 1.0)
+        projections = starts[None, :, :] + ratios[..., None] * deltas[None, :, :]
+        distance_sq = np.sum((positions[:, None, :] - projections) ** 2, axis=2)
+        nearest_indices = np.argmin(distance_sq, axis=1)
+        rows = np.arange(len(indices))
+        projected_distances = (
+            cumulative_starts[nearest_indices]
+            + lengths[nearest_indices] * ratios[rows, nearest_indices]
+        )
+        base_targets = projected_distances + distances
+        target_indices = np.searchsorted(cumulative_ends, base_targets, side="left")
+        target_indices = np.minimum(target_indices, len(lengths) - 1)
+
+        unit_directions = deltas / lengths[:, None]
+        current_directions = unit_directions[nearest_indices]
+        dots = np.einsum("bi,si->bs", current_directions, unit_directions)
+        angle_differences = np.arccos(np.clip(dots, -1.0, 1.0))
+        segment_indices = np.arange(len(lengths))[None, :]
+        within_horizon = (
+            (segment_indices >= nearest_indices[:, None])
+            & (segment_indices <= target_indices[:, None])
+        )
+        max_heading_changes = np.max(
+            np.where(within_horizon, angle_differences, 0.0), axis=1
+        )
+        curve_factors = np.clip(
+            (max_heading_changes - curve_start_radians)
+            / (curve_full_scale_radians - curve_start_radians),
+            0.0,
+            1.0,
+        )
+        minimums = np.minimum(distances, min_curve_distance)
+        adapted = distances - curve_factors * (distances - minimums)
+
+        for row, result_index in enumerate(indices):
+            effective[result_index] = float(adapted[row])
+            heading_changes[result_index] = float(max_heading_changes[row])
+
+    return effective, heading_changes
+
+
 def find_lookahead_positions_from_compiled_paths(
     compiled_paths,
     current_positions,
@@ -380,6 +472,58 @@ def project_position_by_sumo_angle(position, sumo_angle, distance, z=0.0):
         y + math.sin(heading) * distance,
         z,
     )
+
+
+def _smoothstep(value, start, full):
+    try:
+        value = abs(float(value))
+        start = max(0.0, float(start))
+        full = max(start + 1e-6, float(full))
+    except (TypeError, ValueError):
+        return 0.0
+    ratio = min(1.0, max(0.0, (value - start) / (full - start)))
+    return ratio * ratio * (3.0 - 2.0 * ratio)
+
+
+def blend_lane_change_lookahead(
+    route_lookahead,
+    current_position,
+    sumo_angle,
+    distance,
+    lateral_speed=0.0,
+    lateral_offset=0.0,
+    z=0.0,
+    speed_start=0.05,
+    speed_full=0.35,
+    offset_start=0.15,
+    offset_full=0.75,
+):
+    """Blend a route target with the instantaneous SUMO lane-change heading.
+
+    The blend is zero for ordinary lane following, and approaches one while
+    SUMO reports meaningful lateral motion or lane-relative displacement.
+    This keeps the target continuous when SUMO switches the current lane ID.
+    """
+    heading_lookahead = project_position_by_sumo_angle(
+        current_position, sumo_angle, distance, z
+    )
+    if route_lookahead is None:
+        return heading_lookahead, 0.0
+    if heading_lookahead is None:
+        return route_lookahead, 0.0
+
+    blend = max(
+        _smoothstep(lateral_speed, speed_start, speed_full),
+        _smoothstep(lateral_offset, offset_start, offset_full),
+    )
+    if blend <= 0.0:
+        return route_lookahead, 0.0
+    inverse = 1.0 - blend
+    return (
+        inverse * float(route_lookahead[0]) + blend * heading_lookahead[0],
+        inverse * float(route_lookahead[1]) + blend * heading_lookahead[1],
+        inverse * float(route_lookahead[2]) + blend * heading_lookahead[2],
+    ), blend
 
 
 def reconstruct_position_from_lane_geometry(
