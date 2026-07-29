@@ -7,6 +7,7 @@ PERF_WARMUP_STEPS=${PERF_WARMUP_STEPS:-600}
 PERF_MEASUREMENT_STEPS=${PERF_MEASUREMENT_STEPS:-100}
 PERF_STEP_LENGTH=${PERF_STEP_LENGTH:-0.05}
 PERF_SUMO_THREADS=${PERF_SUMO_THREADS:-8}
+PERF_COSIM_TRANSPORT=${PERF_COSIM_TRANSPORT:-grpc}
 PERF_OUTPUT_ROOT=${PERF_OUTPUT_ROOT:-outputs/ackermann_feedback_performance_filtered_r300_nofcd_threads8}
 PERF_ASSET_ROOT=${PERF_ASSET_ROOT:-/home/h-kawai/TeraSim/examples}
 PERF_CARLA_IMAGE=${PERF_CARLA_IMAGE:-carla-novnc:odaiba-perf-base}
@@ -112,13 +113,13 @@ for rhi in "${RHI_MODES[@]}"; do
             condition_dir="${PERF_OUTPUT_ROOT}/${condition}"
             mkdir -p "${condition_dir}"
             rm -f "${condition_dir}/carla_profile.jsonl" "${condition_dir}/terasim_profile.jsonl"
-            python3 - "${condition_dir}/manifest.json" "${rhi}" "${radius}" "${repeat}" "${PERF_WARMUP_STEPS}" "${PERF_MEASUREMENT_STEPS}" "${PERF_SUMO_THREADS}" "${ROUTE_FILE}" <<'PY'
+            python3 - "${condition_dir}/manifest.json" "${rhi}" "${radius}" "${repeat}" "${PERF_WARMUP_STEPS}" "${PERF_MEASUREMENT_STEPS}" "${PERF_SUMO_THREADS}" "${ROUTE_FILE}" "${PERF_COSIM_TRANSPORT}" <<'PY'
 import json, sys
-path, rhi, radius, repeat, warmup, measured, sumo_threads, route_file = sys.argv[1:]
+path, rhi, radius, repeat, warmup, measured, sumo_threads, route_file, transport = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as f:
     json.dump({"rhi": rhi, "radius_m": float(radius), "repeat": int(repeat), "warmup_steps": int(warmup),
                "measurement_steps": int(measured), "step_length_s": 0.05, "period_s": 0.2,
-               "sumo_threads": int(sumo_threads), "fcd_output": False,
+               "sumo_threads": int(sumo_threads), "fcd_output": False, "transport": transport,
                "route_file": route_file}, f, indent=2)
 PY
             echo "[${condition}] Starting dedicated CARLA..."
@@ -129,6 +130,7 @@ PY
             export CARLA_DOCKER_NETWORK="${PERF_NETWORK}" CARLA_HOST="${CARLA_CONTAINER}" CARLA_PORT=2000
             export TERASIM_CONFIG="${CONTAINER_OUTPUT_ROOT}/cosim_odaiba_period_0p2_cached_t500.yaml"
             export CARLA_COSIM_STEP_LENGTH="${PERF_STEP_LENGTH}" COSIM_EXPECTED_STEP_LENGTH="${PERF_STEP_LENGTH}" CARLA_COSIM_MAX_STEPS="${TOTAL_STEPS}"
+            export COSIM_TRANSPORT="${PERF_COSIM_TRANSPORT}"
             export CARLA_COSIM_ACKERMANN_FEEDBACK_MODE=apply CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS="*,AV" CARLA_COSIM_ACKERMANN_FEEDBACK_POSITION_MODE=moveTo
             export CARLA_COSIM_BATCH_TRANSFORM=1 CARLA_COSIM_BATCH_SPAWN=1
             export CARLA_COSIM_ACTOR_FILTER=1 CARLA_COSIM_ACTOR_FILTER_CENTER_ID=AV CARLA_COSIM_ACTOR_FILTER_RADIUS=300 CARLA_COSIM_ACTOR_FILTER_HYSTERESIS=20

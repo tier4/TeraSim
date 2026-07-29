@@ -227,6 +227,13 @@ class TeraSimCoSimDirectPlugin(TeraSimCoSimPlugin):
                 self._tick_requested.clear()
                 break
 
+        # Stop may have been requested while the simulation thread was inside
+        # Event.wait(). Do not consume an extra SUMO step during shutdown.
+        if self._stop_requested:
+            self.logger.info("Stopping simulation")
+            simulator.running = False
+            return False
+
         if getattr(self, "profile_steps_enabled", False):
             ctx["cosim_profile"] = {"terasim_internal": {}}
             ctx["_cosim_profile_step_start_perf"] = time.perf_counter()

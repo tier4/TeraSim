@@ -92,6 +92,9 @@ def _env_bool(name, default=False):
 class CarlaCosim(object):
     def __init__(self, args):
         self.args = args
+        # Keep CARLA blueprint selection independent from TeraSim/NDE's global
+        # RNG. This is required when both loops share one Python process.
+        self._random = random.Random()
 
         carla_random_seed = os.environ.get("CARLA_COSIM_RANDOM_SEED", "").strip()
         if carla_random_seed:
@@ -102,7 +105,7 @@ class CarlaCosim(object):
                     "CARLA_COSIM_RANDOM_SEED must be an integer, "
                     f"got {carla_random_seed!r}"
                 ) from exc
-            random.seed(self.carla_random_seed)
+            self._random.seed(self.carla_random_seed)
             print(f"CARLA co-sim random seed: {self.carla_random_seed}", flush=True)
 
         self.client = carla.Client(args.carla_host, args.carla_port)
@@ -131,6 +134,12 @@ class CarlaCosim(object):
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
+        # CARLA actors mirrored from SUMO are indexed by role_name for their
+        # entire lifetime. Rebuilding these dictionaries with
+        # world.get_actors() every tick is expensive on dense maps.
+        self._vehicle_actor_index = None
+        self._pedestrian_actor_index = None
+        self._pending_actor_index_entries = {}
         requested_vehicle_control_mode = (
             getattr(args, "vehicle_control_mode", None)
             or os.environ.get("CARLA_COSIM_VEHICLE_CONTROL_MODE")
@@ -350,8 +359,16 @@ class CarlaCosim(object):
         self.direct_link = None
         self._direct_tick_future = None
         self._direct_prev_state = None
+        inprocess_link = getattr(args, "inprocess_link", None)
         direct_addr = getattr(args, "direct_addr", None)
-        if direct_addr:
+        if inprocess_link is not None:
+            self.direct_link = inprocess_link
+            self._direct_prev_state = self._decode_link_state(
+                self.direct_link.get_state()
+            )
+            self.terasim = {"simulation_id": "inprocess"}
+            print("TeraSim in-process link ready.", flush=True)
+        elif direct_addr:
             # Direct (gRPC) mode: no Redis/FastAPI. The TeraSim runner
             # (terasim_service.run_direct) already owns the simulation; connect
             # and wait until it reaches wait_for_tick.
@@ -390,6 +407,16 @@ class CarlaCosim(object):
                 print(f"SUMO-CARLA coordinate offset: dx={self.sumo_carla_offset[0]:.2f}, dy={self.sumo_carla_offset[1]:.2f}")
             else:
                 print("Using projection-based coordinate transformation")
+
+    @staticmethod
+    def _decode_link_state(response):
+        """Return a Python state dict from either in-process or gRPC response."""
+        state = getattr(response, "state", None)
+        if state is not None:
+            return state
+        from .direct_link import parse_state_json
+
+        return parse_state_json(getattr(response, "state_json", ""))
 
     @staticmethod
     def _get_net_file_from_config(config_path):
@@ -718,17 +745,13 @@ class CarlaCosim(object):
         return True
 
     def _tick_ackermann_feedback_apply_direct(self):
-        import grpc as _grpc
-
-        from .direct_link import parse_state_json
-
         if self._direct_tick_future is not None:
             wait_started_at = time.perf_counter()
             try:
                 response = self._direct_tick_future.result(timeout=300.0)
-            except _grpc.RpcError as exc:
-                print(f"TeraSim direct tick failed: {exc}. Exiting...")
-                self._apply_ackermann_fail_closed_brake("direct_tick_rpc_error")
+            except Exception as exc:
+                print(f"TeraSim link tick failed: {exc}. Exiting...")
+                self._apply_ackermann_fail_closed_brake("cosim_link_tick_error")
                 return False
             completion_observed_at = time.perf_counter()
             self._profile_set(
@@ -741,7 +764,7 @@ class CarlaCosim(object):
                 self._apply_ackermann_fail_closed_brake(f"direct_status:{response.status}")
                 return False
             with self._profile_timer("terasim_roundtrip.state_decode_s"):
-                state = parse_state_json(response.state_json)
+                state = self._decode_link_state(response)
             if state is not None:
                 self._direct_prev_state = state
 
@@ -783,10 +806,11 @@ class CarlaCosim(object):
         }
         self._profile_set("feedback.command_count", len(commands))
         with self._profile_timer("feedback.bookkeeping_s"):
+            transport_name = getattr(self.direct_link, "transport_name", "grpc")
             self._finalize_ackermann_feedback_records(
                 feedback_records,
                 accepted=True,
-                reason="accepted_by_grpc_tick",
+                reason=f"accepted_by_{transport_name}_tick",
             )
         return True
 
@@ -861,21 +885,17 @@ class CarlaCosim(object):
         if self.ackermann_feedback_apply_enabled:
             return self._tick_ackermann_feedback_apply_direct()
 
-        import grpc as _grpc
-
-        from .direct_link import parse_state_json
-
         # Resolve the step requested on the previous tick.
         if self._direct_tick_future is not None:
             try:
                 resp = self._direct_tick_future.result(timeout=300.0)
-            except _grpc.RpcError as e:
-                print(f"TeraSim direct tick failed: {e}. Exiting...")
+            except Exception as e:
+                print(f"TeraSim link tick failed: {e}. Exiting...")
                 return False
             if resp.status in ("finished", "error"):
                 print(f"TeraSim ended (status={resp.status}). Exiting...")
                 return False
-            state = parse_state_json(resp.state_json)
+            state = self._decode_link_state(resp)
             if state is not None:
                 self._direct_prev_state = state
 
@@ -2183,13 +2203,13 @@ class CarlaCosim(object):
 
     def _select_vehicle_blueprint(self, veh_id, veh_info):
         if "BIKE" in veh_info["type"]:
-            blueprint = random.choice(self.bike_blueprints)
+            blueprint = self._random.choice(self.bike_blueprints)
         elif "MOTOR" in veh_info["type"]:
-            blueprint = random.choice(self.motor_blueprints)
+            blueprint = self._random.choice(self.motor_blueprints)
         elif "POLICE" in veh_info["type"]:
-            blueprint = random.choice(self.police_car_blueprints)
+            blueprint = self._random.choice(self.police_car_blueprints)
         else:
-            blueprint = random.choice(self.vehicle_blueprints)
+            blueprint = self._random.choice(self.vehicle_blueprints)
         blueprint = self._fresh_blueprint(blueprint)
         blueprint.set_attribute("role_name", veh_id)
         if veh_id == AV_SUMO_ID:
@@ -2200,11 +2220,11 @@ class CarlaCosim(object):
 
     def _select_vru_blueprint(self, vru_id, vru_info):
         if "BIKE" in vru_info["type"]:
-            blueprint = random.choice(self.bike_blueprints)
+            blueprint = self._random.choice(self.bike_blueprints)
         elif "MOTOR" in vru_info["type"]:
-            blueprint = random.choice(self.motor_blueprints)
+            blueprint = self._random.choice(self.motor_blueprints)
         else:
-            blueprint = random.choice(self.pedestrian_blueprints)
+            blueprint = self._random.choice(self.pedestrian_blueprints)
         blueprint = self._fresh_blueprint(blueprint)
         blueprint.set_attribute("role_name", vru_id)
         return blueprint
@@ -2283,12 +2303,23 @@ class CarlaCosim(object):
 
             actor = self.world.get_actor(response.actor_id)
             if actor is None:
+                target_index = request.get("actor_index")
+                index_kind = (
+                    "vehicle"
+                    if target_index is self._vehicle_actor_index
+                    else "pedestrian"
+                )
+                self._pending_actor_index_entries[actor_id] = (
+                    index_kind,
+                    response.actor_id,
+                )
                 self._record_spawn_failure(
                     actor_type, actor_id, request["sumo_location"], request["current_frame"]
                 )
                 continue
 
             self._clear_spawn_failure(actor_type, actor_id)
+            self._pending_actor_index_entries.pop(actor_id, None)
             actor_index = request.get("actor_index")
             if actor_index is not None:
                 actor_index[actor_id] = actor
@@ -2339,7 +2370,14 @@ class CarlaCosim(object):
         return self.client.apply_batch_sync(transform_batch, False)
 
     def _build_actor_role_indexes(self):
-        """Build role_name indexes once per tick instead of scanning CARLA per actor."""
+        """Return persistent role_name indexes, scanning CARLA only once."""
+        if (
+            self._vehicle_actor_index is not None
+            and self._pedestrian_actor_index is not None
+        ):
+            self._refresh_persistent_actor_indexes()
+            return self._vehicle_actor_index, self._pedestrian_actor_index
+
         vehicle_actor_index = {}
         pedestrian_actor_index = {}
         actors = self.world.get_actors()
@@ -2356,7 +2394,35 @@ class CarlaCosim(object):
         self._last_actor_index_world_actor_count = world_actor_count
         self._last_actor_index_vehicle_actor_count = len(vehicle_actor_index)
         self._last_actor_index_pedestrian_actor_count = len(pedestrian_actor_index)
+        self._vehicle_actor_index = vehicle_actor_index
+        self._pedestrian_actor_index = pedestrian_actor_index
         return vehicle_actor_index, pedestrian_actor_index
+
+    def _refresh_persistent_actor_indexes(self):
+        """Resolve deferred spawns and discard actors CARLA already destroyed."""
+        for actor_index in (
+            self._vehicle_actor_index or {},
+            self._pedestrian_actor_index or {},
+        ):
+            for role_name, actor in list(actor_index.items()):
+                try:
+                    alive = actor is not None and actor.is_alive
+                except Exception:
+                    alive = False
+                if not alive:
+                    actor_index.pop(role_name, None)
+
+        for role_name, (index_kind, carla_id) in list(
+            self._pending_actor_index_entries.items()
+        ):
+            actor = self.world.get_actor(carla_id)
+            if actor is None:
+                continue
+            if index_kind == "vehicle":
+                self._vehicle_actor_index[role_name] = actor
+            else:
+                self._pedestrian_actor_index[role_name] = actor
+            self._pending_actor_index_entries.pop(role_name, None)
 
     @staticmethod
     def _vru_uses_vehicle_blueprint(vru_info):
@@ -2689,19 +2755,59 @@ class CarlaCosim(object):
             self._apply_vru_walker_control(vru_info, sumo_angle, pedestrian)
 
     def _cleanup_actors(self, actor_type, pattern, cosim_id_record):
-        """Clean up CARLA actors not in the cosim actor record."""
+        """Batch-destroy stale indexed actors without scanning the CARLA world."""
         # Protect ego (and any other role names passed via protected_roles). In 3-cosim the
-        # psim ego has role_name "ego_vehicle", which must not be destroyed as a "stale" actor.
-        protected = getattr(self.args, "protected_roles", None) or ["AV"]
-        actors_to_destroy = [
-            actor
-            for actor in self.world.get_actors().filter(pattern)
-            if actor.attributes.get("role_name") not in cosim_id_record
-            and actor.attributes.get("role_name") not in protected
-        ]
+        # psim ego has role_name "ego_vehicle", which must not be destroyed as a stale actor.
+        protected = set(getattr(self.args, "protected_roles", None) or ["AV"])
+        if actor_type == "vehicle":
+            actor_index = self._vehicle_actor_index or {}
+        else:
+            actor_index = self._pedestrian_actor_index or {}
 
-        for actor in actors_to_destroy:
-            actor.destroy()
+        stale_roles = [
+            role_name
+            for role_name in actor_index
+            if role_name not in cosim_id_record and role_name not in protected
+        ]
+        stale_actors = [
+            actor_index[role_name]
+            for role_name in stale_roles
+            if actor_index.get(role_name) is not None
+        ]
+        stale_pending_roles = [
+            role_name
+            for role_name, (pending_type, _carla_id) in self._pending_actor_index_entries.items()
+            if pending_type == actor_type
+            and role_name not in cosim_id_record
+            and role_name not in protected
+        ]
+        stale_pending_ids = [
+            self._pending_actor_index_entries[role_name][1]
+            for role_name in stale_pending_roles
+        ]
+        if stale_actors or stale_pending_ids:
+            destroy_commands = [
+                carla.command.DestroyActor(actor.id) for actor in stale_actors
+            ]
+            destroy_commands.extend(
+                carla.command.DestroyActor(actor_id) for actor_id in stale_pending_ids
+            )
+            try:
+                self.client.apply_batch_sync(destroy_commands, False)
+            except Exception as exc:
+                print(
+                    f"Warning: CARLA stale {actor_type} batch cleanup failed: {exc}",
+                    flush=True,
+                )
+                for actor in stale_actors:
+                    try:
+                        actor.destroy()
+                    except Exception:
+                        pass
+        for role_name in stale_roles:
+            actor_index.pop(role_name, None)
+        for role_name in stale_pending_roles:
+            self._pending_actor_index_entries.pop(role_name, None)
 
     def close(self):
         """

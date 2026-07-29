@@ -77,22 +77,22 @@ def main(root_arg):
             "detail_python_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_breakdown.python.total_s")}
         summaries.append(row)
     (root/"summary.json").write_text(json.dumps(summaries,indent=2)+"\n")
-    header=["RHI","radius","samples","SUMO all","exported","CARLA","physics avg/max","detail avg","total avg/p95 ms","<=50ms","RTF","world.tick ms","TeraSim ms","SUMO step ms","behavior ms","state export ms"]
+    header=["transport","RHI","radius","samples","SUMO all","exported","CARLA","physics avg/max","detail avg","total avg/p95 ms","<=50ms","RTF","world.tick ms","TeraSim ms","SUMO step ms","behavior ms","state export ms"]
     lines=["# Ackermann feedback performance","","| "+" | ".join(header)+" |","|"+"---|"*len(header)]
     for r in summaries:
-        cells=[r["rhi"],f'{r["radius_m"]:.0f}m',str(r["samples"]),f'{r["sumo_total_vehicles_mean"]:.1f}',f'{r["exported_vehicles_mean"]:.1f}',f'{r["carla_vehicles_mean"]:.1f}',f'{r["physics_vehicles_mean"]:.1f}/{r["physics_vehicles_max"]:.0f}',f'{r["detail_vehicles_mean"]:.1f}',f'{r["total_mean_ms"]:.1f}/{r["total_p95_ms"]:.1f}',f'{r["deadline_50ms_pct"]:.0f}%',f'{r["realtime_factor"]:.2f}',f'{r["world_tick_mean_ms"]:.1f}',f'{r["terasim_internal_mean_ms"]:.1f}',f'{r["sumo_step_mean_ms"]:.1f}',f'{r["behavior_mean_ms"]:.1f}',f'{r["state_export_mean_ms"]:.1f}']
+        cells=[r.get("transport","grpc"),r["rhi"],f'{r["radius_m"]:.0f}m',str(r["samples"]),f'{r["sumo_total_vehicles_mean"]:.1f}',f'{r["exported_vehicles_mean"]:.1f}',f'{r["carla_vehicles_mean"]:.1f}',f'{r["physics_vehicles_mean"]:.1f}/{r["physics_vehicles_max"]:.0f}',f'{r["detail_vehicles_mean"]:.1f}',f'{r["total_mean_ms"]:.1f}/{r["total_p95_ms"]:.1f}',f'{r["deadline_50ms_pct"]:.0f}%',f'{r["realtime_factor"]:.2f}',f'{r["world_tick_mean_ms"]:.1f}',f'{r["terasim_internal_mean_ms"]:.1f}',f'{r["sumo_step_mean_ms"]:.1f}',f'{r["behavior_mean_ms"]:.1f}',f'{r["state_export_mean_ms"]:.1f}']
         lines.append("| "+" | ".join(cells)+" |")
     lines.extend([
         "",
         "## Feedback command ingestion breakdown",
         "",
-        "| RHI | radius | commands | ingestion ms | handler ms | parse ms | position ms | TraCI ms | getLaneID ms | moveTo ms | setPreviousSpeed ms | projection ms | residual ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| transport | RHI | radius | commands | ingestion ms | handler ms | parse ms | position ms | TraCI ms | getLaneID ms | moveTo ms | setPreviousSpeed ms | projection ms | residual ms |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for r in summaries:
         residual = max(0.0, r["feedback_total_mean_ms"] - r["feedback_parse_mean_ms"] - r["feedback_position_mean_ms"] - r["feedback_set_previous_speed_mean_ms"])
         cells = [
-            r["rhi"], f'{r["radius_m"]:.0f}m', f'{r["feedback_commands_mean"]:.1f}',
+            r.get("transport", "grpc"), r["rhi"], f'{r["radius_m"]:.0f}m', f'{r["feedback_commands_mean"]:.1f}',
             f'{r["feedback_ingestion_mean_ms"]:.2f}', f'{r["feedback_total_mean_ms"]:.2f}',
             f'{r["feedback_parse_mean_ms"]:.2f}', f'{r["feedback_position_mean_ms"]:.2f}',
             f'{r["feedback_traci_mean_ms"]:.2f}', f'{r["feedback_get_lane_mean_ms"]:.2f}',

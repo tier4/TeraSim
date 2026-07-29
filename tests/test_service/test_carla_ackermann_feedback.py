@@ -52,6 +52,10 @@ class FakeCommand:
     def SetSimulatePhysics(actor_id, enabled):
         return ("simulate_physics", actor_id, enabled)
 
+    @staticmethod
+    def DestroyActor(actor_id):
+        return ("destroy", actor_id)
+
 
 class FakeVehicleAckermannControl:
     def __init__(self, steer=0.0, speed=0.0, acceleration=0.0, jerk=0.0):
@@ -1455,3 +1459,174 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
     assert record["pure_pursuit_raw_steer"] == pytest.approx(0.7)
     assert record["pure_pursuit_clamped_steer"] == pytest.approx(0.6)
     assert record["pure_pursuit_command_steer"] == pytest.approx(0.55)
+
+
+def test_carla_actor_role_index_is_persistent_and_cleanup_is_batched():
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    actors = [
+        types.SimpleNamespace(
+            id=1, type_id="vehicle.test", attributes={"role_name": "AV"}, is_alive=True
+        ),
+        types.SimpleNamespace(
+            id=2,
+            type_id="vehicle.test",
+            attributes={"role_name": "stale"},
+            is_alive=True,
+        ),
+        types.SimpleNamespace(
+            id=3,
+            type_id="walker.pedestrian.test",
+            attributes={"role_name": "VRU_1"},
+            is_alive=True,
+        ),
+    ]
+    scans = []
+    batches = []
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = types.SimpleNamespace(
+        get_actors=lambda: scans.append("scan") or actors
+    )
+    cosim.client = types.SimpleNamespace(
+        apply_batch_sync=lambda commands, due_tick: batches.append(
+            (commands, due_tick)
+        )
+    )
+    cosim.args = types.SimpleNamespace(protected_roles=["AV"])
+    cosim._vehicle_actor_index = None
+    cosim._pedestrian_actor_index = None
+    cosim._pending_actor_index_entries = {}
+
+    first_vehicle, first_pedestrian = cosim._build_actor_role_indexes()
+    second_vehicle, second_pedestrian = cosim._build_actor_role_indexes()
+
+    assert scans == ["scan"]
+    assert first_vehicle is second_vehicle
+    assert first_pedestrian is second_pedestrian
+    assert set(first_vehicle) == {"AV", "stale"}
+    cosim._cleanup_actors("vehicle", "vehicle.*", {"AV"})
+    assert len(batches) == 1
+    assert len(batches[0][0]) == 1
+    assert batches[0][1] is False
+    assert set(first_vehicle) == {"AV"}
+
+
+def test_traffic_light_static_information_is_cached():
+    from terasim_service.plugins.cosim import TeraSimCoSimPlugin
+
+    network_calls = []
+    program = types.SimpleNamespace(getParams=lambda: {"offset": "1"})
+    tls = types.SimpleNamespace(getPrograms=lambda: {"p0": program})
+    plugin = TeraSimCoSimPlugin.__new__(TeraSimCoSimPlugin)
+    plugin.traffic_light_information_cache = {}
+    plugin.simulator = types.SimpleNamespace(
+        sumo_net=types.SimpleNamespace(
+            getTLS=lambda traffic_light_id: network_calls.append(traffic_light_id)
+            or tls
+        )
+    )
+
+    first = plugin._get_traffic_light_information("tls_0")
+    second = plugin._get_traffic_light_information("tls_0")
+
+    assert first == second
+    assert json.loads(first) == {
+        "programs": {"p0": {"parameters": {"offset": "1"}}}
+    }
+    assert network_calls == ["tls_0"]
+
+
+def test_agent_command_accepts_structured_dict_without_json_roundtrip():
+    from terasim_service.plugins.cosim import TeraSimCoSimPlugin
+    from terasim_service.utils import AgentCommand
+
+    plugin = TeraSimCoSimPlugin.__new__(TeraSimCoSimPlugin)
+    applied = []
+    plugin._apply_agent_command = lambda command, parse_elapsed=0.0: applied.append(
+        (command, parse_elapsed)
+    ) or True
+
+    assert plugin._handle_agent_command(
+        {
+            "agent_id": "AV",
+            "agent_type": "vehicle",
+            "command_type": "set_state",
+            "data": {"position": [1.0, 2.0]},
+        }
+    )
+    assert isinstance(applied[0][0], AgentCommand)
+    assert applied[0][0].agent_id == "AV"
+    assert applied[0][1] >= 0.0
+
+
+def test_inprocess_link_transfers_python_objects_and_tracks_generation():
+    import threading
+
+    from terasim_service.plugins.cosim_inprocess import (
+        InProcessLink,
+        TeraSimCoSimInProcessPlugin,
+    )
+    from terasim_service.utils import AgentCommand
+
+    plugin = TeraSimCoSimInProcessPlugin.__new__(TeraSimCoSimInProcessPlugin)
+    plugin._lock = threading.Lock()
+    plugin._status = "wait_for_tick"
+    plugin._state = {"simulation_time": 0.0}
+    plugin._completed_sumo_time = 0.0
+    plugin._completed_tick_count = 0
+    plugin._completed_generation = 0
+    plugin._requested_generation = 0
+    plugin._request_in_flight = False
+    plugin._stop_requested = False
+    plugin._pending_commands = []
+    plugin._tick_requested = threading.Event()
+    plugin._step_done = threading.Event()
+
+    link = InProcessLink(plugin, ready_timeout=0.1)
+    future = link.tick_async(
+        [
+            {
+                "agent_id": "AV",
+                "agent_type": "vehicle",
+                "command_type": "set_state",
+                "data": {"position": [1.0, 2.0]},
+            }
+        ]
+    )
+    assert plugin._tick_requested.is_set()
+    assert isinstance(plugin._pending_commands[0], AgentCommand)
+    with plugin._lock:
+        plugin._state = {"simulation_time": 0.05}
+        plugin._completed_sumo_time = 0.05
+        plugin._completed_tick_count = 1
+        plugin._completed_generation = 1
+        plugin._request_in_flight = False
+        plugin._status = "ticked"
+    plugin._step_done.set()
+
+    response = future.result(timeout=0.1)
+    assert response.state == {"simulation_time": 0.05}
+    assert response.completed_tick_count == 1
+
+
+def test_inprocess_state_conversion_returns_nested_plain_dicts():
+    from terasim_service.plugins.cosim_inprocess import TeraSimCoSimInProcessPlugin
+    from terasim_service.utils import AgentStateSimplified, SimulationState, SUMOSignal
+
+    state = SimulationState(
+        simulation_time=1.25,
+        agent_count={"vehicle": 1},
+        agent_details={
+            "vehicle": {"AV": AgentStateSimplified(x=1.0, speed=2.0)}
+        },
+        traffic_light_details={"tls": SUMOSignal(tls="Gr")},
+    )
+
+    plain = TeraSimCoSimInProcessPlugin._simulation_state_to_plain_dict(state)
+
+    assert type(plain) is dict
+    assert type(plain["agent_details"]["vehicle"]["AV"]) is dict
+    assert plain["agent_details"]["vehicle"]["AV"]["speed"] == pytest.approx(2.0)
+    assert type(plain["traffic_light_details"]["tls"]) is dict
+    assert plain["traffic_light_details"]["tls"]["tls"] == "Gr"

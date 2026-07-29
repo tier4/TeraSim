@@ -4,6 +4,7 @@ set -euo pipefail
 CARLA_HOST=${CARLA_HOST:-carla-novnc-test}
 CARLA_PORT=${CARLA_PORT:-2000}
 GRPC_PORT=${GRPC_PORT:-8200}
+COSIM_TRANSPORT=${COSIM_TRANSPORT:-grpc}
 TERASIM_CONFIG=${TERASIM_CONFIG:-/app/examples/scenarios/cosim_odaiba_tlmappings_0708.yaml}
 CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.1}
 CARLA_COSIM_MAP_NAME=${CARLA_COSIM_MAP_NAME:-}
@@ -107,29 +108,45 @@ fi
 echo "[2/4] Checking CARLA ${CARLA_HOST}:${CARLA_PORT}..."
 python3 -u -c "import carla; c=carla.Client('${CARLA_HOST}', int('${CARLA_PORT}')); c.set_timeout(30); print('CARLA server version:', c.get_server_version())"
 
-echo "[3/4] Starting TeraSim direct gRPC runner on 127.0.0.1:${GRPC_PORT}..."
-python3 -m terasim_service.run_direct \
-    --config "${TERASIM_CONFIG}" \
-    --grpc_port "${GRPC_PORT}" >"${DIRECT_LOG}" 2>&1 &
-DIRECT_PID=$!
-
-CARLA_COSIM_ARGS=(
-    --terasim_config "${TERASIM_CONFIG}"
-    --carla_host "${CARLA_HOST}"
-    --carla_port "${CARLA_PORT}"
-    --carla_timeout 600
-    --direct_addr "127.0.0.1:${GRPC_PORT}"
-    --step_length "${CARLA_COSIM_STEP_LENGTH}"
-    --vehicle_control_mode "${CARLA_COSIM_VEHICLE_CONTROL_MODE}"
-)
-if [[ -n "${CARLA_COSIM_MAP_NAME}" ]]; then
-    CARLA_COSIM_ARGS+=(--map_name "${CARLA_COSIM_MAP_NAME}")
-fi
-
-echo "[4/4] Starting synchronous Ackermann feedback co-simulation..."
+echo "[3/4] Preparing ${COSIM_TRANSPORT} TeraSim/CARLA transport..."
 echo "  feedback=${CARLA_COSIM_ACKERMANN_FEEDBACK_MODE:-off} actors=${CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS:-}"
 echo "  SUMO noVNC: http://localhost:${SUMO_NOVNC_PORT:-6093}/vnc.html"
-python3 /app/examples/scripts/carla_cosim_main.py "${CARLA_COSIM_ARGS[@]}" &
+if [[ "${COSIM_TRANSPORT}" == "inprocess" ]]; then
+    INPROCESS_ARGS=(
+        --config "${TERASIM_CONFIG}"
+        --carla_host "${CARLA_HOST}"
+        --carla_port "${CARLA_PORT}"
+        --carla_timeout 600
+        --step_length "${CARLA_COSIM_STEP_LENGTH}"
+        --vehicle_control_mode "${CARLA_COSIM_VEHICLE_CONTROL_MODE}"
+    )
+    if [[ -n "${CARLA_COSIM_MAP_NAME}" ]]; then
+        INPROCESS_ARGS+=(--map_name "${CARLA_COSIM_MAP_NAME}")
+    fi
+    echo "[4/4] Starting single-process Ackermann feedback co-simulation..."
+    python3 -m terasim_service.run_inprocess "${INPROCESS_ARGS[@]}" &
+else
+    echo "Starting TeraSim direct gRPC runner on 127.0.0.1:${GRPC_PORT}..."
+    python3 -m terasim_service.run_direct \
+        --config "${TERASIM_CONFIG}" \
+        --grpc_port "${GRPC_PORT}" >"${DIRECT_LOG}" 2>&1 &
+    DIRECT_PID=$!
+
+    CARLA_COSIM_ARGS=(
+        --terasim_config "${TERASIM_CONFIG}"
+        --carla_host "${CARLA_HOST}"
+        --carla_port "${CARLA_PORT}"
+        --carla_timeout 600
+        --direct_addr "127.0.0.1:${GRPC_PORT}"
+        --step_length "${CARLA_COSIM_STEP_LENGTH}"
+        --vehicle_control_mode "${CARLA_COSIM_VEHICLE_CONTROL_MODE}"
+    )
+    if [[ -n "${CARLA_COSIM_MAP_NAME}" ]]; then
+        CARLA_COSIM_ARGS+=(--map_name "${CARLA_COSIM_MAP_NAME}")
+    fi
+    echo "[4/4] Starting gRPC Ackermann feedback co-simulation..."
+    python3 /app/examples/scripts/carla_cosim_main.py "${CARLA_COSIM_ARGS[@]}" &
+fi
 COSIM_PID=$!
 wait "${COSIM_PID}"
 COSIM_STATUS=$?

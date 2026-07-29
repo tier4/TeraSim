@@ -368,6 +368,15 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         self.state_detail_active_vehicle_ids = set()
         self.vehicle_static_state_cache = {}
+        # lon/lat are not consumed by CARLA. Keep them enabled by default for
+        # the Redis/gRPC API contract; the in-process runner disables them.
+        self.state_export_geo_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_STATE_EXPORT_GEO", True
+        )
+        self.traffic_light_information_cache = {}
+        self.traffic_light_id_cache = None
+        self._current_vehicle_id_set = set()
+        self._current_person_id_set = set()
         self.state_context_subscription_enabled = self._parse_bool_env(
             "TERASIM_COSIM_STATE_CONTEXT_SUBSCRIPTION", True
         )
@@ -1110,8 +1119,12 @@ class TeraSimCoSimPlugin(BasePlugin):
         # Add more control command handling logic as needed
 
     def get_vehicle_vru_ids(self):
-        """Get all vehicle and VRU IDs in the simulation."""
-        all_ids = list(set(traci.vehicle.getIDList() + traci.person.getIDList()))
+        """Get all vehicle and VRU IDs and retain the per-step type sets."""
+        vehicle_id_list = traci.vehicle.getIDList()
+        person_id_list = traci.person.getIDList()
+        self._current_vehicle_id_set = set(vehicle_id_list)
+        self._current_person_id_set = set(person_id_list)
+        all_ids = list(self._current_vehicle_id_set | self._current_person_id_set)
         # Separate by type: construction objects, VRUs, and regular vehicles
         construction_ids = [id for id in all_ids if id.startswith("CONSTRUCTION_")]
         vru_ids = [id for id in all_ids if "VRU" in id and id not in construction_ids]
@@ -1663,6 +1676,21 @@ class TeraSimCoSimPlugin(BasePlugin):
             profile_ctx=profile_ctx,
         )
 
+    def _get_traffic_light_information(self, traffic_light_id):
+        """Return cached JSON for immutable SUMO network signal metadata."""
+        information = self.traffic_light_information_cache.get(traffic_light_id)
+        if information is not None:
+            return information
+        tls_information = {"programs": {}}
+        tls = self.simulator.sumo_net.getTLS(traffic_light_id)
+        for program_id, program in tls.getPrograms().items():
+            tls_information["programs"][program_id] = {
+                "parameters": program.getParams()
+            }
+        information = json.dumps(tls_information, separators=(",", ":"))
+        self.traffic_light_information_cache[traffic_light_id] = information
+        return information
+
     def _build_simulation_state(self, simulator):
         """Collect the current simulation state from SUMO into a SimulationState.
 
@@ -1735,7 +1763,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             if sumo_angle is None:
                 sumo_angle = traci.vehicle.getAngle(vid)
             vehicle_state.sumo_angle = sumo_angle
-            vehicle_state.orientation = np.radians(
+            vehicle_state.orientation = math.radians(
                 (90 - vehicle_state.sumo_angle) % 360
             )
             speed = context_values.get(traci.constants.VAR_SPEED)
@@ -1779,15 +1807,16 @@ class TeraSimCoSimPlugin(BasePlugin):
                     context_values=context_values,
                     profile_ctx=profile_ctx,
                 )
-                vehicle_state.lon, vehicle_state.lat = (
-                    self._profile_detail_traci_call(
-                        profile_ctx,
-                        "simulation_convert_geo",
-                        traci.simulation.convertGeo,
-                        vehicle_state.x,
-                        vehicle_state.y,
+                if self.state_export_geo_enabled:
+                    vehicle_state.lon, vehicle_state.lat = (
+                        self._profile_detail_traci_call(
+                            profile_ctx,
+                            "simulation_convert_geo",
+                            traci.simulation.convertGeo,
+                            vehicle_state.x,
+                            vehicle_state.y,
+                        )
                     )
-                )
                 if vid == "AV" or self._is_ackermann_feedback_actor(vid):
                     try:
                         vehicle_state.sumo_desired_speed = (
@@ -1834,10 +1863,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                 )
                 dt = now_time - last_time
                 if dt > 0:
-                    dtheta = np.arctan2(
-                        np.sin(now_orientation - last_orientation),
-                        np.cos(now_orientation - last_orientation),
-                    )
+                    angle_delta = now_orientation - last_orientation
+                    dtheta = math.atan2(math.sin(angle_delta), math.cos(angle_delta))
                     vehicle_state.angular_velocity = dtheta / dt
                 self.last_orientations[vid] = (now_orientation, now_time)
                 add_timing(
@@ -1873,9 +1900,9 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Add VRU states
         vru_collection_start = time.perf_counter()
-        # Get current vehicle and person lists to determine actual object type
-        current_vehicle_list = traci.vehicle.getIDList()
-        current_person_list = traci.person.getIDList()
+        # Reuse the type sets collected at the start of this state export.
+        current_vehicle_list = self._current_vehicle_id_set
+        current_person_list = self._current_person_id_set
 
         vrus = {}
         for vru_id in vru_ids:
@@ -1957,25 +1984,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             time.perf_counter() - construction_collection_start,
         )
 
-        # Add traffic light states
+        # Add dynamic signal phases while reusing immutable program metadata.
         traffic_light_export_start = time.perf_counter()
         traffic_lights = {}
-        for tl_id in traci.trafficlight.getIDList():
+        if self.traffic_light_id_cache is None:
+            self.traffic_light_id_cache = tuple(traci.trafficlight.getIDList())
+        for tl_id in self.traffic_light_id_cache:
             sumo_signal = SUMOSignal()
-            sumo_signal.x, sumo_signal.y = 0,0
+            sumo_signal.x, sumo_signal.y = 0, 0
             sumo_signal.tls = traci.trafficlight.getRedYellowGreenState(tl_id)
-            tls_information = {
-                "programs": {}
-            }
-            tls = self.simulator.sumo_net.getTLS(tl_id)
-            programs = tls.getPrograms()
-            for program_id, program in programs.items():
-                # Get the program parameters
-                program_parameters = program.getParams()
-                tls_information["programs"][program_id] = {
-                    "parameters": program_parameters
-                }
-            sumo_signal.information = json.dumps(tls_information)
+            sumo_signal.information = self._get_traffic_light_information(tl_id)
             traffic_lights[tl_id] = sumo_signal
 
         simulation_state.traffic_light_details = traffic_lights
@@ -2075,19 +2093,35 @@ class TeraSimCoSimPlugin(BasePlugin):
             return True
 
     def _handle_agent_command(self, command_data):
-        """Handle agent control commands.
-        
-        Args:
-            command_data (str): The agent command data.
-        """
+        """Validate a wire command and delegate to the shared structured path."""
+        parse_start = time.perf_counter()
+        try:
+            if isinstance(command_data, AgentCommand):
+                command = command_data
+            elif isinstance(command_data, dict):
+                command = AgentCommand.model_validate(command_data)
+            else:
+                if isinstance(command_data, bytes):
+                    command_data = command_data.decode("utf-8")
+                command = AgentCommand.model_validate_json(command_data)
+        except Exception as exc:
+            self.last_agent_command_failure = {
+                "reason": "agent_command_parse_error",
+                "exception_type": type(exc).__name__,
+            }
+            self.logger.error(f"Error parsing agent command: {exc}")
+            return False
+        return self._apply_agent_command(
+            command, parse_elapsed=time.perf_counter() - parse_start
+        )
+
+    def _apply_agent_command(self, command, parse_elapsed=0.0):
+        """Apply an already validated command; shared by all transports."""
         self.last_agent_command_failure = None
         profile_ctx = getattr(self, "_active_agent_command_profile_ctx", None)
         feedback_command_start = time.perf_counter()
         is_ackermann_feedback = False
         try:
-            parse_start = time.perf_counter()
-            command = AgentCommand.model_validate_json(command_data.decode("utf-8"))
-            parse_elapsed = time.perf_counter() - parse_start
             if command.agent_id != '':
                 if command.agent_type not in ["vehicle", "vru"]:
                     self.logger.error(f"Invalid agent type: {command.agent_type}")
@@ -2310,7 +2344,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                             return False
             
 
-                self.logger.debug(f"Agent command executed: {command_data}")
+                self.logger.debug(f"Agent command executed: {command}")
                 return True
 
         except Exception as e:
@@ -2631,5 +2665,4 @@ class TeraSimCoSimPlugin(BasePlugin):
                 
         except Exception as e:
             self.logger.error(f"Failed to start visualization service: {e}")
-
 

@@ -22,6 +22,8 @@ _MSG_OPTIONS = [
 class DirectLink:
     """gRPC connection to a TeraSimCoSimDirectPlugin server."""
 
+    transport_name = "grpc"
+
     def __init__(self, address: str, ready_timeout: float = 600.0):
         """Connect and wait until the simulation reaches wait_for_tick.
 
