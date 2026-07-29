@@ -101,6 +101,95 @@ def test_lane_lookahead_crosses_internal_and_destination_lanes():
     assert point == pytest.approx((15.0, 0.0, 1.5))
 
 
+def test_batched_lane_lookahead_matches_scalar_results():
+    from terasim_service.utils.sumo_lane_geometry import (
+        compile_lane_shapes,
+        find_lookahead_position_from_lane_shapes,
+        find_lookahead_positions_from_compiled_paths,
+    )
+
+    lane_shapes = [
+        [(0.0, 0.0), (10.0, 0.0)],
+        [(10.0, 0.0), (10.0, 10.0)],
+    ]
+    compiled = compile_lane_shapes(lane_shapes)
+    positions = [(8.0, 0.0), (10.0, 2.0), (10.0, 9.0)]
+    distances = [5.0, 5.0, 5.0]
+    z_values = [1.0, 2.0, 3.0]
+
+    expected = [
+        find_lookahead_position_from_lane_shapes(
+            lane_shapes, position, distance, z
+        )
+        for position, distance, z in zip(positions, distances, z_values)
+    ]
+    actual = find_lookahead_positions_from_compiled_paths(
+        [compiled, compiled, compiled], positions, distances, z_values
+    )
+
+    for actual_point, expected_point in zip(actual, expected):
+        assert actual_point == pytest.approx(expected_point)
+
+
+def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = types.SimpleNamespace(VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3)
+    lane_shapes = {
+        "edge_0_0": [(0.0, 0.0), (10.0, 0.0)],
+        ":junction_0_0": [(10.0, 0.0), (12.0, 0.0)],
+        "edge_1_0": [(12.0, 0.0), (30.0, 0.0)],
+    }
+    shape_calls = []
+    next_link_calls = []
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda lane_id: shape_calls.append(lane_id) or lane_shapes[lane_id]
+    )
+    fake_vehicle = types.SimpleNamespace(
+        getLaneID=lambda _vehicle_id: (_ for _ in ()).throw(
+            AssertionError("context lane ID must be reused")
+        ),
+        getNextLinks=lambda vehicle_id: next_link_calls.append(vehicle_id) or [
+            ("edge_1_0", ":junction_0_0", True, True, False, "G", "s", 2.0)
+        ],
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=fake_lane,
+            vehicle=fake_vehicle,
+        ),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.lookahead_path_cache = {}
+    plugin.lookahead_lane_shape_cache = {}
+    plugin.lookahead_geometry_cache = {}
+    context_values = {
+        constants.VAR_LANE_ID: "edge_0_0",
+        constants.VAR_ROUTE_ID: "route_a",
+    }
+
+    first = plugin._get_vehicle_lookahead_compiled_path(
+        "AV", context_values=context_values
+    )
+    second = plugin._get_vehicle_lookahead_compiled_path(
+        "AV", context_values=context_values
+    )
+    context_values[constants.VAR_ROUTE_ID] = "route_b"
+    after_reroute = plugin._get_vehicle_lookahead_compiled_path(
+        "AV", context_values=context_values
+    )
+
+    assert first is second
+    assert first is after_reroute
+    assert next_link_calls == ["AV", "AV"]
+    assert shape_calls == ["edge_0_0", ":junction_0_0", "edge_1_0"]
+    assert len(plugin.lookahead_geometry_cache) == 1
+
+
 def test_route_aware_projection_switches_lane_after_centerline_midpoint():
     from terasim_service.utils.sumo_lane_geometry import (
         select_route_aware_lane_projection,
@@ -344,6 +433,11 @@ def _state_subscription_constants():
         VAR_SPEED=5,
         VAR_ACCELERATION=6,
         CMD_GET_VEHICLE_VARIABLE=7,
+        VAR_LANE_ID=8,
+        VAR_LANEPOSITION=9,
+        VAR_LANEPOSITION_LAT=10,
+        VAR_NEXT_LINKS=11,
+        VAR_ROUTE_ID=12,
     )
 
 
@@ -416,6 +510,10 @@ def test_state_filter_uses_context_subscription_without_per_vehicle_position_que
                 constants.VAR_ANGLE,
                 constants.VAR_SPEED,
                 constants.VAR_ACCELERATION,
+                constants.VAR_LANE_ID,
+                constants.VAR_LANEPOSITION,
+                constants.VAR_LANEPOSITION_LAT,
+                constants.VAR_ROUTE_ID,
             ],
         )
     ]

@@ -19,8 +19,9 @@ from .base import BasePlugin, DEFAULT_REDIS_CONFIG
 
 from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentCommand
 from ..utils.sumo_lane_geometry import (
+    compile_lane_shapes,
     extract_next_link_lane_ids,
-    find_lookahead_position_from_lane_shapes,
+    find_lookahead_positions_from_compiled_paths,
     project_position_by_sumo_angle,
     reconstruct_position_from_lane_geometry,
     select_route_aware_lane_projection,
@@ -280,7 +281,10 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         # Initialize last orientations cache
         self.last_orientations = {}  # {vehicle_id: (last_orientation, last_time)}
-        self.lookahead_path_cache = {}  # {vehicle_id: [lane_shape, ...]}
+        self.lookahead_path_cache = {}  # {vehicle_id: compiled route geometry}
+        self.lookahead_lane_shape_cache = {}  # {lane_id: immutable lane shape}
+        self.lookahead_geometry_cache = {}  # {lane ID tuple: compiled route geometry}
+        self.lookahead_vehicle_route_cache = {}  # {vehicle_id: {lane_id: next lane IDs}}
         
         # Initialize health monitoring
         self.error_count = 0
@@ -995,6 +999,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             traci.constants.VAR_ANGLE,
             traci.constants.VAR_SPEED,
             traci.constants.VAR_ACCELERATION,
+            traci.constants.VAR_LANE_ID,
+            traci.constants.VAR_LANEPOSITION,
+            traci.constants.VAR_LANEPOSITION_LAT,
+            traci.constants.VAR_ROUTE_ID,
         ]
 
     def _get_state_vehicle_context_results(self, vehicle_ids):
@@ -1209,38 +1217,79 @@ class TeraSimCoSimPlugin(BasePlugin):
             add_timing(profile_ctx, f"{base}.total_s", elapsed)
             add_timing(profile_ctx, f"{base}.{operation_name}_s", elapsed)
 
-    def _populate_lane_relative_position(
-        self, vehicle_id, vehicle_state, profile_ctx=None
-    ):
-        if not self.lane_relative_position_enabled:
-            return
+    @staticmethod
+    def _context_vehicle_value(context_values, constant_name):
+        constant = getattr(traci.constants, constant_name, None)
+        if constant is None or constant not in context_values:
+            return False, None
+        return True, context_values[constant]
 
-        lane_id = self._profile_detail_traci_call(
-            profile_ctx,
-            "vehicle_get_lane_id",
-            traci.vehicle.getLaneID,
-            vehicle_id,
-        )
+    def _get_lookahead_lane_shape(self, lane_id, profile_ctx=None):
         if not lane_id:
-            return
-        lane_position = self._profile_detail_traci_call(
-            profile_ctx,
-            "vehicle_get_lane_position",
-            traci.vehicle.getLanePosition,
-            vehicle_id,
-        )
-        lateral_offset = self._profile_detail_traci_call(
-            profile_ctx,
-            "vehicle_get_lateral_lane_position",
-            traci.vehicle.getLateralLanePosition,
-            vehicle_id,
-        )
-        lane_shape = self._profile_detail_traci_call(
+            return None
+        cache = getattr(self, "lookahead_lane_shape_cache", None)
+        if cache is None:
+            cache = {}
+            self.lookahead_lane_shape_cache = cache
+        if lane_id in cache:
+            return cache[lane_id]
+        shape = self._profile_detail_traci_call(
             profile_ctx,
             "lane_get_shape",
             traci.lane.getShape,
             lane_id,
         )
+        if not shape or len(shape) < 2:
+            return None
+        immutable_shape = tuple(tuple(point) for point in shape)
+        cache[lane_id] = immutable_shape
+        return immutable_shape
+
+    def _populate_lane_relative_position(
+        self,
+        vehicle_id,
+        vehicle_state,
+        context_values=None,
+        profile_ctx=None,
+    ):
+        if not self.lane_relative_position_enabled:
+            return
+
+        context_values = context_values or {}
+        has_lane_id, lane_id = self._context_vehicle_value(
+            context_values, "VAR_LANE_ID"
+        )
+        if not has_lane_id:
+            lane_id = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_lane_id",
+                traci.vehicle.getLaneID,
+                vehicle_id,
+            )
+        if not lane_id:
+            return
+
+        has_lane_position, lane_position = self._context_vehicle_value(
+            context_values, "VAR_LANEPOSITION"
+        )
+        if not has_lane_position:
+            lane_position = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_lane_position",
+                traci.vehicle.getLanePosition,
+                vehicle_id,
+            )
+        has_lateral_offset, lateral_offset = self._context_vehicle_value(
+            context_values, "VAR_LANEPOSITION_LAT"
+        )
+        if not has_lateral_offset:
+            lateral_offset = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_lateral_lane_position",
+                traci.vehicle.getLateralLanePosition,
+                vehicle_id,
+            )
+        lane_shape = self._get_lookahead_lane_shape(lane_id, profile_ctx=profile_ctx)
         reconstructed = self._profile_detail_python_call(
             profile_ctx,
             "reconstruct_lane_relative_position",
@@ -1271,100 +1320,178 @@ class TeraSimCoSimPlugin(BasePlugin):
             speed = 0.0
         return min(15.0, max(7.0, speed))
 
-    def _append_lane_shape(
-        self, lane_shapes, seen_lane_ids, lane_id, profile_ctx=None
+    def _get_vehicle_lookahead_compiled_path(
+        self,
+        vehicle_id,
+        context_values=None,
+        profile_ctx=None,
     ):
-        if not lane_id or lane_id in seen_lane_ids:
-            return
-        try:
-            lane_shape = self._profile_detail_traci_call(
-                profile_ctx,
-                "lane_get_shape",
-                traci.lane.getShape,
-                lane_id,
-            )
-        except Exception:
-            return
-        if lane_shape and len(lane_shape) >= 2:
-            lane_shapes.append(lane_shape)
-            seen_lane_ids.add(lane_id)
-
-    def _get_vehicle_lookahead_lane_shapes(self, vehicle_id, profile_ctx=None):
-        lane_shapes = []
-        seen_lane_ids = set()
-        try:
-            current_lane = self._profile_detail_traci_call(
-                profile_ctx,
-                "vehicle_get_lane_id",
-                traci.vehicle.getLaneID,
-                vehicle_id,
-            )
-        except Exception:
-            current_lane = ""
-
-        self._append_lane_shape(
-            lane_shapes, seen_lane_ids, current_lane, profile_ctx=profile_ctx
+        context_values = context_values or {}
+        has_current_lane, current_lane = self._context_vehicle_value(
+            context_values, "VAR_LANE_ID"
         )
-        if current_lane:
+        if not has_current_lane:
             try:
-                next_links = self._profile_detail_traci_call(
+                current_lane = self._profile_detail_traci_call(
                     profile_ctx,
-                    "vehicle_get_next_links",
-                    traci.vehicle.getNextLinks,
+                    "vehicle_get_lane_id",
+                    traci.vehicle.getLaneID,
                     vehicle_id,
                 )
             except Exception:
-                next_links = []
+                current_lane = ""
+
+        has_next_links, next_links = self._context_vehicle_value(
+            context_values, "VAR_NEXT_LINKS"
+        )
+        if has_next_links:
             next_lane_ids = self._profile_detail_python_call(
                 profile_ctx,
                 "extract_next_link_lane_ids",
                 extract_next_link_lane_ids,
                 next_links,
             )
-            for lane_id in next_lane_ids:
-                self._append_lane_shape(
-                    lane_shapes, seen_lane_ids, lane_id, profile_ctx=profile_ctx
-                )
-
-        if lane_shapes:
-            self.lookahead_path_cache[vehicle_id] = lane_shapes
-            return lane_shapes
-        return self.lookahead_path_cache.get(vehicle_id, [])
-
-    def _populate_vehicle_lookahead(
-        self, vehicle_id, vehicle_state, profile_ctx=None
-    ):
-        lookahead_distance = self._lookahead_distance(vehicle_state.speed)
-        current_position = (vehicle_state.x, vehicle_state.y)
-        lane_shapes = self._get_vehicle_lookahead_lane_shapes(
-            vehicle_id, profile_ctx=profile_ctx
-        )
-        lookahead = self._profile_detail_python_call(
-            profile_ctx,
-            "find_lookahead_position",
-            find_lookahead_position_from_lane_shapes,
-            lane_shapes,
-            current_position,
-            lookahead_distance,
-            vehicle_state.z,
-        )
-        if lookahead is None:
-            lookahead = self._profile_detail_python_call(
-                profile_ctx,
-                "project_position_by_sumo_angle",
-                project_position_by_sumo_angle,
-                current_position,
-                vehicle_state.sumo_angle,
-                lookahead_distance,
-                vehicle_state.z,
+        elif current_lane:
+            vehicle_route_cache = getattr(self, "lookahead_vehicle_route_cache", None)
+            if vehicle_route_cache is None:
+                vehicle_route_cache = {}
+                self.lookahead_vehicle_route_cache = vehicle_route_cache
+            lane_route_cache = vehicle_route_cache.setdefault(vehicle_id, {})
+            _, route_id = self._context_vehicle_value(
+                context_values, "VAR_ROUTE_ID"
             )
-        if lookahead is None:
+            route_cache_key = (current_lane, route_id or "")
+            next_lane_ids = lane_route_cache.get(route_cache_key)
+            if next_lane_ids is None:
+                try:
+                    next_links = self._profile_detail_traci_call(
+                        profile_ctx,
+                        "vehicle_get_next_links",
+                        traci.vehicle.getNextLinks,
+                        vehicle_id,
+                    )
+                except Exception:
+                    next_links = []
+                next_lane_ids = tuple(
+                    self._profile_detail_python_call(
+                        profile_ctx,
+                        "extract_next_link_lane_ids",
+                        extract_next_link_lane_ids,
+                        next_links,
+                    )
+                )
+                lane_route_cache[route_cache_key] = next_lane_ids
+        else:
+            next_lane_ids = ()
+
+        lane_ids = []
+        for lane_id in [current_lane, *next_lane_ids]:
+            if lane_id and lane_id not in lane_ids:
+                lane_ids.append(lane_id)
+        if not lane_ids:
+            return getattr(self, "lookahead_path_cache", {}).get(vehicle_id)
+
+        geometry_cache = getattr(self, "lookahead_geometry_cache", None)
+        if geometry_cache is None:
+            geometry_cache = {}
+            self.lookahead_geometry_cache = geometry_cache
+        route_key = tuple(lane_ids)
+        compiled_path = geometry_cache.get(route_key)
+        if compiled_path is None:
+            lane_shapes = []
+            valid_lane_ids = []
+            for lane_id in lane_ids:
+                try:
+                    lane_shape = self._get_lookahead_lane_shape(
+                        lane_id, profile_ctx=profile_ctx
+                    )
+                except Exception:
+                    continue
+                if lane_shape is not None:
+                    lane_shapes.append(lane_shape)
+                    valid_lane_ids.append(lane_id)
+            if lane_shapes:
+                compiled_path = self._profile_detail_python_call(
+                    profile_ctx,
+                    "compile_lane_shapes",
+                    compile_lane_shapes,
+                    lane_shapes,
+                )
+                if compiled_path is not None:
+                    geometry_cache[route_key] = compiled_path
+                    valid_route_key = tuple(valid_lane_ids)
+                    geometry_cache.setdefault(valid_route_key, compiled_path)
+
+        if compiled_path is not None:
+            path_cache = getattr(self, "lookahead_path_cache", None)
+            if path_cache is None:
+                path_cache = {}
+                self.lookahead_path_cache = path_cache
+            path_cache[vehicle_id] = compiled_path
+            return compiled_path
+        return getattr(self, "lookahead_path_cache", {}).get(vehicle_id)
+
+    def _populate_vehicle_lookaheads(self, requests, profile_ctx=None):
+        if not requests:
             return
 
-        vehicle_state.lookahead_x = lookahead[0]
-        vehicle_state.lookahead_y = lookahead[1]
-        vehicle_state.lookahead_z = lookahead[2]
-        vehicle_state.lookahead_position_valid = True
+        compiled_paths = []
+        current_positions = []
+        lookahead_distances = []
+        z_values = []
+        for vehicle_id, vehicle_state, context_values in requests:
+            compiled_paths.append(
+                self._get_vehicle_lookahead_compiled_path(
+                    vehicle_id,
+                    context_values=context_values,
+                    profile_ctx=profile_ctx,
+                )
+            )
+            current_positions.append((vehicle_state.x, vehicle_state.y))
+            lookahead_distances.append(self._lookahead_distance(vehicle_state.speed))
+            z_values.append(vehicle_state.z)
+
+        lookaheads = self._profile_detail_python_call(
+            profile_ctx,
+            "find_lookahead_positions_batch",
+            find_lookahead_positions_from_compiled_paths,
+            compiled_paths,
+            current_positions,
+            lookahead_distances,
+            z_values,
+        )
+        for request, lookahead, lookahead_distance in zip(
+            requests, lookaheads, lookahead_distances
+        ):
+            _, vehicle_state, _ = request
+            if lookahead is None:
+                lookahead = self._profile_detail_python_call(
+                    profile_ctx,
+                    "project_position_by_sumo_angle",
+                    project_position_by_sumo_angle,
+                    (vehicle_state.x, vehicle_state.y),
+                    vehicle_state.sumo_angle,
+                    lookahead_distance,
+                    vehicle_state.z,
+                )
+            if lookahead is None:
+                continue
+            vehicle_state.lookahead_x = lookahead[0]
+            vehicle_state.lookahead_y = lookahead[1]
+            vehicle_state.lookahead_z = lookahead[2]
+            vehicle_state.lookahead_position_valid = True
+
+    def _populate_vehicle_lookahead(
+        self,
+        vehicle_id,
+        vehicle_state,
+        profile_ctx=None,
+        context_values=None,
+    ):
+        self._populate_vehicle_lookaheads(
+            [(vehicle_id, vehicle_state, context_values or {})],
+            profile_ctx=profile_ctx,
+        )
 
     def _build_simulation_state(self, simulator):
         """Collect the current simulation state from SUMO into a SimulationState.
@@ -1396,6 +1523,8 @@ class TeraSimCoSimPlugin(BasePlugin):
         for feedback_cache in (
             self.feedback_observed_speeds,
             self.feedback_source_carla_frames,
+            self.lookahead_path_cache,
+            self.lookahead_vehicle_route_cache,
         ):
             for vid in list(feedback_cache):
                 if vid not in active_vehicle_ids:
@@ -1416,6 +1545,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         # to the same AV-centred radius used for CARLA physics.
         vehicle_collection_start = time.perf_counter()
         vehicles = {}
+        lookahead_requests = []
         context_results = getattr(self, "state_vehicle_context_results", {})
         for vid in vehicle_ids:
             vehicle_state = AgentStateSimplified()
@@ -1442,7 +1572,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             if vid in detail_vehicle_ids:
                 detail_start = time.perf_counter()
                 self._populate_lane_relative_position(
-                    vid, vehicle_state, profile_ctx=profile_ctx
+                    vid,
+                    vehicle_state,
+                    context_values=context_values,
+                    profile_ctx=profile_ctx,
                 )
                 vehicle_state.lon, vehicle_state.lat = (
                     self._profile_detail_traci_call(
@@ -1482,15 +1615,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                 vehicle_state.feedback_source_carla_frame = (
                     self.feedback_source_carla_frames.get(vid)
                 )
-                lookahead_start = time.perf_counter()
-                self._populate_vehicle_lookahead(
-                    vid, vehicle_state, profile_ctx=profile_ctx
-                )
-                add_timing(
-                    profile_ctx,
-                    "terasim_internal.state_export.lookahead_lane_geometry_s",
-                    time.perf_counter() - lookahead_start,
-                )
+                lookahead_requests.append((vid, vehicle_state, context_values))
                 acceleration = context_values.get(traci.constants.VAR_ACCELERATION)
                 if acceleration is None:
                     acceleration = self._profile_detail_traci_call(
@@ -1522,6 +1647,20 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self.last_orientations.pop(vid, None)
 
             vehicles[vid] = vehicle_state
+
+        lookahead_start = time.perf_counter()
+        self._populate_vehicle_lookaheads(lookahead_requests, profile_ctx=profile_ctx)
+        lookahead_elapsed = time.perf_counter() - lookahead_start
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.lookahead_lane_geometry_s",
+            lookahead_elapsed,
+        )
+        add_timing(
+            profile_ctx,
+            "terasim_internal.state_export.ackermann_detail_s",
+            lookahead_elapsed,
+        )
 
         simulation_state.agent_details["vehicle"] = vehicles
         add_timing(

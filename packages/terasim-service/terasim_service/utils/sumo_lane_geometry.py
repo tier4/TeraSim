@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 
 def extract_next_link_lane_ids(next_links):
     """Return internal and destination lane IDs from TraCI ``getNextLinks`` data."""
@@ -244,6 +246,122 @@ def find_lookahead_position_from_lane_shapes(
     if projected_distance is None:
         return None
     return point_at_distance_on_polyline(points, projected_distance + lookahead_distance, z)
+
+
+def compile_lane_shapes(lane_shapes):
+    """Compile lane polylines into NumPy arrays reusable across simulation ticks."""
+    points = np.asarray(flatten_lane_shapes(lane_shapes), dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2:
+        return None
+
+    starts = points[:-1]
+    deltas = points[1:] - starts
+    length_sq = np.einsum("ij,ij->i", deltas, deltas)
+    valid = length_sq > 0.0
+    if not np.any(valid):
+        return None
+
+    starts = starts[valid]
+    deltas = deltas[valid]
+    length_sq = length_sq[valid]
+    lengths = np.sqrt(length_sq)
+    cumulative_starts = np.concatenate(
+        (np.zeros(1, dtype=np.float64), np.cumsum(lengths[:-1]))
+    )
+    cumulative_ends = cumulative_starts + lengths
+    return {
+        "starts": starts,
+        "deltas": deltas,
+        "length_sq": length_sq,
+        "lengths": lengths,
+        "cumulative_starts": cumulative_starts,
+        "cumulative_ends": cumulative_ends,
+        "last_end": starts[-1] + deltas[-1],
+    }
+
+
+def find_lookahead_positions_from_compiled_paths(
+    compiled_paths,
+    current_positions,
+    lookahead_distances,
+    z_values,
+):
+    """Calculate route lookahead points for multiple vehicles in vectorized groups.
+
+    Vehicles sharing the same compiled route path are projected together. The
+    result matches the scalar lane-shape lookup, while avoiding repeated
+    polyline flattening and per-segment Python loops.
+    """
+    count = len(compiled_paths)
+    if not (
+        len(current_positions) == count
+        and len(lookahead_distances) == count
+        and len(z_values) == count
+    ):
+        raise ValueError("compiled path and vehicle input lengths must match")
+
+    results = [None] * count
+    groups = {}
+    for index, compiled_path in enumerate(compiled_paths):
+        if compiled_path is not None:
+            groups.setdefault(id(compiled_path), (compiled_path, []))[1].append(index)
+
+    for compiled_path, indices in groups.values():
+        try:
+            positions = np.asarray(
+                [current_positions[index] for index in indices], dtype=np.float64
+            )
+            distances = np.maximum(
+                0.0,
+                np.asarray(
+                    [lookahead_distances[index] for index in indices], dtype=np.float64
+                ),
+            )
+            z_array = np.asarray([z_values[index] for index in indices], dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            continue
+
+        starts = compiled_path["starts"]
+        deltas = compiled_path["deltas"]
+        length_sq = compiled_path["length_sq"]
+        lengths = compiled_path["lengths"]
+        cumulative_starts = compiled_path["cumulative_starts"]
+        cumulative_ends = compiled_path["cumulative_ends"]
+
+        offsets = positions[:, None, :] - starts[None, :, :]
+        ratios = np.einsum("bsi,si->bs", offsets, deltas) / length_sq[None, :]
+        ratios = np.clip(ratios, 0.0, 1.0)
+        projections = starts[None, :, :] + ratios[..., None] * deltas[None, :, :]
+        distance_sq = np.sum((positions[:, None, :] - projections) ** 2, axis=2)
+        nearest_indices = np.argmin(distance_sq, axis=1)
+        rows = np.arange(len(indices))
+        projected_distances = (
+            cumulative_starts[nearest_indices]
+            + lengths[nearest_indices] * ratios[rows, nearest_indices]
+        )
+        target_distances = projected_distances + distances
+        target_indices = np.searchsorted(cumulative_ends, target_distances, side="left")
+        beyond_path = target_indices >= len(lengths)
+        target_indices = np.minimum(target_indices, len(lengths) - 1)
+        target_ratios = (
+            target_distances - cumulative_starts[target_indices]
+        ) / lengths[target_indices]
+        target_ratios = np.clip(target_ratios, 0.0, 1.0)
+        target_points = (
+            starts[target_indices] + target_ratios[:, None] * deltas[target_indices]
+        )
+        target_points[beyond_path] = compiled_path["last_end"]
+
+        for row, result_index in enumerate(indices):
+            results[result_index] = (
+                float(target_points[row, 0]),
+                float(target_points[row, 1]),
+                float(z_array[row]),
+            )
+
+    return results
 
 
 def project_position_by_sumo_angle(position, sumo_angle, distance, z=0.0):
