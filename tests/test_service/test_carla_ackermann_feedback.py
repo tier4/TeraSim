@@ -334,6 +334,169 @@ def test_state_detail_filter_disabled_preserves_full_state_contract():
     assert selected == {"AV", "BV"}
     assert plugin.state_detail_active_vehicle_ids == {"AV", "BV"}
 
+
+def _state_subscription_constants():
+    return types.SimpleNamespace(
+        VAR_DISTANCE=1,
+        VAR_POSITION=2,
+        VAR_POSITION3D=3,
+        VAR_ANGLE=4,
+        VAR_SPEED=5,
+        VAR_ACCELERATION=6,
+        CMD_GET_VEHICLE_VARIABLE=7,
+    )
+
+
+def _state_filter_plugin(plugin_module):
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.state_filter_enabled = True
+    plugin.state_filter_radius = 320.0
+    plugin.state_filter_center_id = "AV"
+    plugin.state_filter_missing_center_logged = False
+    plugin.state_filter_error_logged = False
+    plugin.state_context_subscription_enabled = True
+    plugin.state_context_subscription_active = False
+    plugin.state_context_subscription_error_logged = False
+    plugin.state_vehicle_context_results = {}
+    plugin.logger = types.SimpleNamespace(warning=lambda *args, **kwargs: None)
+    return plugin
+
+
+def test_state_filter_uses_context_subscription_without_per_vehicle_position_queries(
+    monkeypatch,
+):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = _state_subscription_constants()
+    subscription_calls = []
+    results = {
+        "AV": {
+            constants.VAR_POSITION3D: (0.0, 0.0, 0.0),
+            constants.VAR_ANGLE: 90.0,
+            constants.VAR_SPEED: 5.0,
+            constants.VAR_ACCELERATION: 0.0,
+        },
+        "near": {
+            constants.VAR_POSITION3D: (100.0, 0.0, 0.0),
+            constants.VAR_ANGLE: 90.0,
+            constants.VAR_SPEED: 4.0,
+            constants.VAR_ACCELERATION: -1.0,
+        },
+    }
+    fake_vehicle = types.SimpleNamespace(
+        subscribeContext=lambda *args: subscription_calls.append(args),
+        getContextSubscriptionResults=lambda _center_id: results,
+        getPosition3D=lambda _vehicle_id: (_ for _ in ()).throw(
+            AssertionError("per-vehicle position query must not be used")
+        ),
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(constants=constants, vehicle=fake_vehicle),
+    )
+    plugin = _state_filter_plugin(plugin_module)
+
+    selected, positions = plugin._filter_vehicle_ids_for_state(["AV", "near", "far"])
+
+    assert selected == ["AV", "near"]
+    assert positions == {
+        "AV": (0.0, 0.0, 0.0),
+        "near": (100.0, 0.0, 0.0),
+    }
+    assert subscription_calls == [
+        (
+            "AV",
+            constants.CMD_GET_VEHICLE_VARIABLE,
+            320.0,
+            [
+                constants.VAR_DISTANCE,
+                constants.VAR_POSITION,
+                constants.VAR_POSITION3D,
+                constants.VAR_ANGLE,
+                constants.VAR_SPEED,
+                constants.VAR_ACCELERATION,
+            ],
+        )
+    ]
+
+
+def test_state_filter_falls_back_when_context_subscription_fails(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = _state_subscription_constants()
+    positions = {
+        "AV": (0.0, 0.0, 0.0),
+        "near": (100.0, 0.0, 0.0),
+        "far": (400.0, 0.0, 0.0),
+    }
+    fake_vehicle = types.SimpleNamespace(
+        subscribeContext=lambda *args: (_ for _ in ()).throw(RuntimeError("failed")),
+        getContextSubscriptionResults=lambda _center_id: None,
+        getPosition3D=lambda vehicle_id: positions[vehicle_id],
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(constants=constants, vehicle=fake_vehicle),
+    )
+    plugin = _state_filter_plugin(plugin_module)
+
+    selected, position_cache = plugin._filter_vehicle_ids_for_state(
+        ["AV", "near", "far"]
+    )
+
+    assert selected == ["AV", "near"]
+    assert position_cache == positions
+    assert plugin.state_context_subscription_error_logged is True
+
+
+def test_detail_profile_helpers_skip_timing_when_profile_is_disabled(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    def unexpected_timer_call():
+        raise AssertionError("perf_counter must not run while profiling is disabled")
+
+    monkeypatch.setattr(plugin_module.time, "perf_counter", unexpected_timer_call)
+    profile_ctx = {}
+
+    assert plugin_module.TeraSimCoSimPlugin._profile_detail_traci_call(
+        profile_ctx, "get_value", lambda value: value + 1, 2
+    ) == 3
+    assert plugin_module.TeraSimCoSimPlugin._profile_detail_python_call(
+        profile_ctx, "geometry", lambda value: value * 2, 3
+    ) == 6
+    assert "cosim_profile" not in profile_ctx
+
+
+def test_detail_profile_helpers_record_time_and_traci_count(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    timestamps = iter((1.0, 1.25, 2.0, 2.5))
+    monkeypatch.setattr(plugin_module.time, "perf_counter", lambda: next(timestamps))
+    profile_ctx = {"cosim_profile": {}}
+
+    plugin_module.TeraSimCoSimPlugin._profile_detail_traci_call(
+        profile_ctx, "get_value", lambda: "value"
+    )
+    plugin_module.TeraSimCoSimPlugin._profile_detail_python_call(
+        profile_ctx, "geometry", lambda: "point"
+    )
+
+    breakdown = profile_ctx["cosim_profile"]["terasim_internal"]["state_export"][
+        "ackermann_detail_breakdown"
+    ]
+    assert breakdown["traci"] == {
+        "total_s": 0.25,
+        "get_value_s": 0.25,
+        "get_value_calls": 1.0,
+    }
+    assert breakdown["python"] == {
+        "total_s": 0.5,
+        "geometry_s": 0.5,
+    }
+
+
 def test_feedback_batches_valid_actors_and_isolates_invalid_shape(monkeypatch):
     install_fake_carla()
     from terasim_service.utils.carla import cosim as cosim_module

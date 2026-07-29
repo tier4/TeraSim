@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from terasim.overlay import traci
-from terasim.profiling import add_timing, set_value
+from terasim.profiling import add_timing, get_profile, set_value
 from terasim.simulator import Simulator
 
 from terasim_nde_nade.adversity import ConstructionAdversity
@@ -314,6 +314,12 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         self.state_detail_active_vehicle_ids = set()
         self.vehicle_static_state_cache = {}
+        self.state_context_subscription_enabled = self._parse_bool_env(
+            "TERASIM_COSIM_STATE_CONTEXT_SUBSCRIPTION", True
+        )
+        self.state_context_subscription_active = False
+        self.state_context_subscription_error_logged = False
+        self.state_vehicle_context_results = {}
         if self.state_filter_enabled:
             self.logger.info(
                 "TeraSim co-sim state filter enabled: center=%s radius=%s",
@@ -979,6 +985,77 @@ class TeraSimCoSimPlugin(BasePlugin):
         vehicle_ids = [id for id in all_ids if id not in vru_ids and id not in construction_ids]
         return vehicle_ids, vru_ids, construction_ids
 
+    @staticmethod
+    def _state_context_subscription_variables():
+        """Return the vehicle variables shared by NADE and state export."""
+        return [
+            traci.constants.VAR_DISTANCE,
+            traci.constants.VAR_POSITION,
+            traci.constants.VAR_POSITION3D,
+            traci.constants.VAR_ANGLE,
+            traci.constants.VAR_SPEED,
+            traci.constants.VAR_ACCELERATION,
+        ]
+
+    def _get_state_vehicle_context_results(self, vehicle_ids):
+        """Return AV-centred vehicle state without per-vehicle TraCI queries."""
+        self.state_vehicle_context_results = {}
+        if (
+            not getattr(self, "state_context_subscription_enabled", True)
+            or not self.state_filter_enabled
+            or self.state_filter_radius is None
+            or self.state_filter_radius <= 0
+        ):
+            return None
+
+        center_id = self.state_filter_center_id
+        if center_id not in vehicle_ids:
+            self.state_context_subscription_active = False
+            return None
+
+        variables = self._state_context_subscription_variables()
+        required_variables = {
+            traci.constants.VAR_POSITION3D,
+            traci.constants.VAR_ANGLE,
+            traci.constants.VAR_SPEED,
+        }
+
+        try:
+            results = None
+            if getattr(self, "state_context_subscription_active", False):
+                results = traci.vehicle.getContextSubscriptionResults(center_id)
+                center_values = (results or {}).get(center_id, {})
+                if not required_variables.issubset(center_values):
+                    self.state_context_subscription_active = False
+
+            if not getattr(self, "state_context_subscription_active", False):
+                traci.vehicle.subscribeContext(
+                    center_id,
+                    traci.constants.CMD_GET_VEHICLE_VARIABLE,
+                    self.state_filter_radius,
+                    variables,
+                )
+                self.state_context_subscription_active = True
+                results = traci.vehicle.getContextSubscriptionResults(center_id)
+
+            results = dict(results or {})
+            center_values = results.get(center_id, {})
+            if not required_variables.issubset(center_values):
+                raise RuntimeError("context subscription returned incomplete AV state")
+
+            self.state_context_subscription_error_logged = False
+            self.state_vehicle_context_results = results
+            return results
+        except Exception as exc:
+            self.state_context_subscription_active = False
+            if not getattr(self, "state_context_subscription_error_logged", False):
+                self.logger.warning(
+                    "State context subscription failed; falling back to per-vehicle queries: %s",
+                    exc,
+                )
+                self.state_context_subscription_error_logged = True
+            return None
+
     def _filter_vehicle_ids_for_state(self, vehicle_ids):
         if (
             not self.state_filter_enabled
@@ -996,6 +1073,24 @@ class TeraSimCoSimPlugin(BasePlugin):
                     )
                     self.state_filter_missing_center_logged = True
                 return vehicle_ids, {}
+
+            context_results = self._get_state_vehicle_context_results(vehicle_ids)
+            if context_results is not None:
+                filtered_vehicle_ids = []
+                position_cache = {}
+                for vehicle_id in vehicle_ids:
+                    values = context_results.get(vehicle_id)
+                    if values is None:
+                        continue
+                    position = values.get(traci.constants.VAR_POSITION3D)
+                    if position is None:
+                        continue
+                    filtered_vehicle_ids.append(vehicle_id)
+                    position_cache[vehicle_id] = position
+                if self.state_filter_center_id in position_cache:
+                    self.state_filter_missing_center_logged = False
+                    self.state_filter_error_logged = False
+                    return filtered_vehicle_ids, position_cache
 
             center_position = traci.vehicle.getPosition3D(self.state_filter_center_id)
             position_cache = {self.state_filter_center_id: center_position}
@@ -1083,17 +1178,73 @@ class TeraSimCoSimPlugin(BasePlugin):
             vehicle_state.type,
         ) = static_state
 
-    def _populate_lane_relative_position(self, vehicle_id, vehicle_state):
+    @staticmethod
+    def _profile_detail_traci_call(profile_ctx, command_name, function, *args):
+        """Call one TraCI command and record its wall time and invocation count."""
+        if get_profile(profile_ctx) is None:
+            return function(*args)
+
+        start = time.perf_counter()
+        try:
+            return function(*args)
+        finally:
+            elapsed = time.perf_counter() - start
+            base = "terasim_internal.state_export.ackermann_detail_breakdown.traci"
+            add_timing(profile_ctx, f"{base}.total_s", elapsed)
+            add_timing(profile_ctx, f"{base}.{command_name}_s", elapsed)
+            add_timing(profile_ctx, f"{base}.{command_name}_calls", 1.0)
+
+    @staticmethod
+    def _profile_detail_python_call(profile_ctx, operation_name, function, *args):
+        """Call pure Python geometry and time it only while profiling is active."""
+        if get_profile(profile_ctx) is None:
+            return function(*args)
+
+        start = time.perf_counter()
+        try:
+            return function(*args)
+        finally:
+            elapsed = time.perf_counter() - start
+            base = "terasim_internal.state_export.ackermann_detail_breakdown.python"
+            add_timing(profile_ctx, f"{base}.total_s", elapsed)
+            add_timing(profile_ctx, f"{base}.{operation_name}_s", elapsed)
+
+    def _populate_lane_relative_position(
+        self, vehicle_id, vehicle_state, profile_ctx=None
+    ):
         if not self.lane_relative_position_enabled:
             return
 
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_id = self._profile_detail_traci_call(
+            profile_ctx,
+            "vehicle_get_lane_id",
+            traci.vehicle.getLaneID,
+            vehicle_id,
+        )
         if not lane_id:
             return
-        lane_position = traci.vehicle.getLanePosition(vehicle_id)
-        lateral_offset = traci.vehicle.getLateralLanePosition(vehicle_id)
-        lane_shape = traci.lane.getShape(lane_id)
-        reconstructed = reconstruct_position_from_lane_geometry(
+        lane_position = self._profile_detail_traci_call(
+            profile_ctx,
+            "vehicle_get_lane_position",
+            traci.vehicle.getLanePosition,
+            vehicle_id,
+        )
+        lateral_offset = self._profile_detail_traci_call(
+            profile_ctx,
+            "vehicle_get_lateral_lane_position",
+            traci.vehicle.getLateralLanePosition,
+            vehicle_id,
+        )
+        lane_shape = self._profile_detail_traci_call(
+            profile_ctx,
+            "lane_get_shape",
+            traci.lane.getShape,
+            lane_id,
+        )
+        reconstructed = self._profile_detail_python_call(
+            profile_ctx,
+            "reconstruct_lane_relative_position",
+            reconstruct_position_from_lane_geometry,
             lane_shape,
             lane_position,
             lateral_offset,
@@ -1120,51 +1271,88 @@ class TeraSimCoSimPlugin(BasePlugin):
             speed = 0.0
         return min(15.0, max(7.0, speed))
 
-    def _append_lane_shape(self, lane_shapes, seen_lane_ids, lane_id):
+    def _append_lane_shape(
+        self, lane_shapes, seen_lane_ids, lane_id, profile_ctx=None
+    ):
         if not lane_id or lane_id in seen_lane_ids:
             return
         try:
-            lane_shape = traci.lane.getShape(lane_id)
+            lane_shape = self._profile_detail_traci_call(
+                profile_ctx,
+                "lane_get_shape",
+                traci.lane.getShape,
+                lane_id,
+            )
         except Exception:
             return
         if lane_shape and len(lane_shape) >= 2:
             lane_shapes.append(lane_shape)
             seen_lane_ids.add(lane_id)
 
-    def _get_vehicle_lookahead_lane_shapes(self, vehicle_id):
+    def _get_vehicle_lookahead_lane_shapes(self, vehicle_id, profile_ctx=None):
         lane_shapes = []
         seen_lane_ids = set()
         try:
-            current_lane = traci.vehicle.getLaneID(vehicle_id)
+            current_lane = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_lane_id",
+                traci.vehicle.getLaneID,
+                vehicle_id,
+            )
         except Exception:
             current_lane = ""
 
-        self._append_lane_shape(lane_shapes, seen_lane_ids, current_lane)
+        self._append_lane_shape(
+            lane_shapes, seen_lane_ids, current_lane, profile_ctx=profile_ctx
+        )
         if current_lane:
             try:
-                next_links = traci.vehicle.getNextLinks(vehicle_id)
+                next_links = self._profile_detail_traci_call(
+                    profile_ctx,
+                    "vehicle_get_next_links",
+                    traci.vehicle.getNextLinks,
+                    vehicle_id,
+                )
             except Exception:
                 next_links = []
-            for lane_id in extract_next_link_lane_ids(next_links):
-                self._append_lane_shape(lane_shapes, seen_lane_ids, lane_id)
+            next_lane_ids = self._profile_detail_python_call(
+                profile_ctx,
+                "extract_next_link_lane_ids",
+                extract_next_link_lane_ids,
+                next_links,
+            )
+            for lane_id in next_lane_ids:
+                self._append_lane_shape(
+                    lane_shapes, seen_lane_ids, lane_id, profile_ctx=profile_ctx
+                )
 
         if lane_shapes:
             self.lookahead_path_cache[vehicle_id] = lane_shapes
             return lane_shapes
         return self.lookahead_path_cache.get(vehicle_id, [])
 
-    def _populate_vehicle_lookahead(self, vehicle_id, vehicle_state):
+    def _populate_vehicle_lookahead(
+        self, vehicle_id, vehicle_state, profile_ctx=None
+    ):
         lookahead_distance = self._lookahead_distance(vehicle_state.speed)
         current_position = (vehicle_state.x, vehicle_state.y)
-        lane_shapes = self._get_vehicle_lookahead_lane_shapes(vehicle_id)
-        lookahead = find_lookahead_position_from_lane_shapes(
+        lane_shapes = self._get_vehicle_lookahead_lane_shapes(
+            vehicle_id, profile_ctx=profile_ctx
+        )
+        lookahead = self._profile_detail_python_call(
+            profile_ctx,
+            "find_lookahead_position",
+            find_lookahead_position_from_lane_shapes,
             lane_shapes,
             current_position,
             lookahead_distance,
             vehicle_state.z,
         )
         if lookahead is None:
-            lookahead = project_position_by_sumo_angle(
+            lookahead = self._profile_detail_python_call(
+                profile_ctx,
+                "project_position_by_sumo_angle",
+                project_position_by_sumo_angle,
                 current_position,
                 vehicle_state.sumo_angle,
                 lookahead_distance,
@@ -1228,35 +1416,63 @@ class TeraSimCoSimPlugin(BasePlugin):
         # to the same AV-centred radius used for CARLA physics.
         vehicle_collection_start = time.perf_counter()
         vehicles = {}
+        context_results = getattr(self, "state_vehicle_context_results", {})
         for vid in vehicle_ids:
             vehicle_state = AgentStateSimplified()
+            context_values = context_results.get(vid, {})
             position = vehicle_position_cache.get(vid)
+            if position is None:
+                position = context_values.get(traci.constants.VAR_POSITION3D)
             if position is None:
                 position = traci.vehicle.getPosition3D(vid)
             vehicle_state.x, vehicle_state.y, vehicle_state.z = position
-            vehicle_state.sumo_angle = traci.vehicle.getAngle(vid)
+            sumo_angle = context_values.get(traci.constants.VAR_ANGLE)
+            if sumo_angle is None:
+                sumo_angle = traci.vehicle.getAngle(vid)
+            vehicle_state.sumo_angle = sumo_angle
             vehicle_state.orientation = np.radians(
                 (90 - vehicle_state.sumo_angle) % 360
             )
-            vehicle_state.speed = traci.vehicle.getSpeed(vid)
+            speed = context_values.get(traci.constants.VAR_SPEED)
+            if speed is None:
+                speed = traci.vehicle.getSpeed(vid)
+            vehicle_state.speed = speed
             self._populate_vehicle_static_state(vid, vehicle_state)
 
             if vid in detail_vehicle_ids:
                 detail_start = time.perf_counter()
-                self._populate_lane_relative_position(vid, vehicle_state)
-                vehicle_state.lon, vehicle_state.lat = traci.simulation.convertGeo(
-                    vehicle_state.x, vehicle_state.y
+                self._populate_lane_relative_position(
+                    vid, vehicle_state, profile_ctx=profile_ctx
+                )
+                vehicle_state.lon, vehicle_state.lat = (
+                    self._profile_detail_traci_call(
+                        profile_ctx,
+                        "simulation_convert_geo",
+                        traci.simulation.convertGeo,
+                        vehicle_state.x,
+                        vehicle_state.y,
+                    )
                 )
                 if vid == "AV" or self._is_ackermann_feedback_actor(vid):
                     try:
                         vehicle_state.sumo_desired_speed = (
-                            traci.vehicle.getSpeedWithoutTraCI(vid)
+                            self._profile_detail_traci_call(
+                                profile_ctx,
+                                "vehicle_get_speed_without_traci",
+                                traci.vehicle.getSpeedWithoutTraCI,
+                                vid,
+                            )
                         )
                     except Exception:
                         vehicle_state.sumo_desired_speed = vehicle_state.speed
                     try:
                         vehicle_state.sumo_emergency_decel = (
-                            traci.vehicle.getEmergencyDecel(vid)
+                            self._profile_detail_traci_call(
+                                profile_ctx,
+                                "vehicle_get_emergency_decel",
+                                traci.vehicle.getEmergencyDecel,
+                                vid,
+                            )
                         )
                     except Exception:
                         vehicle_state.sumo_emergency_decel = None
@@ -1267,13 +1483,23 @@ class TeraSimCoSimPlugin(BasePlugin):
                     self.feedback_source_carla_frames.get(vid)
                 )
                 lookahead_start = time.perf_counter()
-                self._populate_vehicle_lookahead(vid, vehicle_state)
+                self._populate_vehicle_lookahead(
+                    vid, vehicle_state, profile_ctx=profile_ctx
+                )
                 add_timing(
                     profile_ctx,
                     "terasim_internal.state_export.lookahead_lane_geometry_s",
                     time.perf_counter() - lookahead_start,
                 )
-                vehicle_state.acceleration = traci.vehicle.getAcceleration(vid)
+                acceleration = context_values.get(traci.constants.VAR_ACCELERATION)
+                if acceleration is None:
+                    acceleration = self._profile_detail_traci_call(
+                        profile_ctx,
+                        "vehicle_get_acceleration",
+                        traci.vehicle.getAcceleration,
+                        vid,
+                    )
+                vehicle_state.acceleration = acceleration
                 now_time = simulation_state.simulation_time
                 now_orientation = vehicle_state.orientation
                 last_orientation, last_time = self.last_orientations.get(

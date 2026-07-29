@@ -57,7 +57,9 @@ def main(root_arg):
             "nade_decision_mean_ms": mean_ms(tprofiles,"terasim_internal.behavior_generation.nade_decision_control_s"),
             "state_export_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.total_s"),
             "state_ackermann_detail_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_s"),
-            "lookahead_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.lookahead_lane_geometry_s")}
+            "lookahead_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.lookahead_lane_geometry_s"),
+            "detail_traci_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_breakdown.traci.total_s"),
+            "detail_python_mean_ms": mean_ms(tprofiles,"terasim_internal.state_export.ackermann_detail_breakdown.python.total_s")}
         summaries.append(row)
     (root/"summary.json").write_text(json.dumps(summaries,indent=2)+"\n")
     header=["RHI","radius","samples","SUMO all","exported","CARLA","physics avg/max","detail avg","total avg/p95 ms","<=50ms","RTF","world.tick ms","TeraSim ms","SUMO step ms","behavior ms","state export ms"]
