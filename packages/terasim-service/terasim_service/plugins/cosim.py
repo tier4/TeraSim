@@ -226,10 +226,20 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.continue_on_ackermann_feedback_failure = self._parse_bool_env(
             "TERASIM_COSIM_CONTINUE_ON_ACKERMANN_FEEDBACK_FAILURE", False
         )
+        self.continue_on_background_ackermann_feedback_failure = self._parse_bool_env(
+            "TERASIM_COSIM_CONTINUE_ON_BACKGROUND_ACKERMANN_FEEDBACK_FAILURE",
+            False,
+        )
         if self.continue_on_ackermann_feedback_failure:
             self.logger.warning(
                 "Ackermann feedback failures are non-fatal. This mode is intended "
                 "for performance measurements only."
+            )
+        elif self.continue_on_background_ackermann_feedback_failure:
+            self.logger.warning(
+                "Background Ackermann feedback failures are non-fatal; AV feedback "
+                "failures remain fail-closed. This mode is intended for visual and "
+                "performance validation only."
             )
         self.ackermann_feedback_lane_index = self._parse_int_env(
             "CARLA_COSIM_ACKERMANN_FEEDBACK_LANE_INDEX", 0
@@ -451,8 +461,6 @@ class TeraSimCoSimPlugin(BasePlugin):
         return actor_id in actor_ids or (actor_id != "AV" and "*" in actor_ids)
 
     def _should_continue_after_agent_command_failure(self):
-        if not getattr(self, "continue_on_ackermann_feedback_failure", False):
-            return False
         failure = self.last_agent_command_failure or {}
         reason = str(failure.get("reason", ""))
         is_feedback_failure = bool(failure.get("ackermann_feedback")) or reason.startswith(
@@ -460,10 +468,21 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         if not is_feedback_failure:
             return False
+        actor_id = str(failure.get("actor_id", ""))
+        continue_all = getattr(self, "continue_on_ackermann_feedback_failure", False)
+        continue_background = getattr(
+            self,
+            "continue_on_background_ackermann_feedback_failure",
+            False,
+        )
+        if not continue_all and not (
+            continue_background and actor_id and actor_id != "AV"
+        ):
+            return False
         self.logger.warning(
-            "Performance mode: ignoring Ackermann feedback command failure and "
+            "Validation mode: ignoring Ackermann feedback command failure and "
             "continuing SUMO actor=%s reason=%s",
-            failure.get("actor_id", ""),
+            actor_id,
             reason or "unknown",
         )
         return True

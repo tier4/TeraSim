@@ -10,6 +10,7 @@ CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.1}
 CARLA_COSIM_MAP_NAME=${CARLA_COSIM_MAP_NAME:-}
 CARLA_COSIM_VEHICLE_CONTROL_MODE=${CARLA_COSIM_VEHICLE_CONTROL_MODE:-ackermann_physics}
 ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
+USE_LIBSUMO=${USE_LIBSUMO:-0}
 SUMO_DISPLAY=${SUMO_DISPLAY:-:20}
 SUMO_GUI_REALTIME=${SUMO_GUI_REALTIME:-1}
 
@@ -72,10 +73,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-export USE_LIBSUMO=0
 export DISPLAY="${SUMO_DISPLAY}"
 
 if is_enabled "${ENABLE_SUMO_GUI}"; then
+    if is_enabled "${USE_LIBSUMO}"; then
+        echo "SUMO GUI requires TraCI; overriding USE_LIBSUMO=${USE_LIBSUMO} with 0."
+    fi
+    export USE_LIBSUMO=0
     echo "[1/4] Starting SUMO desktop/noVNC on port ${SUMO_NOVNC_PORT:-6093}..."
     /usr/local/bin/start_sumo_novnc >/tmp/sumo-novnc.log 2>&1 &
     SUMO_NOVNC_PID=$!
@@ -103,8 +107,15 @@ with open(os.environ["TERASIM_RUNTIME_CONFIG"], "w", encoding="utf-8") as output
     yaml.safe_dump(config, output, sort_keys=False)
 PY
     TERASIM_CONFIG="${RUNTIME_TERASIM_CONFIG}"
+else
+    if is_enabled "${USE_LIBSUMO}"; then
+        export USE_LIBSUMO=1
+    else
+        export USE_LIBSUMO=0
+    fi
 fi
 
+echo "Using SUMO backend: $([[ "${USE_LIBSUMO}" == "1" ]] && echo libsumo || echo TraCI)"
 echo "[2/4] Checking CARLA ${CARLA_HOST}:${CARLA_PORT}..."
 python3 -u -c "import carla; c=carla.Client('${CARLA_HOST}', int('${CARLA_PORT}')); c.set_timeout(30); print('CARLA server version:', c.get_server_version())"
 

@@ -1391,6 +1391,36 @@ def test_direct_command_failure_stops_before_sumo_step():
     assert plugin._step_done.is_set()
 
 
+def test_background_feedback_failure_can_continue_without_relaxing_av():
+    from terasim_service.plugins import cosim as plugin_module
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.continue_on_ackermann_feedback_failure = False
+    plugin.continue_on_background_ackermann_feedback_failure = True
+    plugin.logger = types.SimpleNamespace(warning=lambda *args, **kwargs: None)
+
+    plugin.last_agent_command_failure = {
+        "actor_id": "vehicle2311",
+        "reason": "ackermann_feedback_moveTo_mapping_failed",
+        "ackermann_feedback": True,
+    }
+    assert plugin._should_continue_after_agent_command_failure() is True
+
+    plugin.last_agent_command_failure = {
+        "actor_id": "AV",
+        "reason": "ackermann_feedback_moveTo_mapping_failed",
+        "ackermann_feedback": True,
+    }
+    assert plugin._should_continue_after_agent_command_failure() is False
+
+    plugin.last_agent_command_failure = {
+        "actor_id": "vehicle2311",
+        "reason": "agent_command_exception",
+        "ackermann_feedback": False,
+    }
+    assert plugin._should_continue_after_agent_command_failure() is False
+
+
 def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys):
     install_fake_carla()
     from terasim_service.utils.carla.cosim import CarlaCosim
